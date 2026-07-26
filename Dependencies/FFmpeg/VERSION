@@ -1,0 +1,6 @@
+FFmpeg 8.1.2
+x264 b35605ace3ddf7c1a5d67a2eb553f034aef41d55
+architectures arm64 x86_64
+minimum-macos 13.0
+license GPL-2.0-or-later
+
