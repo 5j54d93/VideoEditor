@@ -1,0 +1,1435 @@
+//
+//  EditorModel.swift
+//  VideoEditor
+//
+//  The project model. Holds the ordered assembly items + background audio, and
+//  drives editing of the currently selected item (frame-accurate trim). Export
+//  normalizes every item onto a shared canvas and concatenates them deterministically.
+//
+
+import Foundation
+import AVFoundation
+import Observation
+import AppKit
+import UniformTypeIdentifiers
+
+/// A resolved position in the gapless output timeline.
+struct TimelineHit {
+    let itemID: ClipItem.ID
+    let itemIndex: Int
+    let timelineStart: Double
+    let timelineEnd: Double
+    let timelineTime: Double
+    let sourceTime: Double
+}
+
+/// Transient hover state. This is deliberately separate from the committed
+/// playhead so moving the pointer never changes selection or playback.
+struct TimelinePreview {
+    let itemID: ClipItem.ID
+    let timelineTime: Double
+    /// Set for image clips; video clips render from the scrub player instead.
+    let imageURL: URL?
+    /// A video clip is being scrubbed — the preview frame comes from the shared
+    /// `ScrubPreviewPlayer`, not a still image.
+    let showsScrubPlayer: Bool
+}
+
+private enum ProbedLibraryImport {
+    case image(url: URL, width: Int, height: Int)
+    case audio(url: URL, duration: Double)
+    case video(url: URL, info: MediaInfo)
+}
+
+@MainActor
+@Observable
+final class EditorModel {
+    // Tooling
+    var ff: FFTools? = FFTools.locate()
+    var ffMissing: Bool { ff == nil }
+
+    // Project
+    var library: [LibraryAsset] = []
+    var items: [ClipItem] = []
+    /// The clip the playhead is parked on — drives the preview player and the
+    /// trim/split controls. Independent of the visual selection below.
+    var activeItemID: ClipItem.ID?
+    /// Desktop-style visual selection (blue border, bulk delete): click replaces,
+    /// ⌘-click toggles, marquee replaces, clicking blank space clears.
+    var selectedIDs: Set<ClipItem.ID> = []
+    /// Library-side selection. The two selection domains are mutually exclusive —
+    /// selecting in one clears the other, so Delete always has one clear target.
+    var selectedLibraryIDs: Set<LibraryAsset.ID> = []
+    var audioURL: URL?
+    var audioName: String?
+    var audioDuration: Double = 0
+
+    // Editing state (of the selected item's source)
+    var currentTime: Double = 0
+    var player: AVPlayer?
+
+    /// Drives the hover preview by chase-seeking a dedicated muted player, kept
+    /// separate from `player` so scrubbing never disturbs the committed playhead.
+    @ObservationIgnored let scrub = ScrubPreviewPlayer()
+    var scrubPlayer: AVPlayer { scrub.player }
+
+    // The committed output playhead and the scale of the one canonical timeline.
+    var timelineTime: Double = 0
+    var timelinePointsPerSecond: Double = 72
+    /// Incremented only when the first video is inserted into an empty timeline.
+    /// TimelineView consumes this request using its current measured width.
+    private(set) var timelineAutoFitRequestID = 0
+    var timelinePreview: TimelinePreview?
+    var isTimelinePlaying = false
+
+    // Export
+    var settings = ExportSettings()
+    var isExporting = false
+    var exportProgress: Double = 0
+    var exportResult: ExportResult?
+    /// Where the running/last export writes to, for the progress sheet.
+    var exportDestination: URL?
+    var exportStartDate: Date?
+    /// Wall-clock seconds the last finished export took.
+    var exportElapsed: Double?
+    var errorMessage: String?
+    var isImporting = false
+    var imageDefaultDuration: Double = 3
+
+    // True while a time/frame text field has keyboard focus, so single-key
+    // shortcuts (space, q, w, s, i, o, delete…) don't fire mid-typing.
+    var isTextEditing = false
+
+    private var players: [URL: AVPlayer] = [:]
+    private var thumbnailerCache: [URL: Thumbnailer] = [:]
+    private var exportTask: Task<Void, Never>?
+    private var videoSourceRevisions: [URL: Int] = [:]
+    private var sourceImportGenerations: [URL: Int] = [:]
+    @ObservationIgnored private var activeImportCount = 0
+    @ObservationIgnored private var audioDurationRequestID = 0
+    private var timeObserver: Any?
+    private var observedPlayer: AVPlayer?
+    @ObservationIgnored private var timeObserverGeneration = 0
+    @ObservationIgnored private var imagePlaybackTask: Task<Void, Never>?
+    @ObservationIgnored private var isAdvancingPlayback = false
+
+    var hasProject: Bool { !items.isEmpty }
+    var hasLibrary: Bool { !library.isEmpty }
+
+    // MARK: - Selected item
+
+    var activeIndex: Int? { items.firstIndex { $0.id == activeItemID } }
+    var activeItem: ClipItem? { activeIndex.map { items[$0] } }
+    func thumbnailer(for url: URL) -> Thumbnailer? {
+        thumbnailerCache[normalizedSourceURL(url)]
+    }
+
+    func videoSourceRevision(for url: URL) -> Int {
+        videoSourceRevisions[normalizedSourceURL(url), default: 0]
+    }
+
+    var activeTotalFrames: Int { activeItem.map { $0.grid.frameCount } ?? 1 }
+    var currentFrameIndex: Int {
+        guard let item = activeItem, !item.isImage else { return 0 }
+        let first = item.trimStartFrame
+        let last = max(first, item.trimEndFrame - 1)
+        return min(max(first, item.grid.frameIndex(containing: currentTime)), last)
+    }
+    /// Nearest real frame start of the active clip (identity for images).
+    func snap(_ t: Double) -> Double {
+        guard let item = activeItem, !item.isImage else { return t }
+        let g = item.grid
+        return g.time(ofFrame: g.nearestFrame(to: t))
+    }
+    var isPlaying: Bool { isTimelinePlaying }
+
+    // Trim of the selected video item, as bindable points.
+    var activeInPoint: Double {
+        get { activeItem?.inPoint ?? 0 }
+        set {
+            guard let id = activeItemID else { return }
+            setTrimStart(newValue, for: id)
+        }
+    }
+    var activeOutPoint: Double {
+        get { activeItem?.outPoint ?? 0 }
+        set {
+            guard let id = activeItemID else { return }
+            setTrimEnd(newValue, for: id)
+        }
+    }
+
+    // MARK: - Canvas / output
+
+    private func even(_ x: Int) -> Int { x % 2 == 0 ? max(2, x) : x + 1 }
+
+    var canvas: CanvasSpec {
+        let w = items.map { $0.naturalWidth }.filter { $0 > 0 }.max() ?? 1280
+        let h = items.map { $0.naturalHeight }.filter { $0 > 0 }.max() ?? 720
+        // Use the exact rational of the fastest video so a fractional-fps source
+        // (e.g. 24.9713) is never resampled to a rounded integer rate.
+        let best = items.filter { !$0.isImage && $0.fps > 0 }.max { $0.fps < $1.fps }
+        return CanvasSpec(width: even(w), height: even(h),
+                          fps: best?.fpsRational ?? "30", fpsValue: best?.fps ?? 30)
+    }
+
+    var totalOutputDuration: Double { items.reduce(0) { $0 + $1.displayDuration } }
+
+    // MARK: - Output timeline coordinates / zoom
+
+    let timelineMinPointsPerSecond: Double = 8
+    // At the upper end a 30 fps source gets 120 points per frame, so individual
+    // frames can become first-class cells inside the timeline itself.
+    let timelineMaxPointsPerSecond: Double = 3_600
+
+    var timelineZoomLevel: Double {
+        get {
+            log(timelinePointsPerSecond / timelineMinPointsPerSecond)
+                / log(timelineMaxPointsPerSecond / timelineMinPointsPerSecond)
+        }
+        set {
+            let level = min(max(newValue, 0), 1)
+            setTimelineScale(timelineMinPointsPerSecond
+                * pow(timelineMaxPointsPerSecond / timelineMinPointsPerSecond, level))
+        }
+    }
+
+    func setTimelineScale(_ value: Double) {
+        timelinePointsPerSecond = min(max(value, timelineMinPointsPerSecond),
+                                      timelineMaxPointsPerSecond)
+    }
+
+    func fitTimeline(in viewportWidth: CGFloat) {
+        guard totalOutputDuration > 0 else { return }
+        setTimelineScale(Double(max(1, viewportWidth)) / totalOutputDuration)
+    }
+
+    /// Ask the timeline view to zoom-to-fit; the model doesn't know the
+    /// viewport width, so the view consumes this request with its own measure.
+    func requestTimelineAutoFit() {
+        timelineAutoFitRequestID &+= 1
+    }
+
+    func timelineStart(for id: ClipItem.ID) -> Double? {
+        var start = 0.0
+        for item in items {
+            if item.id == id { return start }
+            start += item.displayDuration
+        }
+        return nil
+    }
+
+    /// Resolve an output time using half-open clip ranges. A time exactly on an
+    /// edit point belongs to the clip on its right; the movie end belongs to the
+    /// final clip so its last frame can still be inspected.
+    func timelineHit(at time: Double) -> TimelineHit? {
+        guard !items.isEmpty, time >= 0, time <= totalOutputDuration + 1e-9 else { return nil }
+        var start = 0.0
+        for (index, item) in items.enumerated() {
+            let end = start + item.displayDuration
+            let isLast = index == items.count - 1
+            if time < end || (isLast && time <= end + 1e-9) {
+                let offset = min(max(0, time - start), item.displayDuration)
+                let sourceTime: Double
+                if item.isImage {
+                    sourceTime = offset
+                } else {
+                    let g = item.grid
+                    let firstFrame = item.trimStartFrame
+                    let endFrame = max(firstFrame + 1, item.trimEndFrame)
+                    let firstTime = g.time(ofFrame: firstFrame)
+                    let lastTime = g.time(ofFrame: endFrame - 1)
+                    sourceTime = min(max(firstTime, item.inPoint + offset), lastTime)
+                }
+                return TimelineHit(itemID: item.id, itemIndex: index,
+                                   timelineStart: start, timelineEnd: end,
+                                   timelineTime: min(max(time, start), end),
+                                   sourceTime: sourceTime)
+            }
+            start = end
+        }
+        return nil
+    }
+
+    /// Quantize a hit to the video frame nearest to it, splitting each frame's
+    /// span at its midpoint: the left half of a span stays on that frame, the
+    /// right half rounds up to the next one. Hover and click seeks share this,
+    /// so the hover line, the playhead and the previewed frame all agree.
+    /// Images have no frame grid and pass through unchanged.
+    private func frameSnapped(_ hit: TimelineHit) -> TimelineHit {
+        let item = items[hit.itemIndex]
+        guard !item.isImage else { return hit }
+        let g = item.grid
+        let firstFrame = item.trimStartFrame
+        let endFrame = max(firstFrame + 1, item.trimEndFrame)
+        let frame = min(max(firstFrame, g.nearestFrame(to: hit.sourceTime)), endFrame - 1)
+        let source = g.time(ofFrame: frame)
+        let timeline = hit.timelineStart + (source - item.inPoint)
+        return TimelineHit(itemID: hit.itemID, itemIndex: hit.itemIndex,
+                           timelineStart: hit.timelineStart, timelineEnd: hit.timelineEnd,
+                           timelineTime: min(max(timeline, hit.timelineStart), hit.timelineEnd),
+                           sourceTime: source)
+    }
+
+    private func syncTimelineTimeFromActive() {
+        guard let item = activeItem, let start = timelineStart(for: item.id) else {
+            timelineTime = min(max(0, timelineTime), totalOutputDuration)
+            return
+        }
+        let offset = item.isImage
+            ? min(max(0, currentTime), item.displayDuration)
+            : min(max(0, currentTime - item.inPoint), item.displayDuration)
+        timelineTime = start + offset
+    }
+
+    /// The edit boundary represented by the global playhead. Previewing the
+    /// movie end uses the last retained frame, but edits at that position must
+    /// still resolve to the exclusive out boundary.
+    private var activeEditSourceTime: Double {
+        guard let item = activeItem,
+              let start = timelineStart(for: item.id) else { return currentTime }
+        let offset = min(max(0, timelineTime - start), item.displayDuration)
+        return item.isImage ? offset : min(item.outPoint, item.inPoint + offset)
+    }
+
+    func seekTimeline(to time: Double) {
+        guard let rawHit = timelineHit(at: time) else { return }
+        let hit = frameSnapped(rawHit)
+        pauseTimelinePlayback()
+        if activeItemID != hit.itemID {
+            // Selecting a different clip and then seeking used to issue two
+            // asynchronous seeks (clip start, then tap target). Initialize the
+            // selection at the final target so a single click is sufficient.
+            selectItemInternal(hit.itemID,
+                               sourceTime: hit.sourceTime,
+                               timelinePosition: hit.timelineTime)
+            return
+        }
+        guard let item = activeItem else { return }
+        timelineTime = hit.timelineTime
+        if item.isImage {
+            currentTime = min(max(0, hit.sourceTime), item.displayDuration)
+        } else {
+            currentTime = min(max(item.inPoint, hit.sourceTime), item.outPoint)
+            seekPlayer(to: currentTime)
+        }
+    }
+
+    /// Park the playhead on the exclusive end boundary while previewing the
+    /// final retained frame. A regular frame-snapped seek would place the red
+    /// line at that frame's start instead of at the visible end of the movie.
+    func seekTimelineToEnd() {
+        guard let last = items.last else { return }
+        pauseTimelinePlayback()
+        let sourceEnd = last.isImage ? last.displayDuration : last.outPoint
+        selectItemInternal(last.id,
+                           sourceTime: sourceEnd,
+                           timelinePosition: totalOutputDuration)
+    }
+
+    func updateTimelineHover(at time: Double) {
+        guard time >= 0, time <= totalOutputDuration,
+              let rawHit = timelineHit(at: time) else {
+            clearTimelineHover()
+            return
+        }
+        let hit = frameSnapped(rawHit)
+        let item = items[hit.itemIndex]
+        if item.isImage {
+            scrub.end()
+            timelinePreview = TimelinePreview(itemID: item.id,
+                                              timelineTime: hit.timelineTime,
+                                              imageURL: item.url,
+                                              showsScrubPlayer: false)
+            return
+        }
+
+        let g = item.grid
+        let firstFrame = item.trimStartFrame
+        let endFrame = max(firstFrame + 1, item.trimEndFrame)
+        let firstTime = g.time(ofFrame: firstFrame)
+        let lastTime = g.time(ofFrame: endFrame - 1)
+        // The exact frame under the pointer (already frame-snapped), clamped into
+        // the clip's kept range so scrubbing never previews trimmed-away content.
+        let exact = min(max(firstTime, hit.sourceTime), lastTime)
+        timelinePreview = TimelinePreview(itemID: item.id,
+                                          timelineTime: hit.timelineTime,
+                                          imageURL: nil,
+                                          showsScrubPlayer: true)
+        scrub.prepare(url: normalizedSourceURL(item.url))
+        // The pointer is already snapped to one real frame. Request that exact
+        // frame once; allowing a tolerance here lets AVPlayer repaint either
+        // neighbour while repeated hover events arrive inside the same cell.
+        scrub.scrub(to: exact)
+    }
+
+    func clearTimelineHover() {
+        scrub.end()
+        timelinePreview = nil
+    }
+
+    // MARK: - Undo / redo
+
+    /// A full copy of everything an edit can touch. Snapshot-based undo keeps
+    /// every operation trivially reversible — the arrays are small metadata, so
+    /// copies are cheap.
+    private struct ProjectSnapshot {
+        var library: [LibraryAsset]
+        var items: [ClipItem]
+        var audioURL: URL?
+        var audioName: String?
+        var audioDuration: Double
+        var activeItemID: ClipItem.ID?
+        var selectedIDs: Set<ClipItem.ID>
+        var selectedLibraryIDs: Set<LibraryAsset.ID>
+        var currentTime: Double
+        var timelineTime: Double
+    }
+
+    private var undoStack: [ProjectSnapshot] = []
+    private var redoStack: [ProjectSnapshot] = []
+    var canUndo: Bool { !undoStack.isEmpty }
+    var canRedo: Bool { !redoStack.isEmpty }
+
+    private func snapshot() -> ProjectSnapshot {
+        ProjectSnapshot(library: library, items: items,
+                        audioURL: audioURL, audioName: audioName,
+                        audioDuration: audioDuration,
+                        activeItemID: activeItemID, selectedIDs: selectedIDs,
+                        selectedLibraryIDs: selectedLibraryIDs,
+                        currentTime: currentTime, timelineTime: timelineTime)
+    }
+
+    /// Push the current project state as one undo step. Call exactly once per
+    /// user action, immediately before its first mutation.
+    private func registerUndo() {
+        undoStack.append(snapshot())
+        if undoStack.count > 100 { undoStack.removeFirst() }
+        redoStack.removeAll()
+    }
+
+    func undo() {
+        guard let past = undoStack.popLast() else { return }
+        redoStack.append(snapshot())
+        apply(past)
+    }
+
+    func redo() {
+        guard let future = redoStack.popLast() else { return }
+        undoStack.append(snapshot())
+        apply(future)
+    }
+
+    private func apply(_ s: ProjectSnapshot) {
+        pauseTimelinePlayback()
+        clearTimelineHover()
+        audioDurationRequestID &+= 1
+        library = s.library
+        items = s.items
+        audioURL = s.audioURL
+        audioName = s.audioName
+        audioDuration = s.audioDuration
+        selectedIDs = s.selectedIDs
+        selectedLibraryIDs = s.selectedLibraryIDs
+        if let id = s.activeItemID, items.contains(where: { $0.id == id }) {
+            selectItemInternal(id, sourceTime: s.currentTime,
+                               timelinePosition: s.timelineTime)
+        } else if let first = items.first {
+            selectItemInternal(first.id)
+        } else {
+            activeItemID = nil
+            detachObserver()
+            player = nil
+            currentTime = 0
+            timelineTime = 0
+        }
+        reconcileVideoCaches()
+    }
+
+    // MARK: - Importing
+
+    func pickAndImport() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.movie, .mpeg4Movie, .quickTimeMovie, .video, .image,
+                                     .audio, .mp3, .mpeg4Audio, .wav, .aiff]
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        if panel.runModal() == .OK { importAssets(panel.urls) }
+    }
+
+    /// Probe files once and add them to the library. Nothing enters the timeline
+    /// here — the user drags assets in (or uses the row's add button).
+    func importAssets(_ urls: [URL]) {
+        guard let ff else { errorMessage = FFError.notFound.errorDescription; return }
+        guard !urls.isEmpty else { return }
+
+        var seen: Set<URL> = []
+        let requests = urls.compactMap { rawURL -> (url: URL, generation: Int)? in
+            let url = normalizedSourceURL(rawURL)
+            guard seen.insert(url).inserted else { return nil }
+            let generation = sourceImportGenerations[url, default: 0] &+ 1
+            sourceImportGenerations[url] = generation
+            return (url, generation)
+        }
+        guard !requests.isEmpty else { return }
+
+        errorMessage = nil
+        activeImportCount += 1
+        isImporting = true
+        Task {
+            var probedImports: [(entry: ProbedLibraryImport, url: URL, generation: Int)] = []
+            for request in requests {
+                do {
+                    let result: ProbedLibraryImport
+                    if isImageURL(request.url) {
+                        let (width, height) = try await ff.probeDimensions(request.url)
+                        result = .image(url: request.url, width: width, height: height)
+                    } else if isAudioURL(request.url) {
+                        let duration = try await ff.probeDuration(request.url)
+                        result = .audio(url: request.url, duration: duration)
+                    } else {
+                        result = .video(url: request.url, info: try await ff.probe(request.url))
+                    }
+                    guard sourceImportGenerations[request.url] == request.generation else {
+                        continue
+                    }
+                    probedImports.append((result, request.url, request.generation))
+                } catch {
+                    guard sourceImportGenerations[request.url] == request.generation else {
+                        continue
+                    }
+                    self.errorMessage = "無法讀取 \(request.url.lastPathComponent)：" +
+                        ((error as? FFError)?.errorDescription ?? error.localizedDescription)
+                }
+            }
+
+            // A result can become stale while this batch is still probing later
+            // files. Recheck at commit so the newest import of each path wins.
+            let imports = probedImports.compactMap { result -> ProbedLibraryImport? in
+                sourceImportGenerations[result.url] == result.generation
+                    ? result.entry : nil
+            }
+
+            // Refresh video sources before adding new rows. This is intentionally
+            // outside undo: the old bytes no longer exist, so restoring their
+            // metadata would only make the model disagree with the file on disk.
+            let existingVideoURLs = Set(imports.compactMap { entry -> URL? in
+                guard case .video(let url, _) = entry,
+                      hasVideoReference(to: url) else { return nil }
+                return url
+            })
+            for entry in imports {
+                guard case .video(let url, let info) = entry else { continue }
+                refreshVideoSource(at: url, with: info)
+            }
+
+            let additions = imports.filter { entry in
+                guard case .video(let url, _) = entry else { return true }
+                return !existingVideoURLs.contains(url)
+            }
+            if !additions.isEmpty { registerUndo() }
+
+            for entry in additions {
+                switch entry {
+                case .image(let url, let width, let height):
+                    library.append(LibraryAsset(url: url, kind: .image,
+                                                width: width, height: height))
+                case .audio(let url, let duration):
+                    library.append(LibraryAsset(url: url, kind: .audio,
+                                                duration: duration, hasAudio: true))
+                case .video(let url, let info):
+                    library.append(videoLibraryAsset(url: url, info: info))
+                }
+            }
+
+            activeImportCount -= 1
+            isImporting = activeImportCount > 0
+        }
+    }
+
+    private func normalizedSourceURL(_ url: URL) -> URL {
+        guard url.isFileURL else { return url }
+        return url.standardizedFileURL.resolvingSymlinksInPath()
+    }
+
+    private func isSameSource(_ lhs: URL, _ rhs: URL) -> Bool {
+        normalizedSourceURL(lhs) == normalizedSourceURL(rhs)
+    }
+
+    private func hasVideoReference(to url: URL) -> Bool {
+        library.contains { $0.kind == .video && isSameSource($0.url, url) }
+            || items.contains { !$0.isImage && isSameSource($0.url, url) }
+    }
+
+    private func videoLibraryAsset(url: URL, info: MediaInfo) -> LibraryAsset {
+        LibraryAsset(url: url, kind: .video,
+                     width: info.width, height: info.height,
+                     duration: info.duration, fps: info.fps,
+                     fpsRational: info.fpsRational,
+                     hasAudio: info.audioCodec != nil,
+                     keyframes: info.keyframes,
+                     frameTimes: info.frameTimes)
+    }
+
+    /// Replace every object that can retain the old inode behind a file URL.
+    /// A new source revision also makes SwiftUI discard view-local decoded frames.
+    private func installFreshVideoCaches(for url: URL) {
+        let sourceURL = normalizedSourceURL(url)
+        clearTimelineHover()
+        scrub.invalidate(url: sourceURL)
+
+        let stalePlayerKeys = players.keys.filter { isSameSource($0, sourceURL) }
+        for key in stalePlayerKeys { discardPlayer(forKey: key) }
+
+        let staleThumbnailKeys = thumbnailerCache.keys.filter { isSameSource($0, sourceURL) }
+        for key in staleThumbnailKeys { thumbnailerCache.removeValue(forKey: key) }
+        thumbnailerCache[sourceURL] = Thumbnailer(url: sourceURL)
+        videoSourceRevisions[sourceURL, default: 0] &+= 1
+    }
+
+    private func discardPlayer(forKey key: URL) {
+        guard let stalePlayer = players.removeValue(forKey: key) else { return }
+        stalePlayer.pause()
+        if observedPlayer === stalePlayer { detachObserver() }
+        if player === stalePlayer { player = nil }
+        stalePlayer.replaceCurrentItem(with: nil)
+    }
+
+    /// Release decoded media when its last model reference disappears. Undo can
+    /// restore a reference later; missing Thumbnailers are recreated here and a
+    /// revision bump tells every strip to redraw from the new generator.
+    private func reconcileVideoCaches() {
+        let itemURLs = Set(items.compactMap { item in
+            item.isImage ? nil : normalizedSourceURL(item.url)
+        })
+        let thumbnailURLs = itemURLs.union(library.compactMap { asset in
+            asset.kind == .video ? normalizedSourceURL(asset.url) : nil
+        })
+
+        let stalePlayerKeys = players.keys.filter {
+            !itemURLs.contains(normalizedSourceURL($0))
+        }
+        for key in stalePlayerKeys { discardPlayer(forKey: key) }
+
+        let staleThumbnailKeys = thumbnailerCache.keys.filter {
+            !thumbnailURLs.contains(normalizedSourceURL($0))
+        }
+        for key in staleThumbnailKeys { thumbnailerCache.removeValue(forKey: key) }
+
+        for url in thumbnailURLs where thumbnailerCache[url] == nil {
+            thumbnailerCache[url] = Thumbnailer(url: url)
+            videoSourceRevisions[url, default: 0] &+= 1
+        }
+    }
+
+    /// Re-importing the same path is a source refresh rather than a duplicate
+    /// library row. Metadata, live playback and every decoded frame move to the
+    /// new file together, so preview and export can never describe different bytes.
+    private func refreshVideoSource(at url: URL, with info: MediaInfo) {
+        let sourceURL = normalizedSourceURL(url)
+        let refreshedActiveID = activeItem.flatMap {
+            !$0.isImage && isSameSource($0.url, sourceURL) ? $0.id : nil
+        }
+        if refreshedActiveID != nil { pauseTimelinePlayback() }
+        let requestedSourceTime = currentTime
+
+        installFreshVideoCaches(for: sourceURL)
+
+        for index in library.indices where library[index].kind == .video
+            && isSameSource(library[index].url, sourceURL) {
+            refreshVideoLibraryAsset(&library[index], sourceURL: sourceURL, info: info)
+        }
+
+        for index in items.indices where !items[index].isImage
+            && isSameSource(items[index].url, sourceURL) {
+            refreshVideoItem(&items[index], sourceURL: sourceURL, info: info)
+        }
+        for index in undoStack.indices {
+            refreshVideoSnapshot(&undoStack[index], sourceURL: sourceURL, info: info)
+        }
+        for index in redoStack.indices {
+            refreshVideoSnapshot(&redoStack[index], sourceURL: sourceURL, info: info)
+        }
+
+        if let refreshedActiveID,
+           items.contains(where: { $0.id == refreshedActiveID }) {
+            selectItemInternal(refreshedActiveID, sourceTime: requestedSourceTime)
+        } else {
+            syncTimelineTimeFromActive()
+        }
+    }
+
+    private func refreshVideoLibraryAsset(_ asset: inout LibraryAsset,
+                                          sourceURL: URL, info: MediaInfo) {
+        asset.url = sourceURL
+        asset.kind = .video
+        asset.width = info.width
+        asset.height = info.height
+        asset.duration = info.duration
+        asset.fps = info.fps
+        asset.fpsRational = info.fpsRational
+        asset.hasAudio = info.audioCodec != nil
+        asset.keyframes = info.keyframes
+        asset.frameTimes = info.frameTimes
+    }
+
+    private func refreshVideoSnapshot(_ snapshot: inout ProjectSnapshot,
+                                      sourceURL: URL, info: MediaInfo) {
+        for index in snapshot.library.indices where snapshot.library[index].kind == .video
+            && isSameSource(snapshot.library[index].url, sourceURL) {
+            refreshVideoLibraryAsset(&snapshot.library[index], sourceURL: sourceURL, info: info)
+        }
+        for index in snapshot.items.indices where !snapshot.items[index].isImage
+            && isSameSource(snapshot.items[index].url, sourceURL) {
+            refreshVideoItem(&snapshot.items[index], sourceURL: sourceURL, info: info)
+        }
+
+        let totalDuration = snapshot.items.reduce(0) { $0 + $1.displayDuration }
+        guard let activeID = snapshot.activeItemID,
+              let activeIndex = snapshot.items.firstIndex(where: { $0.id == activeID }) else {
+            snapshot.timelineTime = min(max(0, snapshot.timelineTime), totalDuration)
+            return
+        }
+        let activeItem = snapshot.items[activeIndex]
+        snapshot.currentTime = activeItem.isImage
+            ? min(max(0, snapshot.currentTime), activeItem.displayDuration)
+            : min(max(activeItem.inPoint, snapshot.currentTime), activeItem.outPoint)
+        let timelineStart = snapshot.items.prefix(activeIndex)
+            .reduce(0) { $0 + $1.displayDuration }
+        let offset = activeItem.isImage
+            ? snapshot.currentTime : snapshot.currentTime - activeItem.inPoint
+        snapshot.timelineTime = timelineStart + min(max(0, offset), activeItem.displayDuration)
+    }
+
+    private func refreshVideoItem(_ item: inout ClipItem,
+                                  sourceURL: URL, info: MediaInfo) {
+        let oldGrid = item.grid
+        let keptSourceStart = item.trimStartFrame <= oldGrid.firstDisplayedFrame
+        let keptSourceEnd = item.trimEndFrame >= oldGrid.frameCount
+        let newGrid = FrameGrid(times: info.frameTimes,
+                                nominalFps: info.fps > 0 ? info.fps : 30,
+                                fallbackDuration: info.duration)
+        let firstFrame = min(newGrid.firstDisplayedFrame, newGrid.frameCount - 1)
+        let lastPossibleStart = max(firstFrame, newGrid.frameCount - 1)
+        let requestedStart = keptSourceStart
+            ? firstFrame : newGrid.nearestBoundary(to: item.inPoint)
+        let startFrame = min(max(firstFrame, requestedStart), lastPossibleStart)
+        let requestedEnd = keptSourceEnd
+            ? newGrid.frameCount : newGrid.nearestBoundary(to: item.outPoint)
+        let endFrame = min(max(startFrame + 1, requestedEnd), newGrid.frameCount)
+
+        item.url = sourceURL
+        item.naturalWidth = info.width
+        item.naturalHeight = info.height
+        item.sourceDuration = info.duration
+        item.fps = info.fps
+        item.fpsRational = info.fpsRational
+        item.hasAudio = info.audioCodec != nil
+        item.keyframes = info.keyframes
+        item.frameTimes = info.frameTimes
+        item.inPoint = newGrid.boundary(startFrame)
+        item.outPoint = newGrid.boundary(endFrame)
+    }
+
+    func libraryAsset(_ id: LibraryAsset.ID) -> LibraryAsset? {
+        library.first { $0.id == id }
+    }
+
+    /// Instantiate a library asset onto the timeline. `index` nil appends.
+    /// Audio assets become the background music instead of a timeline item.
+    func insertLibraryAsset(_ id: LibraryAsset.ID, at index: Int? = nil) {
+        guard let asset = libraryAsset(id) else { return }
+        switch asset.kind {
+        case .audio:
+            setAudio(asset.url)
+        case .image:
+            insertItem(ClipItem(url: asset.url, kind: .image,
+                                naturalWidth: asset.width, naturalHeight: asset.height,
+                                sourceDuration: 0, fps: 0, hasAudio: false,
+                                outPoint: imageDefaultDuration), at: index)
+        case .video:
+            // In/out default to the real first/last frame boundaries, so files
+            // whose video doesn't start at t = 0 begin life on the grid.
+            let grid = FrameGrid(times: asset.frameTimes,
+                                 nominalFps: asset.fps > 0 ? asset.fps : 30,
+                                 fallbackDuration: asset.duration)
+            insertItem(ClipItem(url: asset.url, kind: .video,
+                                naturalWidth: asset.width, naturalHeight: asset.height,
+                                sourceDuration: asset.duration, fps: asset.fps,
+                                fpsRational: asset.fpsRational,
+                                hasAudio: asset.hasAudio, keyframes: asset.keyframes,
+                                frameTimes: asset.frameTimes,
+                                inPoint: grid.boundary(grid.firstDisplayedFrame),
+                                outPoint: grid.boundary(grid.frameCount)), at: index)
+        }
+    }
+
+    private func insertItem(_ item: ClipItem, at index: Int?) {
+        pauseTimelinePlayback()
+        registerUndo()
+        let shouldAutoFit = items.isEmpty && !item.isImage
+        let i = min(max(0, index ?? items.count), items.count)
+        items.insert(item, at: i)
+        if activeItemID == nil { selectItem(item.id) }
+        syncTimelineTimeFromActive()
+        if shouldAutoFit { timelineAutoFitRequestID &+= 1 }
+    }
+
+    func removeFromLibrary(_ id: LibraryAsset.ID) {
+        removeLibraryAssets([id])
+    }
+
+    func removeSelectedLibraryAssets() {
+        removeLibraryAssets(selectedLibraryIDs)
+    }
+
+    /// Remove library assets and, in the same undo step, every timeline clip
+    /// instantiated from them. A removed audio asset stops being the music.
+    func removeLibraryAssets(_ ids: Set<LibraryAsset.ID>) {
+        let assets = library.filter { ids.contains($0.id) }
+        guard !assets.isEmpty else { return }
+        pauseTimelinePlayback()
+        clearTimelineHover()
+        registerUndo()
+        let urls = Set(assets.map(\.url))
+        if let audioURL, urls.contains(where: { isSameSource($0, audioURL) }) {
+            resetAudioState()
+        }
+        library.removeAll { ids.contains($0.id) }
+        selectedLibraryIDs.subtract(ids)
+        let doomed = Set(items.filter { item in
+            urls.contains(where: { isSameSource($0, item.url) })
+        }.map(\.id))
+        if !doomed.isEmpty { removeItemsInternal(doomed) }
+        for rawURL in urls {
+            let url = normalizedSourceURL(rawURL)
+            let stillReferenced = library.contains { isSameSource($0.url, url) }
+                || items.contains { isSameSource($0.url, url) }
+                || audioURL.map { isSameSource($0, url) } == true
+            if !stillReferenced {
+                sourceImportGenerations[url, default: 0] &+= 1
+            }
+        }
+        reconcileVideoCaches()
+    }
+
+    private func isImageURL(_ url: URL) -> Bool {
+        if let t = UTType(filenameExtension: url.pathExtension.lowercased()) {
+            return t.conforms(to: .image)
+        }
+        return ["jpg", "jpeg", "png", "heic", "gif", "webp", "tiff", "bmp"].contains(url.pathExtension.lowercased())
+    }
+
+    private func isAudioURL(_ url: URL) -> Bool {
+        if let t = UTType(filenameExtension: url.pathExtension.lowercased()),
+           t.conforms(to: .audiovisualContent) {
+            return t.conforms(to: .audio)
+        }
+        return ["mp3", "m4a", "wav", "aiff", "aif", "aac", "flac", "ogg"].contains(url.pathExtension.lowercased())
+    }
+
+    func setAudio(_ url: URL) {
+        registerUndo()
+        let sourceURL = normalizedSourceURL(url)
+        audioDurationRequestID &+= 1
+        let requestID = audioDurationRequestID
+        audioURL = sourceURL
+        audioName = sourceURL.lastPathComponent
+        audioDuration = 0
+        Task {
+            let duration = if let ff {
+                (try? await ff.probeDuration(sourceURL)) ?? 0.0
+            } else {
+                0.0
+            }
+            guard audioDurationRequestID == requestID, audioURL == sourceURL else { return }
+            audioDuration = duration
+        }
+    }
+
+    func clearAudio() {
+        registerUndo()
+        resetAudioState()
+    }
+
+    private func resetAudioState() {
+        audioDurationRequestID &+= 1
+        audioURL = nil
+        audioName = nil
+        audioDuration = 0
+    }
+
+    // MARK: - Item list ops
+
+    func selectItem(_ id: ClipItem.ID) {
+        pauseTimelinePlayback()
+        selectItemInternal(id)
+        selectedIDs = [id]
+        selectedLibraryIDs = []
+    }
+
+    private func selectItemInternal(_ id: ClipItem.ID,
+                                    sourceTime requestedSourceTime: Double? = nil,
+                                    timelinePosition requestedTimelinePosition: Double? = nil) {
+        player?.pause()
+        activeItemID = id
+        guard let item = activeItem else { detachObserver(); player = nil; return }
+        let itemTimelineStart = timelineStart(for: item.id) ?? 0
+
+        if item.isImage {
+            detachObserver(); player = nil
+            let target = min(max(0, requestedSourceTime ?? 0), item.displayDuration)
+            currentTime = target
+            timelineTime = requestedTimelinePosition ?? (itemTimelineStart + target)
+            return
+        }
+        let sourceURL = normalizedSourceURL(item.url)
+        // Warm the scrub player on the active source so hovering this clip shows
+        // its first frame instantly instead of loading an item mid-sweep.
+        scrub.prepare(url: sourceURL)
+        let p = players[sourceURL] ?? {
+            let np = AVPlayer(url: sourceURL); np.actionAtItemEnd = .pause
+            players[sourceURL] = np; return np
+        }()
+        player = p
+        attachObserver(to: p)
+        let target = min(max(item.inPoint, requestedSourceTime ?? item.inPoint), item.outPoint)
+        currentTime = target
+        timelineTime = requestedTimelinePosition
+            ?? (itemTimelineStart + min(max(0, target - item.inPoint), item.displayDuration))
+        seekPlayer(to: target)
+    }
+
+    // MARK: - Visual selection
+
+    func selectOnly(_ id: ClipItem.ID) {
+        selectedIDs = [id]
+        selectedLibraryIDs = []
+    }
+
+    func toggleSelection(_ id: ClipItem.ID) {
+        if selectedIDs.contains(id) { selectedIDs.remove(id) } else { selectedIDs.insert(id) }
+        selectedLibraryIDs = []
+    }
+
+    func clearSelection() {
+        selectedIDs = []
+        selectedLibraryIDs = []
+    }
+
+    func selectLibraryAsset(_ id: LibraryAsset.ID) {
+        selectedLibraryIDs = [id]
+        selectedIDs = []
+    }
+
+    func toggleLibrarySelection(_ id: LibraryAsset.ID) {
+        if selectedLibraryIDs.contains(id) {
+            selectedLibraryIDs.remove(id)
+        } else {
+            selectedLibraryIDs.insert(id)
+        }
+        selectedIDs = []
+    }
+
+    /// Remove every selected clip. The playhead lands on the nearest remaining
+    /// clip and nothing stays visually selected afterwards.
+    func removeSelectedItems() {
+        guard !selectedIDs.isEmpty else { return }
+        pauseTimelinePlayback()
+        clearTimelineHover()
+        registerUndo()
+        removeItemsInternal(selectedIDs)
+        reconcileVideoCaches()
+    }
+
+    /// Shared clip-removal core (no undo registration — the caller owns the step).
+    private func removeItemsInternal(_ ids: Set<ClipItem.ID>) {
+        let firstRemovedIndex = items.firstIndex { ids.contains($0.id) } ?? 0
+        let activeRemoved = activeItemID.map { ids.contains($0) } ?? false
+        items.removeAll { ids.contains($0.id) }
+        selectedIDs.subtract(ids)
+        guard !items.isEmpty else {
+            activeItemID = nil
+            player = nil
+            currentTime = 0
+            timelineTime = 0
+            detachObserver()
+            return
+        }
+        if activeRemoved {
+            selectItemInternal(items[min(firstRemovedIndex, items.count - 1)].id)
+        } else {
+            syncTimelineTimeFromActive()
+        }
+    }
+
+    /// Move a clip into the gap at `insertionIndex`, counted in the pre-move
+    /// array (the gap the user pointed at: 0 = before the first clip,
+    /// `items.count` = after the last).
+    func moveItem(_ id: ClipItem.ID, to insertionIndex: Int) {
+        moveItems([id], to: insertionIndex)
+    }
+
+    /// Move several clips as one ordered group. Selected clips do not need to be
+    /// adjacent: they are lifted out, retain their relative project order, then
+    /// are inserted together at the pointed gap. Translating the pre-move gap
+    /// into the reduced array keeps drops correct on either side of the group.
+    /// A drop that produces the existing order is intentionally not undoable.
+    func moveItems(_ ids: Set<ClipItem.ID>, to insertionIndex: Int) {
+        pauseTimelinePlayback()
+        guard !ids.isEmpty else { return }
+        let target = min(max(0, insertionIndex), items.count)
+        let moving = items.filter { ids.contains($0.id) }
+        guard !moving.isEmpty else { return }
+
+        let movingIDs = Set(moving.map(\.id))
+        let removedBeforeTarget = items.prefix(target).reduce(into: 0) { count, item in
+            if movingIDs.contains(item.id) { count += 1 }
+        }
+        var reordered = items.filter { !movingIDs.contains($0.id) }
+        let destination = min(max(0, target - removedBeforeTarget), reordered.count)
+        reordered.insert(contentsOf: moving, at: destination)
+        guard reordered.map(\.id) != items.map(\.id) else { return }
+
+        registerUndo()
+        items = reordered
+        syncTimelineTimeFromActive()
+    }
+
+    // MARK: - Selected-item editing
+
+    func setImageDuration(_ seconds: Double) {
+        guard let id = activeItemID else { return }
+        setImageDuration(seconds, for: id)
+    }
+
+    func setImageDuration(_ seconds: Double, for id: ClipItem.ID) {
+        pauseTimelinePlayback()
+        guard let index = items.firstIndex(where: { $0.id == id }), items[index].isImage else { return }
+        let newValue = max(0.1, seconds)
+        guard newValue != items[index].outPoint else { return }
+        registerUndo()
+        items[index].outPoint = newValue
+        if activeItemID == id {
+            currentTime = min(currentTime, items[index].displayDuration)
+            syncTimelineTimeFromActive()
+        }
+    }
+
+    func setTrimStart(_ time: Double, for id: ClipItem.ID) {
+        pauseTimelinePlayback()
+        guard let index = items.firstIndex(where: { $0.id == id }), !items[index].isImage else { return }
+        let item = items[index]
+        let g = item.grid
+        let idx = min(max(g.firstDisplayedFrame, g.nearestBoundary(to: time)),
+                      item.trimEndFrame - 1)
+        let newValue = g.boundary(idx)
+        guard newValue != item.inPoint else { return }
+        registerUndo()
+        items[index].inPoint = newValue
+        if activeItemID == id {
+            currentTime = max(currentTime, items[index].inPoint)
+            seekPlayer(to: currentTime)
+            syncTimelineTimeFromActive()
+        }
+    }
+
+    func setTrimEnd(_ time: Double, for id: ClipItem.ID) {
+        pauseTimelinePlayback()
+        guard let index = items.firstIndex(where: { $0.id == id }), !items[index].isImage else { return }
+        let item = items[index]
+        let g = item.grid
+        let idx = min(max(item.trimStartFrame + 1, g.nearestBoundary(to: time)),
+                      g.frameCount)
+        let newValue = g.boundary(idx)
+        guard newValue != item.outPoint else { return }
+        registerUndo()
+        items[index].outPoint = newValue
+        if activeItemID == id {
+            currentTime = min(currentTime, items[index].outPoint)
+            seekPlayer(to: currentTime)
+            syncTimelineTimeFromActive()
+        }
+    }
+
+    func setInHere() {
+        guard let id = activeItemID else { return }
+        setTrimStart(activeEditSourceTime, for: id)
+    }
+
+    func setOutHere() {
+        guard let id = activeItemID else { return }
+        setTrimEnd(activeEditSourceTime, for: id)
+    }
+
+    /// The playhead as an editable frame boundary strictly inside the active
+    /// clip. Keeping the outer boundaries out of this operation avoids turning
+    /// a one-sided trim into an accidental whole-clip deletion.
+    private var activeInteriorEdit: (id: ClipItem.ID, sourceTime: Double)? {
+        guard let item = activeItem, !item.isImage else { return nil }
+        let grid = item.grid
+        let boundary = grid.nearestBoundary(to: activeEditSourceTime)
+        guard boundary > item.trimStartFrame, boundary < item.trimEndFrame else { return nil }
+        return (item.id, grid.boundary(boundary))
+    }
+
+    var canDeleteBeforePlayhead: Bool { activeInteriorEdit != nil }
+    var canDeleteAfterPlayhead: Bool { activeInteriorEdit != nil }
+
+    /// Ripple-trim the active clip from its previous edit point to the playhead.
+    func deleteBeforePlayhead() {
+        guard let edit = activeInteriorEdit else { return }
+        setTrimStart(edit.sourceTime, for: edit.id)
+    }
+
+    /// Ripple-trim the active clip from the playhead to its next edit point.
+    func deleteAfterPlayhead() {
+        guard let edit = activeInteriorEdit else { return }
+        setTrimEnd(edit.sourceTime, for: edit.id)
+    }
+
+    /// Split the selected video item at the playhead into two items.
+    func splitAtPlayhead() {
+        pauseTimelinePlayback()
+        guard let i = activeIndex, !items[i].isImage else { return }
+        let seg = items[i]
+        let g = seg.grid
+        let idx = g.nearestBoundary(to: activeEditSourceTime)
+        guard idx > seg.trimStartFrame, idx < seg.trimEndFrame else { return }
+        let t = g.boundary(idx)
+        registerUndo()
+        var left = seg; left.outPoint = t
+        let right = ClipItem(url: seg.url, kind: .video, naturalWidth: seg.naturalWidth,
+                            naturalHeight: seg.naturalHeight, sourceDuration: seg.sourceDuration,
+                            fps: seg.fps, fpsRational: seg.fpsRational,
+                            hasAudio: seg.hasAudio, keyframes: seg.keyframes,
+                            frameTimes: seg.frameTimes,
+                            inPoint: t, outPoint: seg.outPoint)
+        items[i] = left
+        items.insert(right, at: i + 1)
+        selectItem(right.id)
+    }
+
+    // MARK: - Transport
+
+    private func attachObserver(to p: AVPlayer) {
+        detachObserver()
+        timeObserverGeneration &+= 1
+        let generation = timeObserverGeneration
+        let itemID = activeItemID
+        let interval = CMTime(seconds: 0.03, preferredTimescale: 600)
+        observedPlayer = p
+        timeObserver = p.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] t in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                // Paused seeks update model time synchronously. Letting delayed
+                // AVPlayer callbacks write during that state is what moved the
+                // playhead left after the first click.
+                guard self.isTimelinePlaying,
+                      self.timeObserverGeneration == generation,
+                      self.observedPlayer === p,
+                      self.player === p,
+                      self.activeItemID == itemID else { return }
+                guard let item = self.activeItem, !item.isImage else { return }
+                if t.seconds >= item.outPoint - item.frameDuration / 2 {
+                    p.pause()
+                    self.currentTime = item.outPoint
+                    self.syncTimelineTimeFromActive()
+                    if self.isTimelinePlaying, !self.isAdvancingPlayback {
+                        Task { @MainActor [weak self] in
+                            self?.advanceTimelinePlayback(after: item.id)
+                        }
+                    }
+                } else {
+                    self.currentTime = max(item.inPoint, t.seconds)
+                    self.syncTimelineTimeFromActive()
+                }
+            }
+        }
+    }
+
+    private func detachObserver() {
+        timeObserverGeneration &+= 1
+        if let timeObserver, let observedPlayer { observedPlayer.removeTimeObserver(timeObserver) }
+        timeObserver = nil
+        observedPlayer = nil
+    }
+
+    private func seekPlayer(to t: Double) {
+        // Seek just inside the frame. Some sources use uncommon time bases (for
+        // example 1/12796800), so even a 60000 timescale can round a boundary
+        // backwards and leave the preview one frame behind the model.
+        // The out point is an exclusive edit boundary, so preview it using the
+        // final retained frame rather than the first frame that will be dropped.
+        let previewTime: Double
+        if let item = activeItem, !item.isImage,
+           t >= item.outPoint - 1e-9 {
+            let lastRetainedFrame = max(item.trimStartFrame, item.trimEndFrame - 1)
+            previewTime = item.grid.time(ofFrame: lastRetainedFrame)
+        } else {
+            previewTime = t
+        }
+        player?.seek(to: interiorFrameTime(previewTime),
+                     toleranceBefore: .zero, toleranceAfter: .zero)
+    }
+
+    func seek(to time: Double) {
+        pauseTimelinePlayback()
+        guard let item = activeItem else { return }
+        let t: Double
+        if item.isImage {
+            t = min(max(0, time), item.displayDuration)
+        } else {
+            t = min(max(item.inPoint, time), item.outPoint)
+        }
+        currentTime = t
+        if !item.isImage { seekPlayer(to: t) }
+        syncTimelineTimeFromActive()
+    }
+
+    /// Jump to a typed output-timeline position. Millisecond input is accepted and
+    /// rounded to the *nearest* frame boundary — unlike pointer snapping (floor),
+    /// because typed times are often truncated displays of an exact boundary
+    /// (boundary 9.611060 shows as "9.611"; flooring that would land a frame early).
+    func seekTimelineTyped(to time: Double) {
+        let clamped = min(max(0, time), totalOutputDuration)
+        guard let rawHit = timelineHit(at: clamped) else { return }
+        let item = items[rawHit.itemIndex]
+        if item.isImage {
+            seekTimeline(to: clamped)
+            return
+        }
+        let g = item.grid
+        let rounded = g.time(ofFrame: g.nearestFrame(to: rawHit.sourceTime))
+        seekTimeline(to: rawHit.timelineStart + (rounded - item.inPoint))
+    }
+
+    /// Jump to an exact source frame of the selected video clip.
+    func seek(toSourceFrame idx: Int) {
+        guard let item = activeItem, !item.isImage else { return }
+        seek(to: item.grid.time(ofFrame: idx))
+    }
+
+    /// Step the playhead by whole frames, walking the real frame grid so a step
+    /// always lands on the next/previous picture even on VFR sources. Stepping
+    /// past a clip edge moves onto the neighbouring clip.
+    func stepFrame(_ delta: Int) {
+        pauseTimelinePlayback()
+        guard delta != 0, let hit = timelineHit(at: timelineTime) else { return }
+        let item = items[hit.itemIndex]
+        if item.isImage {
+            let frameDuration = 1.0 / canvas.fpsValue
+            seekTimeline(to: min(max(0, timelineTime + Double(delta) * frameDuration),
+                                 totalOutputDuration))
+            return
+        }
+        let g = item.grid
+        let firstFrame = item.trimStartFrame
+        let endFrame = max(firstFrame + 1, item.trimEndFrame)
+        let idx = g.frameIndex(containing: hit.sourceTime) + delta
+        if idx < firstFrame {
+            seekTimeline(to: max(0, hit.timelineStart - 1e-4))
+        } else if idx >= endFrame {
+            seekTimeline(to: min(totalOutputDuration, hit.timelineEnd + 1e-4))
+        } else {
+            seekTimeline(to: hit.timelineStart + (g.time(ofFrame: idx) - item.inPoint))
+        }
+    }
+
+    func togglePlay() {
+        if isTimelinePlaying {
+            pauseTimelinePlayback()
+            return
+        }
+        guard hasProject else { return }
+        if timelineTime >= totalOutputDuration - 1e-6 {
+            seekTimeline(to: 0)
+        } else if activeItem == nil {
+            // Deselected (e.g. by clicking empty space): resume from the playhead
+            // instead of restarting the whole movie.
+            seekTimeline(to: timelineTime)
+        }
+        isTimelinePlaying = true
+        playCurrentTimelineItem()
+    }
+
+    /// Return keyboard focus from any time/frame text field to the timeline, so
+    /// single-key shortcuts (delete, space, q/w, s/i/o…) act on the selected clip.
+    func endTextEditing() {
+        isTextEditing = false
+        DispatchQueue.main.async { NSApp.keyWindow?.makeFirstResponder(nil) }
+    }
+
+    private func pauseTimelinePlayback() {
+        // Every timeline interaction lands here, making it the natural spot to
+        // reclaim focus from the text fields.
+        endTextEditing()
+        let wasPlaying = isTimelinePlaying
+        isTimelinePlaying = false
+        player?.pause()
+        imagePlaybackTask?.cancel()
+        imagePlaybackTask = nil
+        isAdvancingPlayback = false
+        // Playback reports time every ~30ms, so pausing almost always lands
+        // between two frame boundaries. Snap the committed playhead onto the
+        // nearest frame so it lines up with the frame cells and future cuts.
+        if wasPlaying, let item = activeItem, !item.isImage {
+            let snapped = min(max(item.inPoint, snap(currentTime)), item.outPoint)
+            currentTime = snapped
+            seekPlayer(to: snapped)
+            syncTimelineTimeFromActive()
+        }
+    }
+
+    private func playCurrentTimelineItem() {
+        guard isTimelinePlaying, let item = activeItem else {
+            pauseTimelinePlayback()
+            return
+        }
+        if item.isImage {
+            let initialTime = currentTime
+            let remaining = max(0, item.displayDuration - initialTime)
+            guard remaining > 1e-6 else {
+                advanceTimelinePlayback(after: item.id)
+                return
+            }
+            imagePlaybackTask?.cancel()
+            imagePlaybackTask = Task { [weak self] in
+                let startedAt = Date()
+                while !Task.isCancelled {
+                    guard let self, self.isTimelinePlaying, self.activeItemID == item.id else { return }
+                    let elapsed = Date().timeIntervalSince(startedAt)
+                    self.currentTime = min(item.displayDuration, initialTime + elapsed)
+                    self.syncTimelineTimeFromActive()
+                    if self.currentTime >= item.displayDuration - 1e-6 { break }
+                    try? await Task.sleep(for: .milliseconds(33))
+                }
+                guard !Task.isCancelled, let self, self.isTimelinePlaying,
+                      self.activeItemID == item.id else { return }
+                self.advanceTimelinePlayback(after: item.id)
+            }
+        } else {
+            guard let player else {
+                pauseTimelinePlayback()
+                return
+            }
+            if currentTime >= item.outPoint - item.frameDuration / 2 {
+                currentTime = item.inPoint
+                seekPlayer(to: item.inPoint)
+                syncTimelineTimeFromActive()
+            }
+            player.play()
+        }
+    }
+
+    private func advanceTimelinePlayback(after itemID: ClipItem.ID) {
+        guard isTimelinePlaying, !isAdvancingPlayback,
+              let index = items.firstIndex(where: { $0.id == itemID }) else { return }
+        isAdvancingPlayback = true
+        player?.pause()
+        imagePlaybackTask?.cancel()
+        imagePlaybackTask = nil
+
+        if let next = items[safe: index + 1] {
+            selectItemInternal(next.id)
+            isAdvancingPlayback = false
+            playCurrentTimelineItem()
+        } else {
+            if let last = items.last {
+                currentTime = last.isImage ? last.displayDuration : last.outPoint
+            }
+            timelineTime = totalOutputDuration
+            isTimelinePlaying = false
+            isAdvancingPlayback = false
+        }
+    }
+
+    // MARK: - Export
+
+    private static let exportFolderDefaultsKey = "exportFolderPath"
+
+    /// Default filename (no extension) offered by the export setup sheet.
+    var suggestedExportName: String {
+        items.first { $0.displayDuration > 1e-3 }?
+            .url.deletingPathExtension().lastPathComponent ?? "成品"
+    }
+
+    /// Last folder the user exported into, falling back to ~/Movies.
+    var defaultExportFolder: URL {
+        if let path = UserDefaults.standard.string(forKey: Self.exportFolderDefaultsKey),
+           FileManager.default.fileExists(atPath: path) {
+            return URL(fileURLWithPath: path, isDirectory: true)
+        }
+        return FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser
+    }
+
+    func rememberExportFolder(_ url: URL) {
+        UserDefaults.standard.set(url.path, forKey: Self.exportFolderDefaultsKey)
+    }
+
+    func export(to outURL: URL) {
+        guard let ff, hasProject else { return }
+        let usable = items.filter { $0.displayDuration > 1e-3 }
+        guard !usable.isEmpty else { errorMessage = "沒有可輸出的素材。"; return }
+
+        let assemblyItems = usable.map { item -> AssemblyItem in
+            if item.isImage {
+                return AssemblyItem(url: item.url, isImage: true,
+                                    trimStartFrame: 0, trimEndFrame: 0,
+                                    trimStart: 0, trimEnd: item.displayDuration,
+                                    duration: item.displayDuration, hasAudio: false)
+            }
+            // Resolve the in/out points to indices in the real frame grid: the cut
+            // lands on exactly the frames the preview showed, no matter how the
+            // source's timestamps sit relative to the nominal k/fps lattice.
+            let g = item.grid
+            let startFrame = item.trimStartFrame
+            let endFrame = max(startFrame + 1, item.trimEndFrame)
+            let start = g.boundary(startFrame)
+            let end = g.boundary(endFrame)
+            return AssemblyItem(url: item.url, isImage: false,
+                                trimStartFrame: startFrame, trimEndFrame: endFrame,
+                                trimStart: start, trimEnd: end,
+                                duration: end - start, hasAudio: item.hasAudio)
+        }
+        let canvas = self.canvas
+        let audio = self.audioURL
+        let settings = self.settings
+        isExporting = true
+        exportProgress = 0
+        exportResult = nil
+        exportDestination = outURL
+        exportStartDate = Date()
+        exportElapsed = nil
+        errorMessage = nil
+
+        exportTask = Task {
+            do {
+                self.exportResult = try await ff.exportAssembly(
+                    items: assemblyItems, audioURL: audio,
+                    canvas: canvas, output: outURL, settings: settings,
+                    onProgress: { [weak self] p in
+                        Task { @MainActor [weak self] in self?.exportProgress = p }
+                    })
+            } catch is CancellationError {
+                // ffmpeg was terminated mid-write; don't leave the torso behind.
+                try? FileManager.default.removeItem(at: outURL)
+            } catch {
+                self.errorMessage = (error as? FFError)?.errorDescription ?? error.localizedDescription
+            }
+            self.exportElapsed = self.exportStartDate.map { -$0.timeIntervalSinceNow }
+            self.isExporting = false
+            self.exportTask = nil
+        }
+    }
+
+    func cancelExport() {
+        exportTask?.cancel()
+    }
+
+}
+
+extension Array {
+    subscript(safe index: Int) -> Element? { indices.contains(index) ? self[index] : nil }
+}
