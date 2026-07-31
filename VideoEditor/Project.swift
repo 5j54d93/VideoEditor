@@ -120,7 +120,6 @@ struct LibraryAsset: Identifiable, Equatable {
     var fps: Double = 0
     var fpsRational: String = "30"
     var hasAudio: Bool = false
-    var keyframes: [Double] = [0]
     var frameTimes: [Double] = []   // real pts of every frame; empty → nominal grid
 }
 
@@ -135,7 +134,6 @@ struct ClipItem: Identifiable, Equatable {
     var fps: Double              // video fps; image: 0
     var fpsRational: String = "30"  // exact rate for ffmpeg (e.g. "21700/869"); image: unused
     var hasAudio: Bool
-    var keyframes: [Double] = [0]
     var frameTimes: [Double] = []   // real pts of every frame; empty → nominal grid
 
     var inPoint: Double = 0      // video trim start; image: 0
@@ -156,10 +154,4 @@ struct ClipItem: Identifiable, Equatable {
     /// First dropped frame (exclusive).
     var trimEndFrame: Int { grid.nearestBoundary(to: outPoint) }
 
-    /// Largest keyframe at or before `t` (for lossless-friendly cuts).
-    func keyframe(atOrBefore t: Double) -> Double {
-        var best = 0.0
-        for k in keyframes { if k <= t + 1e-6 { best = k } else { break } }
-        return best
-    }
 }

@@ -128,7 +128,6 @@ final class EditorModel {
         videoSourceRevisions[normalizedSourceURL(url), default: 0]
     }
 
-    var activeTotalFrames: Int { activeItem.map { $0.grid.frameCount } ?? 1 }
     var currentFrameIndex: Int {
         guard let item = activeItem, !item.isImage else { return 0 }
         let first = item.trimStartFrame
@@ -141,24 +140,6 @@ final class EditorModel {
         let g = item.grid
         return g.time(ofFrame: g.nearestFrame(to: t))
     }
-    var isPlaying: Bool { isTimelinePlaying }
-
-    // Trim of the selected video item, as bindable points.
-    var activeInPoint: Double {
-        get { activeItem?.inPoint ?? 0 }
-        set {
-            guard let id = activeItemID else { return }
-            setTrimStart(newValue, for: id)
-        }
-    }
-    var activeOutPoint: Double {
-        get { activeItem?.outPoint ?? 0 }
-        set {
-            guard let id = activeItemID else { return }
-            setTrimEnd(newValue, for: id)
-        }
-    }
-
     // MARK: - Canvas / output
 
     private func even(_ x: Int) -> Int { x % 2 == 0 ? max(2, x) : x + 1 }
@@ -567,7 +548,6 @@ final class EditorModel {
                      duration: info.duration, fps: info.fps,
                      fpsRational: info.fpsRational,
                      hasAudio: info.audioCodec != nil,
-                     keyframes: info.keyframes,
                      frameTimes: info.frameTimes)
     }
 
@@ -669,7 +649,6 @@ final class EditorModel {
         asset.fps = info.fps
         asset.fpsRational = info.fpsRational
         asset.hasAudio = info.audioCodec != nil
-        asset.keyframes = info.keyframes
         asset.frameTimes = info.frameTimes
     }
 
@@ -725,7 +704,6 @@ final class EditorModel {
         item.fps = info.fps
         item.fpsRational = info.fpsRational
         item.hasAudio = info.audioCodec != nil
-        item.keyframes = info.keyframes
         item.frameTimes = info.frameTimes
         item.inPoint = newGrid.boundary(startFrame)
         item.outPoint = newGrid.boundary(endFrame)
@@ -757,8 +735,7 @@ final class EditorModel {
                                 naturalWidth: asset.width, naturalHeight: asset.height,
                                 sourceDuration: asset.duration, fps: asset.fps,
                                 fpsRational: asset.fpsRational,
-                                hasAudio: asset.hasAudio, keyframes: asset.keyframes,
-                                frameTimes: asset.frameTimes,
+                                hasAudio: asset.hasAudio, frameTimes: asset.frameTimes,
                                 inPoint: grid.boundary(grid.firstDisplayedFrame),
                                 outPoint: grid.boundary(grid.frameCount)), at: index)
         }
@@ -963,13 +940,6 @@ final class EditorModel {
         }
     }
 
-    /// Move a clip into the gap at `insertionIndex`, counted in the pre-move
-    /// array (the gap the user pointed at: 0 = before the first clip,
-    /// `items.count` = after the last).
-    func moveItem(_ id: ClipItem.ID, to insertionIndex: Int) {
-        moveItems([id], to: insertionIndex)
-    }
-
     /// Move several clips as one ordered group. Selected clips do not need to be
     /// adjacent: they are lifted out, retain their relative project order, then
     /// are inserted together at the pointed gap. Translating the pre-move gap
@@ -1102,8 +1072,7 @@ final class EditorModel {
         let right = ClipItem(url: seg.url, kind: .video, naturalWidth: seg.naturalWidth,
                             naturalHeight: seg.naturalHeight, sourceDuration: seg.sourceDuration,
                             fps: seg.fps, fpsRational: seg.fpsRational,
-                            hasAudio: seg.hasAudio, keyframes: seg.keyframes,
-                            frameTimes: seg.frameTimes,
+                            hasAudio: seg.hasAudio, frameTimes: seg.frameTimes,
                             inPoint: t, outPoint: seg.outPoint)
         items[i] = left
         items.insert(right, at: i + 1)
@@ -1171,43 +1140,6 @@ final class EditorModel {
         }
         player?.seek(to: interiorFrameTime(previewTime),
                      toleranceBefore: .zero, toleranceAfter: .zero)
-    }
-
-    func seek(to time: Double) {
-        pauseTimelinePlayback()
-        guard let item = activeItem else { return }
-        let t: Double
-        if item.isImage {
-            t = min(max(0, time), item.displayDuration)
-        } else {
-            t = min(max(item.inPoint, time), item.outPoint)
-        }
-        currentTime = t
-        if !item.isImage { seekPlayer(to: t) }
-        syncTimelineTimeFromActive()
-    }
-
-    /// Jump to a typed output-timeline position. Millisecond input is accepted and
-    /// rounded to the *nearest* frame boundary — unlike pointer snapping (floor),
-    /// because typed times are often truncated displays of an exact boundary
-    /// (boundary 9.611060 shows as "9.611"; flooring that would land a frame early).
-    func seekTimelineTyped(to time: Double) {
-        let clamped = min(max(0, time), totalOutputDuration)
-        guard let rawHit = timelineHit(at: clamped) else { return }
-        let item = items[rawHit.itemIndex]
-        if item.isImage {
-            seekTimeline(to: clamped)
-            return
-        }
-        let g = item.grid
-        let rounded = g.time(ofFrame: g.nearestFrame(to: rawHit.sourceTime))
-        seekTimeline(to: rawHit.timelineStart + (rounded - item.inPoint))
-    }
-
-    /// Jump to an exact source frame of the selected video clip.
-    func seek(toSourceFrame idx: Int) {
-        guard let item = activeItem, !item.isImage else { return }
-        seek(to: item.grid.time(ofFrame: idx))
     }
 
     /// Step the playhead by whole frames, walking the real frame grid so a step

@@ -21,7 +21,7 @@ A native macOS video editor built with SwiftUI that cuts on **real** frames and 
 
 Drop videos, images and audio files anywhere in the window — or press <kbd>⌘</kbd><kbd>I</kbd> — and they land in the left sidebar as a card grid with thumbnails, duration badges and vitals.
 
-- **Probed once**：every file is inspected on import（dimensions, exact frame rate, keyframes, per-frame timestamps）, so dragging the same asset onto the timeline ten times never re-probes it.
+- **Probed once**：every file is inspected on import（dimensions, exact frame rate, per-frame timestamps）, so dragging the same asset onto the timeline ten times never re-probes it.
 - **Search and filter**：filter by name, or narrow the grid to videos／images／audio only.
 - **Drag or double-click**：drag a card onto the timeline to insert it at the caret, or double-click to append it to the end.
 - **Audio is background music**：an audio asset doesn't become a clip — it becomes the movie's music track（overriding the clips' own audio）, marked with a 背景音樂 badge on its card.

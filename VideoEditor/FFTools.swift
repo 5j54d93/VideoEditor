@@ -22,19 +22,8 @@ struct MediaInfo: Sendable {
     var fpsRational: String       // exact rate as ffmpeg rational, e.g. "21700/869"
     var width: Int
     var height: Int
-    var videoCodec: String
     var audioCodec: String?
-    var keyframes: [Double]       // pts_time of every key frame, ascending
     var frameTimes: [Double]      // pts_time of every frame, ascending; [] if unavailable
-
-    /// Largest keyframe time <= `time` (where a lossless copy can start cleanly).
-    func keyframe(atOrBefore time: Double) -> Double {
-        var best = 0.0
-        for k in keyframes {
-            if k <= time + 1e-6 { best = k } else { break }
-        }
-        return best
-    }
 }
 
 // MARK: - Export configuration
@@ -84,9 +73,6 @@ struct ExportResult: Sendable {
     var outputURL: URL
     var sha256: String
     var command: String       // human-readable command, for transparency
-    var actualStart: Double    // where the clip really starts (snapped for lossless)
-    var requestedStart: Double
-    var wasSnapped: Bool
     var log: String
 }
 
@@ -182,7 +168,6 @@ struct FFTools: Sendable {
 
         let width = (v["width"] as? Int) ?? 0
         let height = (v["height"] as? Int) ?? 0
-        let vCodec = (v["codec_name"] as? String) ?? "?"
         let aCodec = a?["codec_name"] as? String
 
         // Keep the exact rational (e.g. "21700/869" ≈ 24.9713) alongside the Double:
@@ -201,7 +186,6 @@ struct FFTools: Sendable {
         var duration = Double(format["duration"] as? String ?? "") ?? 0
         if duration == 0 { duration = Double(v["duration"] as? String ?? "") ?? 0 }
 
-        let keyframes = try await keyframeTimes(url)
         // Packet `pts_time` is printed by ffprobe with only six decimal places.
         // Preserve the integer PTS and apply the stream time base ourselves so
         // zero-tolerance preview seeks cannot fall on the preceding frame after
@@ -211,8 +195,7 @@ struct FFTools: Sendable {
 
         return MediaInfo(duration: duration, fps: fps, fpsRational: fpsRational,
                          width: width, height: height,
-                         videoCodec: vCodec, audioCodec: aCodec, keyframes: keyframes,
-                         frameTimes: frameTimes)
+                         audioCodec: aCodec, frameTimes: frameTimes)
     }
 
     /// Just the pixel dimensions of the first video stream (used for still images).
@@ -239,18 +222,6 @@ struct FFTools: Sendable {
         return Double((root["format"] as? [String: Any])?["duration"] as? String ?? "") ?? 0
     }
 
-    /// pts_time of every keyframe. `-skip_frame nokey` makes the decoder emit only key frames.
-    private nonisolated func keyframeTimes(_ url: URL) async throws -> [Double] {
-        let args = ["-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey",
-                    "-show_entries", "frame=pts_time", "-of", "csv=p=0", url.path]
-        let (code, out) = try await Self.run(ffprobe, args)
-        guard code == 0 else { throw FFError.probeFailed(out) }
-        let times = out.split(whereSeparator: \.isNewline)
-            .compactMap { Double($0.trimmingCharacters(in: CharacterSet(charactersIn: ", "))) }
-            .sorted()
-        return times.isEmpty ? [0.0] : times
-    }
-
     /// Real pts of every video packet (one per frame; display order after sorting).
     /// Packet-level, so no decode — fast even on long sources. This is the exact
     /// lattice ffmpeg's `trim` counts frames on. Returns [] when any packet lacks
@@ -274,76 +245,6 @@ struct FFTools: Sendable {
     }
 
     // MARK: Export
-
-    /// Build the ffmpeg argument list for a cut. Pure function so it can be unit-tested
-    /// and shown to the user verbatim.
-    static func exportArgs(input: URL, output: URL, start: Double, duration: Double,
-                           settings: ExportSettings) -> [String] {
-        var args = ["-nostdin", "-y",
-                    "-fflags", "+bitexact",
-                    "-ss", fmt(start),
-                    "-i", input.path,
-                    "-t", fmt(duration),
-                    "-map", "0:v:0", "-map", "0:a:0?"]
-
-        switch settings.mode {
-        case .losslessCopy:
-            args += ["-c", "copy"]
-        case .reencode:
-            args += ["-c:v", "libx264",
-                     "-preset", settings.preset,
-                     "-crf", String(settings.crf),
-                     "-pix_fmt", "yuv420p"]
-            if settings.strictSingleThread {
-                args += ["-x264-params", "threads=1"]
-            }
-            args += ["-c:a", "aac", "-b:a", "192k"]
-        }
-
-        // Deterministic container: strip metadata, no encoder tag, no random UUID/time.
-        args += ["-map_metadata", "-1",
-                 "-map_chapters", "-1",
-                 "-flags", "+bitexact",
-                 "-movflags", "+faststart",
-                 output.path]
-        return args
-    }
-
-    /// Build the ffmpeg args to concatenate several kept ranges into one clip.
-    /// Uses the trim/concat filter and re-encodes with libx264 — the only way to
-    /// cut on arbitrary frames — but bitexact keeps the output byte-deterministic.
-    static func concatArgs(input: URL, output: URL, ranges: [(start: Double, end: Double)],
-                           hasAudio: Bool, settings: ExportSettings) -> [String] {
-        var filter = ""
-        for (i, r) in ranges.enumerated() {
-            filter += "[0:v]trim=start=\(fmt(r.start)):end=\(fmt(r.end)),setpts=PTS-STARTPTS[v\(i)];"
-            if hasAudio {
-                filter += "[0:a]atrim=start=\(fmt(r.start)):end=\(fmt(r.end)),asetpts=PTS-STARTPTS[a\(i)];"
-            }
-        }
-        var inputs = ""
-        for i in 0..<ranges.count {
-            inputs += "[v\(i)]"
-            if hasAudio { inputs += "[a\(i)]" }
-        }
-        filter += "\(inputs)concat=n=\(ranges.count):v=1:a=\(hasAudio ? 1 : 0)[outv]"
-        if hasAudio { filter += "[outa]" }
-
-        var args = ["-nostdin", "-y", "-fflags", "+bitexact",
-                    "-i", input.path,
-                    "-filter_complex", filter,
-                    "-map", "[outv]"]
-        if hasAudio { args += ["-map", "[outa]"] }
-
-        args += ["-c:v", "libx264", "-preset", settings.preset,
-                 "-crf", String(settings.crf), "-pix_fmt", "yuv420p"]
-        if settings.strictSingleThread { args += ["-x264-params", "threads=1"] }
-        if hasAudio { args += ["-c:a", "aac", "-b:a", "192k"] }
-
-        args += ["-map_metadata", "-1", "-map_chapters", "-1",
-                 "-flags", "+bitexact", "-movflags", "+faststart", output.path]
-        return args
-    }
 
     /// Build ffmpeg args to assemble several assets (videos + images) into one clip
     /// on a shared canvas, with either a background-music track (overriding original
@@ -426,51 +327,7 @@ struct FFTools: Sendable {
         guard code == 0 else { throw FFError.exportFailed(code: code, log: log) }
         let sha = try Self.sha256(of: output)
         let pretty = ([ffmpeg.lastPathComponent] + args).joined(separator: " ")
-        return ExportResult(outputURL: output, sha256: sha, command: pretty,
-                            actualStart: 0, requestedStart: 0, wasSnapped: false, log: log)
-    }
-
-    nonisolated func exportConcat(input: URL, output: URL, info: MediaInfo,
-                                  ranges: [(start: Double, end: Double)],
-                                  settings: ExportSettings) async throws -> ExportResult {
-        let hasAudio = info.audioCodec != nil
-        let args = Self.concatArgs(input: input, output: output, ranges: ranges,
-                                   hasAudio: hasAudio, settings: settings)
-        let (code, log) = try await Self.run(ffmpeg, args)
-        guard code == 0 else { throw FFError.exportFailed(code: code, log: log) }
-
-        let sha = try Self.sha256(of: output)
-        let pretty = ([ffmpeg.lastPathComponent] + args).joined(separator: " ")
-        let first = ranges.first?.start ?? 0
-        return ExportResult(outputURL: output, sha256: sha, command: pretty,
-                            actualStart: first, requestedStart: first,
-                            wasSnapped: false, log: log)
-    }
-
-    nonisolated func export(input: URL, output: URL, info: MediaInfo,
-                            requestedStart: Double, end: Double,
-                            settings: ExportSettings) async throws -> ExportResult {
-        // Lossless copy must begin on a keyframe; frame-accurate re-encode starts exactly.
-        let start: Double
-        switch settings.mode {
-        case .losslessCopy: start = info.keyframe(atOrBefore: requestedStart)
-        case .reencode:     start = requestedStart
-        }
-        let duration = max(0, end - start)
-
-        let args = Self.exportArgs(input: input, output: output,
-                                   start: start, duration: duration, settings: settings)
-        let (code, log) = try await Self.run(ffmpeg, args)
-        guard code == 0 else { throw FFError.exportFailed(code: code, log: log) }
-
-        let sha = try Self.sha256(of: output)
-        let pretty = ([ffmpeg.lastPathComponent] + args).joined(separator: " ")
-        let snapped = abs(start - requestedStart) > 1e-4
-
-        return ExportResult(outputURL: output, sha256: sha, command: pretty,
-                            actualStart: start, requestedStart: requestedStart,
-                            wasSnapped: snapped && settings.mode == .losslessCopy,
-                            log: log)
+        return ExportResult(outputURL: output, sha256: sha, command: pretty, log: log)
     }
 
     // MARK: - Helpers
