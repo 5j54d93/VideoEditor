@@ -35,10 +35,29 @@ struct TimelinePreview {
     let showsScrubPlayer: Bool
 }
 
-private enum ProbedLibraryImport {
+private enum ProbedLibraryImport: Sendable {
     case image(url: URL, width: Int, height: Int)
     case audio(url: URL, duration: Double)
     case video(url: URL, info: MediaInfo)
+}
+
+private enum LibraryImportKind: Sendable {
+    case image, audio, video
+}
+
+private struct LibraryImportRequest: Sendable {
+    let order: Int
+    let url: URL
+    let generation: Int
+    let kind: LibraryImportKind
+}
+
+private struct ProbedLibraryImportResult: Sendable {
+    let order: Int
+    let url: URL
+    let generation: Int
+    let entry: ProbedLibraryImport?
+    let errorMessage: String?
 }
 
 @MainActor
@@ -445,12 +464,21 @@ final class EditorModel {
         guard !urls.isEmpty else { return }
 
         var seen: Set<URL> = []
-        let requests = urls.compactMap { rawURL -> (url: URL, generation: Int)? in
+        let requests = urls.enumerated().compactMap { order, rawURL -> LibraryImportRequest? in
             let url = normalizedSourceURL(rawURL)
             guard seen.insert(url).inserted else { return nil }
             let generation = sourceImportGenerations[url, default: 0] &+ 1
             sourceImportGenerations[url] = generation
-            return (url, generation)
+            let kind: LibraryImportKind
+            if isImageURL(url) {
+                kind = .image
+            } else if isAudioURL(url) {
+                kind = .audio
+            } else {
+                kind = .video
+            }
+            return LibraryImportRequest(order: order, url: url,
+                                        generation: generation, kind: kind)
         }
         guard !requests.isEmpty else { return }
 
@@ -458,29 +486,65 @@ final class EditorModel {
         activeImportCount += 1
         isImporting = true
         Task {
+            let results: [ProbedLibraryImportResult]
+            do {
+                results = try await withThrowingTaskGroup(
+                    of: ProbedLibraryImportResult.self,
+                    returning: [ProbedLibraryImportResult].self
+                ) { group in
+                    for request in requests {
+                        group.addTask {
+                            do {
+                                let entry: ProbedLibraryImport
+                                switch request.kind {
+                                case .image:
+                                    let dimensions = try await ff.probeDimensions(request.url)
+                                    entry = .image(url: request.url,
+                                                   width: dimensions.w, height: dimensions.h)
+                                case .audio:
+                                    let duration = try await ff.probeDuration(request.url)
+                                    entry = .audio(url: request.url, duration: duration)
+                                case .video:
+                                    entry = .video(url: request.url,
+                                                   info: try await ff.probe(request.url))
+                                }
+                                return ProbedLibraryImportResult(
+                                    order: request.order, url: request.url,
+                                    generation: request.generation,
+                                    entry: entry, errorMessage: nil)
+                            } catch {
+                                return ProbedLibraryImportResult(
+                                    order: request.order, url: request.url,
+                                    generation: request.generation, entry: nil,
+                                    errorMessage: (error as? FFError)?.errorDescription
+                                        ?? error.localizedDescription)
+                            }
+                        }
+                    }
+
+                    var completed: [ProbedLibraryImportResult] = []
+                    completed.reserveCapacity(requests.count)
+                    for try await result in group { completed.append(result) }
+                    return completed.sorted { $0.order < $1.order }
+                }
+            } catch {
+                // Each child converts its own probe failure to a value, so only
+                // task-group cancellation or another structural failure lands here.
+                self.errorMessage = error.localizedDescription
+                activeImportCount -= 1
+                isImporting = activeImportCount > 0
+                return
+            }
+
             var probedImports: [(entry: ProbedLibraryImport, url: URL, generation: Int)] = []
-            for request in requests {
-                do {
-                    let result: ProbedLibraryImport
-                    if isImageURL(request.url) {
-                        let (width, height) = try await ff.probeDimensions(request.url)
-                        result = .image(url: request.url, width: width, height: height)
-                    } else if isAudioURL(request.url) {
-                        let duration = try await ff.probeDuration(request.url)
-                        result = .audio(url: request.url, duration: duration)
-                    } else {
-                        result = .video(url: request.url, info: try await ff.probe(request.url))
-                    }
-                    guard sourceImportGenerations[request.url] == request.generation else {
-                        continue
-                    }
-                    probedImports.append((result, request.url, request.generation))
-                } catch {
-                    guard sourceImportGenerations[request.url] == request.generation else {
-                        continue
-                    }
-                    self.errorMessage = "無法讀取 \(request.url.lastPathComponent)：" +
-                        ((error as? FFError)?.errorDescription ?? error.localizedDescription)
+            for result in results {
+                guard sourceImportGenerations[result.url] == result.generation else {
+                    continue
+                }
+                if let entry = result.entry {
+                    probedImports.append((entry, result.url, result.generation))
+                } else if let message = result.errorMessage {
+                    self.errorMessage = "無法讀取 \(result.url.lastPathComponent)：" + message
                 }
             }
 
