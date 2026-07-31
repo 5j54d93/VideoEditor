@@ -388,6 +388,15 @@ final class EditorModel {
 
     private var undoStack: [ProjectSnapshot] = []
     private var redoStack: [ProjectSnapshot] = []
+    /// Captures the state at the start of one continuous slider gesture. The
+    /// snapshot is only pushed after the gesture actually changes the value, so
+    /// clicking the slider without moving it neither adds a no-op undo step nor
+    /// clears redo history.
+    @ObservationIgnored private var imageDurationEditingSession: (
+        itemID: ClipItem.ID,
+        undoSnapshot: ProjectSnapshot,
+        hasRegisteredUndo: Bool
+    )?
     var canUndo: Bool { !undoStack.isEmpty }
     var canRedo: Bool { !redoStack.isEmpty }
 
@@ -403,18 +412,24 @@ final class EditorModel {
     /// Push the current project state as one undo step. Call exactly once per
     /// user action, immediately before its first mutation.
     private func registerUndo() {
-        undoStack.append(snapshot())
+        registerUndo(snapshot())
+    }
+
+    private func registerUndo(_ undoSnapshot: ProjectSnapshot) {
+        undoStack.append(undoSnapshot)
         if undoStack.count > 100 { undoStack.removeFirst() }
         redoStack.removeAll()
     }
 
     func undo() {
+        imageDurationEditingSession = nil
         guard let past = undoStack.popLast() else { return }
         redoStack.append(snapshot())
         apply(past)
     }
 
     func redo() {
+        imageDurationEditingSession = nil
         guard let future = redoStack.popLast() else { return }
         undoStack.append(snapshot())
         apply(future)
@@ -1032,9 +1047,16 @@ final class EditorModel {
 
     // MARK: - Selected-item editing
 
-    func setImageDuration(_ seconds: Double) {
-        guard let id = activeItemID else { return }
-        setImageDuration(seconds, for: id)
+    func beginImageDurationEditing(for id: ClipItem.ID) {
+        pauseTimelinePlayback()
+        guard items.contains(where: { $0.id == id && $0.isImage }) else { return }
+        guard imageDurationEditingSession?.itemID != id else { return }
+        imageDurationEditingSession = (id, snapshot(), false)
+    }
+
+    func endImageDurationEditing(for id: ClipItem.ID) {
+        guard imageDurationEditingSession?.itemID == id else { return }
+        imageDurationEditingSession = nil
     }
 
     func setImageDuration(_ seconds: Double, for id: ClipItem.ID) {
@@ -1042,7 +1064,15 @@ final class EditorModel {
         guard let index = items.firstIndex(where: { $0.id == id }), items[index].isImage else { return }
         let newValue = max(0.1, seconds)
         guard newValue != items[index].outPoint else { return }
-        registerUndo()
+        if var session = imageDurationEditingSession, session.itemID == id {
+            if !session.hasRegisteredUndo {
+                registerUndo(session.undoSnapshot)
+                session.hasRegisteredUndo = true
+                imageDurationEditingSession = session
+            }
+        } else {
+            registerUndo()
+        }
         items[index].outPoint = newValue
         if activeItemID == id {
             currentTime = min(currentTime, items[index].displayDuration)

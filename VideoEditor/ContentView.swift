@@ -168,8 +168,20 @@ struct ContentView: View {
         HStack(spacing: 12) {
             Image(systemName: "photo").foregroundStyle(.secondary)
             Text("圖片顯示秒數").font(.callout)
-            Slider(value: Binding(get: { item.displayDuration },
-                                  set: { model.setImageDuration($0) }), in: 0.2...20)
+            Slider(
+                value: Binding(
+                    get: { item.displayDuration },
+                    set: { model.setImageDuration($0, for: item.id) }
+                ),
+                in: 0.2...20,
+                onEditingChanged: { isEditing in
+                    if isEditing {
+                        model.beginImageDurationEditing(for: item.id)
+                    } else {
+                        model.endImageDurationEditing(for: item.id)
+                    }
+                }
+            )
                 .frame(width: 260)
             Text(String(format: "%.1f 秒", item.displayDuration))
                 .font(.system(.callout, design: .monospaced)).frame(width: 64, alignment: .leading)
