@@ -710,6 +710,7 @@ private struct ExactFrameTimelineStrip: View {
 
     @State private var frames: [Int: CGImage] = [:]
     @State private var loadedSourceRevision: Int?
+    @State private var loadGeneration: UInt = 0
 
     private var frameWidth: CGFloat { pointsPerSecond / CGFloat(fps) }
     private var retainedFirstFrame: Int { grid.nearestBoundary(to: start) }
@@ -752,13 +753,21 @@ private struct ExactFrameTimelineStrip: View {
         .clipped()
         .allowsHitTesting(false)
         .task(id: requestID) {
+            loadGeneration &+= 1
+            let expectedGeneration = loadGeneration
+            let expectedRequestID = requestID
             if loadedSourceRevision != sourceRevision {
                 frames.removeAll(keepingCapacity: true)
                 loadedSourceRevision = sourceRevision
             }
             try? await Task.sleep(for: .milliseconds(45))
-            guard !Task.isCancelled else { return }
-            await loadRequestedFrames()
+            guard !Task.isCancelled,
+                  loadGeneration == expectedGeneration,
+                  requestID == expectedRequestID else { return }
+            await loadRequestedFrames(
+                expectedRequestID: expectedRequestID,
+                expectedGeneration: expectedGeneration
+            )
         }
     }
 
@@ -801,25 +810,28 @@ private struct ExactFrameTimelineStrip: View {
         }
     }
 
-    private func loadRequestedFrames() async {
+    private func loadRequestedFrames(expectedRequestID: String, expectedGeneration: UInt) async {
         guard let thumbnailer else { return }
         let wanted = requestedFrames
         guard !wanted.isEmpty else { return }
-        let center = min(max(preferredFrame ?? ((wanted.first! + wanted.last!) / 2),
-                             wanted.first!), wanted.last!)
-        let prioritized = wanted.sorted {
-            let leftDistance = abs($0 - center)
-            let rightDistance = abs($1 - center)
-            return leftDistance == rightDistance ? $0 < $1 : leftDistance < rightDistance
-        }
 
-        for frameIndex in prioritized where frames[frameIndex] == nil {
-            guard !Task.isCancelled else { return }
-            if let image = await thumbnailer.exactFrame(at: grid.time(ofFrame: frameIndex)) {
-                guard !Task.isCancelled else { return }
-                frames[frameIndex] = image
-            }
+        // Submit every visible cache miss together so AVFoundation can walk the
+        // source once instead of making a second GOP pass for a priority cell.
+        let misses = wanted.compactMap { frameIndex -> Thumbnailer.ExactRequest? in
+            guard frames[frameIndex] == nil else { return nil }
+            return Thumbnailer.ExactRequest(
+                frameIndex: frameIndex,
+                time: grid.time(ofFrame: frameIndex)
+            )
+        }.sorted {
+            if $0.time == $1.time { return $0.frameIndex < $1.frameIndex }
+            return $0.time < $1.time
         }
+        let loaded = await thumbnailer.exactFrames(misses)
+        guard !Task.isCancelled,
+              loadGeneration == expectedGeneration,
+              requestID == expectedRequestID else { return }
+        frames.merge(loaded) { _, new in new }
 
         let retained = Set(wanted)
         frames = frames.filter { retained.contains($0.key) }
