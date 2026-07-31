@@ -34,13 +34,88 @@ struct TimelineView: View {
         let anchorViewportX: CGFloat
     }
 
+    /// One prefix-sum pass per body evaluation. Rendering and pointer geometry
+    /// share these boundaries instead of repeatedly walking `model.items`.
+    private struct TimelineLayout {
+        struct Entry: Identifiable {
+            let item: ClipItem
+            let start: Double
+            let end: Double
+
+            var id: ClipItem.ID { item.id }
+        }
+
+        let entries: [Entry]
+        /// Clip boundaries in seconds: index 0 is zero and index n is movie end.
+        let boundaries: [Double]
+        let totalDuration: Double
+
+        init(items: [ClipItem]) {
+            var entries: [Entry] = []
+            entries.reserveCapacity(items.count)
+            var boundaries: [Double] = [0]
+            boundaries.reserveCapacity(items.count + 1)
+            var start = 0.0
+            for item in items {
+                let end = start + item.displayDuration
+                entries.append(Entry(item: item, start: start, end: end))
+                boundaries.append(end)
+                start = end
+            }
+            self.entries = entries
+            self.boundaries = boundaries
+            totalDuration = start
+        }
+
+        func insertionIndex(at x: CGFloat, scale: CGFloat) -> Int {
+            guard !entries.isEmpty, scale > 0 else { return 0 }
+            var low = 0
+            var high = entries.count
+            // Find the first clip midpoint strictly to the right of x. This
+            // preserves the existing rule that an exact midpoint inserts after.
+            while low < high {
+                let mid = (low + high) / 2
+                let midpoint = CGFloat((boundaries[mid] + boundaries[mid + 1]) / 2) * scale
+                if x < midpoint { high = mid } else { low = mid + 1 }
+            }
+            return low
+        }
+
+        func insertionX(_ index: Int, scale: CGFloat) -> CGFloat {
+            CGFloat(boundaries[min(max(0, index), entries.count)]) * scale
+        }
+
+        func itemID(at time: Double) -> ClipItem.ID? {
+            guard !entries.isEmpty,
+                  time >= 0,
+                  time <= totalDuration + 1e-9 else { return nil }
+            var low = 0
+            var high = entries.count
+            while low < high {
+                let mid = (low + high) / 2
+                if boundaries[mid + 1] > time { high = mid } else { low = mid + 1 }
+            }
+            if low < entries.count { return entries[low].id }
+            return entries.last?.id
+        }
+
+        func selection(in rect: CGRect, scale: CGFloat) -> Set<ClipItem.ID> {
+            Set(entries.lazy.filter { entry in
+                let minX = CGFloat(entry.start) * scale
+                let maxX = CGFloat(entry.end) * scale
+                return rect.minX <= maxX && rect.maxX >= minX
+            }.map(\.id))
+        }
+    }
+
     var body: some View {
+        let layout = TimelineLayout(items: model.items)
         VStack(alignment: .leading, spacing: 7) {
-            header
+            header(layout: layout)
 
             GeometryReader { geo in
                 let scale = CGFloat(model.timelinePointsPerSecond)
-                let clipsWidth = CGFloat(model.totalOutputDuration) * scale
+                let clipsWidth = CGFloat(layout.totalDuration) * scale
                 let trailingWorkspace = max(360, geo.size.width * 0.72)
                 let contentWidth = max(geo.size.width, clipsWidth + trailingWorkspace)
                 // The drop zone always fills the pane; clips inside render at a
@@ -48,7 +123,8 @@ struct TimelineView: View {
                 let trackHeight = max(baseTrackHeight, geo.size.height - rulerHeight)
 
                 ScrollView(.horizontal, showsIndicators: true) {
-                    canvas(width: contentWidth, clipsWidth: clipsWidth, scale: scale,
+                    canvas(layout: layout, width: contentWidth,
+                           clipsWidth: clipsWidth, scale: scale,
                            viewportWidth: geo.size.width, trackHeight: trackHeight)
                 }
                 .scrollPosition($scrollPosition)
@@ -56,19 +132,24 @@ struct TimelineView: View {
                                         of: { max(0, $0.contentOffset.x) }) { _, newValue in
                     scrollOffset = newValue
                 }
-                .onAppear { updateViewportWidth(geo.size.width) }
-                .onChange(of: geo.size.width) { _, w in updateViewportWidth(w) }
+                .onAppear {
+                    updateViewportWidth(geo.size.width,
+                                        totalDuration: layout.totalDuration)
+                }
+                .onChange(of: geo.size.width) { _, w in
+                    updateViewportWidth(w, totalDuration: layout.totalDuration)
+                }
             }
             .frame(minHeight: baseTrackHeight + rulerHeight, maxHeight: .infinity, alignment: .top)
             .onChange(of: model.timelineAutoFitRequestID) { _, _ in
-                fitTimelineToViewport()
+                fitTimelineToViewport(totalDuration: layout.totalDuration)
             }
         }
     }
 
     /// Single toolbar row: transport / editing controls on the left, zoom on the
     /// right.
-    private var header: some View {
+    private func header(layout: TimelineLayout) -> some View {
         HStack(spacing: 9) {
             Button { model.togglePlay() } label: {
                 HStack(spacing: 5) {
@@ -116,7 +197,7 @@ struct TimelineView: View {
                 .help("從成品時間軸與輸出中移除選取的片段（⌫）")
             }
 
-            Text(headerInfo)
+            Text(headerInfo(layout: layout))
                 .font(.system(.caption2, design: .monospaced))
                 .foregroundStyle(.tertiary)
                 .lineLimit(1)
@@ -144,42 +225,43 @@ struct TimelineView: View {
             .help("時間軸縮放")
             Image(systemName: "plus.magnifyingglass").foregroundStyle(.secondary)
             Button {
-                fitTimelineToViewport()
+                fitTimelineToViewport(totalDuration: layout.totalDuration)
             } label: {
                 HStack(spacing: 5) {
                     Text("符合視窗")
                     KeyCapHint("⇧Z")
                 }
             }
-            .disabled(model.totalOutputDuration <= 0)
+            .disabled(layout.totalDuration <= 0)
             .help("自動調整縮放，讓整個成品剛好塞進時間軸的可視寬度，並捲回開頭（⇧Z）")
         }
         .buttonStyle(.bordered)
         .controlSize(.small)
     }
 
-    private func fitTimelineToViewport(width: CGFloat? = nil) {
+    private func fitTimelineToViewport(width: CGFloat? = nil, totalDuration: Double) {
         let measuredWidth = width ?? viewportWidth
         guard measuredWidth > 0 else {
             pendingAutoFit = true
             return
         }
         pendingAutoFit = false
-        model.fitTimeline(in: max(120, measuredWidth - 24))
+        guard totalDuration > 0 else { return }
+        model.setTimelineScale(Double(max(120, measuredWidth - 24)) / totalDuration)
         // Scroll after the zoom change has re-laid the content: in the same
         // update the target is clamped against the old width and the viewport
         // stays where it was.
         DispatchQueue.main.async { scrollPosition.scrollTo(x: 0) }
     }
 
-    private func updateViewportWidth(_ width: CGFloat) {
+    private func updateViewportWidth(_ width: CGFloat, totalDuration: Double) {
         viewportWidth = width
         guard pendingAutoFit, width > 0 else { return }
-        fitTimelineToViewport(width: width)
+        fitTimelineToViewport(width: width, totalDuration: totalDuration)
     }
 
-    private var headerInfo: String {
-        var s = "\(model.items.count) 段 · \(timelineClockText(model.totalOutputDuration))"
+    private func headerInfo(layout: TimelineLayout) -> String {
+        var s = "\(layout.entries.count) 段 · \(timelineClockText(layout.totalDuration))"
         if model.hasProject {
             let c = model.canvas
             let fps = c.fpsValue == c.fpsValue.rounded()
@@ -190,7 +272,8 @@ struct TimelineView: View {
         return s
     }
 
-    private func canvas(width: CGFloat, clipsWidth: CGFloat, scale: CGFloat,
+    private func canvas(layout: TimelineLayout, width: CGFloat,
+                        clipsWidth: CGFloat, scale: CGFloat,
                         viewportWidth: CGFloat, trackHeight: CGFloat) -> some View {
         let visibleTimelineRange = ClosedRange(
             uncheckedBounds: (
@@ -218,9 +301,9 @@ struct TimelineView: View {
             // needed here — the strips already load frames only for the visible
             // range internally.
             HStack(spacing: 0) {
-                ForEach(model.items) { item in
-                    TimelineClipView(model: model, item: item,
-                                     timelineStart: model.timelineStart(for: item.id) ?? 0,
+                ForEach(layout.entries) { entry in
+                    TimelineClipView(model: model, item: entry.item,
+                                     timelineStart: entry.start,
                                      visibleTimelineRange: visibleTimelineRange,
                                      pointsPerSecond: scale, height: baseTrackHeight)
                 }
@@ -243,7 +326,7 @@ struct TimelineView: View {
                 Capsule()
                     .fill(Color.accentColor)
                     .frame(width: 3, height: baseTrackHeight + 12)
-                    .offset(x: insertionX(insertion, scale: scale) - 1.5,
+                    .offset(x: layout.insertionX(insertion, scale: scale) - 1.5,
                             y: rulerHeight + (trackHeight - baseTrackHeight) / 2 - 6)
                     .allowsHitTesting(false)
             }
@@ -269,7 +352,9 @@ struct TimelineView: View {
         // insertion gap — including index 0, so a clip can be moved to the very
         // start — and show a caret at that gap while dragging.
         .onDrop(of: [.text], delegate: TimelineInsertionDropDelegate(
-            insertionIndex: { location in insertionIndex(at: location.x, scale: scale) },
+            insertionIndex: { location in
+                layout.insertionIndex(at: location.x, scale: scale)
+            },
             setIndicator: { dropInsertionIndex = $0 },
             autoScroll: { location in updateDropAutoScroll(pointerX: location.x) },
             stopAutoScroll: { stopDropAutoScroll() },
@@ -298,14 +383,16 @@ struct TimelineView: View {
                     if NSEvent.modifierFlags.contains(.command) {
                         // ⌘-click toggles a clip in/out of the selection and never
                         // moves the playhead.
-                        if onClips, let hit = model.timelineHit(at: time) {
-                            model.toggleSelection(hit.itemID)
+                        if onClips, let itemID = layout.itemID(at: time) {
+                            model.toggleSelection(itemID)
                         }
                         return
                     }
                     if onClips {
                         model.seekTimeline(to: time)
-                        if let hit = model.timelineHit(at: time) { model.selectOnly(hit.itemID) }
+                        if let itemID = layout.itemID(at: time) {
+                            model.selectOnly(itemID)
+                        }
                     } else if onRuler {
                         model.seekTimeline(to: time)
                     } else {
@@ -316,7 +403,7 @@ struct TimelineView: View {
                         if value.location.x >= clipsWidth {
                             model.seekTimelineToEnd()
                         } else {
-                            model.seekTimeline(to: min(time, model.totalOutputDuration))
+                            model.seekTimeline(to: min(time, layout.totalDuration))
                         }
                     }
                 }
@@ -343,7 +430,8 @@ struct TimelineView: View {
                                       width: abs(value.location.x - start.x),
                                       height: abs(value.location.y - start.y))
                     marqueeRect = rect
-                    model.selectedIDs = marqueeSelection(rect, scale: scale,
+                    model.selectedIDs = marqueeSelection(rect, layout: layout,
+                                                         scale: scale,
                                                          clipRowTop: clipRowTop)
                 }
                 .onEnded { _ in
@@ -373,22 +461,6 @@ struct TimelineView: View {
     }
 
     // MARK: Reorder / insertion drops
-
-    /// The gap the pointer is closest to: left half of a clip means "before it",
-    /// right half means "after it"; past the last clip appends.
-    private func insertionIndex(at x: CGFloat, scale: CGFloat) -> Int {
-        var boundary: CGFloat = 0
-        for (index, item) in model.items.enumerated() {
-            let width = CGFloat(item.displayDuration) * scale
-            if x < boundary + width / 2 { return index }
-            boundary += width
-        }
-        return model.items.count
-    }
-
-    private func insertionX(_ index: Int, scale: CGFloat) -> CGFloat {
-        model.items.prefix(index).reduce(0) { $0 + CGFloat($1.displayDuration) * scale }
-    }
 
     private func handleTimelineDrop(_ payload: String, at index: Int) {
         if let assetID = libraryAssetID(payload) {
@@ -426,19 +498,13 @@ struct TimelineView: View {
 
     /// Clips whose time span intersects the marquee horizontally, provided the
     /// marquee vertically overlaps the clip row.
-    private func marqueeSelection(_ rect: CGRect, scale: CGFloat,
+    private func marqueeSelection(_ rect: CGRect, layout: TimelineLayout,
+                                  scale: CGFloat,
                                   clipRowTop: CGFloat) -> Set<ClipItem.ID> {
         guard rect.maxY >= clipRowTop, rect.minY <= clipRowTop + baseTrackHeight else {
             return []
         }
-        var out: Set<ClipItem.ID> = []
-        var x: CGFloat = 0
-        for item in model.items {
-            let w = CGFloat(item.displayDuration) * scale
-            if rect.minX <= x + w, rect.maxX >= x { out.insert(item.id) }
-            x += w
-        }
-        return out
+        return layout.selection(in: rect, scale: scale)
     }
 
     /// Purely visual — the canvas-wide drop delegate owns the actual drop.

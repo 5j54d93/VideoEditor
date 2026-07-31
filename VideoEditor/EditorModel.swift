@@ -69,7 +69,9 @@ final class EditorModel {
 
     // Project
     var library: [LibraryAsset] = []
-    var items: [ClipItem] = []
+    var items: [ClipItem] = [] {
+        didSet { rebuildTimelineIndex() }
+    }
     /// The clip the playhead is parked on — drives the preview player and the
     /// trim/split controls. Independent of the visual selection below.
     var activeItemID: ClipItem.ID?
@@ -120,6 +122,7 @@ final class EditorModel {
 
     private var players: [URL: AVPlayer] = [:]
     private var thumbnailerCache: [URL: Thumbnailer] = [:]
+    @ObservationIgnored private var timelineStartsByID: [ClipItem.ID: Double] = [:]
     private var exportTask: Task<Void, Never>?
     private var videoSourceRevisions: [URL: Int] = [:]
     private var sourceImportGenerations: [URL: Int] = [:]
@@ -172,7 +175,22 @@ final class EditorModel {
                           fps: best?.fpsRational ?? "30", fpsValue: best?.fps ?? 30)
     }
 
-    var totalOutputDuration: Double { items.reduce(0) { $0 + $1.displayDuration } }
+    private(set) var totalOutputDuration: Double = 0
+
+    /// Rebuild all timeline-derived coordinates once whenever the value-typed
+    /// item array changes. Reads during layout, playback and hit-testing then
+    /// stay O(1), rather than repeatedly reducing or scanning the whole array.
+    private func rebuildTimelineIndex() {
+        var starts: [ClipItem.ID: Double] = [:]
+        starts.reserveCapacity(items.count)
+        var total = 0.0
+        for item in items {
+            starts[item.id] = total
+            total += item.displayDuration
+        }
+        timelineStartsByID = starts
+        totalOutputDuration = total
+    }
 
     // MARK: - Output timeline coordinates / zoom
 
@@ -210,12 +228,7 @@ final class EditorModel {
     }
 
     func timelineStart(for id: ClipItem.ID) -> Double? {
-        var start = 0.0
-        for item in items {
-            if item.id == id { return start }
-            start += item.displayDuration
-        }
-        return nil
+        timelineStartsByID[id]
     }
 
     /// Resolve an output time using half-open clip ranges. A time exactly on an
