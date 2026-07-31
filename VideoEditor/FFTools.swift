@@ -3,12 +3,14 @@
 //  VideoEditor
 //
 //  Wraps the system ffmpeg / ffprobe binaries. Every export path is built to be
-//  byte-for-byte deterministic: the same source + same cut points always produce
-//  a file with the same SHA-256, so re-uploading to Google Photos dedupes.
+//  byte-for-byte repeatable on one CPU architecture: the same bundled toolchain,
+//  source and cut points produce the same SHA-256. The fixed output profile also
+//  removes core-count-dependent x264 output.
 //
-//  The determinism trick: `-fflags +bitexact -flags +bitexact -map_metadata -1`
-//  strips the wall-clock creation_time, encoder version strings and random UUIDs
-//  that normal editors (CapCut, default ffmpeg) embed on every export.
+//  The output-side bitexact flags and metadata stripping remove volatile container
+//  fields. Filter/scaler and x264 threading are pinned as part of the file format.
+//  FFmpeg's native AAC encoder is repeatable within an architecture, but its
+//  floating-point implementation is not byte-identical across arm64 and x86_64.
 //
 
 import Foundation
@@ -24,20 +26,6 @@ struct MediaInfo: Sendable {
     var height: Int
     var audioCodec: String?
     var frameTimes: [Double]      // pts_time of every frame, ascending; [] if unavailable
-}
-
-// MARK: - Export configuration
-
-enum ExportMode: String, CaseIterable, Sendable {
-    case losslessCopy   // stream copy, start snapped to a keyframe — lossless, fast
-    case reencode       // frame-accurate libx264 re-encode — exact frame, lossy
-}
-
-struct ExportSettings: Sendable {
-    var mode: ExportMode = .losslessCopy
-    var crf: Int = 18
-    var preset: String = "medium"
-    var strictSingleThread: Bool = false   // force x264 threads=1 for max reproducibility
 }
 
 // MARK: - Multi-asset assembly
@@ -77,7 +65,7 @@ struct ExportResult: Sendable {
 }
 
 /// Tiny lock-guarded string box for accumulating partial lines across pipe callbacks.
-private final class LineBuffer: @unchecked Sendable {
+private nonisolated final class LineBuffer: @unchecked Sendable {
     private let lock = NSLock()
     private var v = ""
     var value: String {
@@ -89,7 +77,7 @@ private final class LineBuffer: @unchecked Sendable {
 /// Lock-guarded handle that lets a task-cancellation handler terminate the
 /// running ffmpeg. Closes the register/cancel race: whichever comes second
 /// still kills the process.
-private final class ProcessBox: @unchecked Sendable {
+private nonisolated final class ProcessBox: @unchecked Sendable {
     private let lock = NSLock()
     private var process: Process?
     private var cancelled = false
@@ -248,25 +236,38 @@ struct FFTools: Sendable {
 
     /// Build ffmpeg args to assemble several assets (videos + images) into one clip
     /// on a shared canvas, with either a background-music track (overriding original
-    /// audio) or each item's own audio (silence for images). Re-encoded, bitexact →
-    /// byte-deterministic.
-    static func assembleArgs(items: [AssemblyItem], audioURL: URL?, canvas: CanvasSpec,
-                             output: URL, settings: ExportSettings) -> [String] {
+    /// audio) or each item's own audio (silence for images). Re-encoded into the
+    /// fixed, byte-repeatable-within-one-architecture output profile.
+    nonisolated static func assembleArgs(items: [AssemblyItem], audioURL: URL?, canvas: CanvasSpec,
+                                         output: URL) -> [String] {
         let W = canvas.width, H = canvas.height, FPS = canvas.fps
-        let fit = "scale=\(W):\(H):force_original_aspect_ratio=decrease," +
+        let fit = "scale=\(W):\(H):force_original_aspect_ratio=decrease:" +
+                  "flags=bicubic+accurate_rnd+bitexact:sws_dither=none," +
                   "pad=\(W):\(H):(ow-iw)/2:(oh-ih)/2,setsar=1,fps=\(FPS),format=yuv420p"
+        let normalizeAudio = "aresample=sample_rate=44100:out_chlayout=stereo:" +
+                             "out_sample_fmt=fltp:internal_sample_fmt=s32p:" +
+                             "dither_method=none:exact_rational=1"
         let useOriginalAudio = (audioURL == nil)
 
-        var args = ["-nostdin", "-y", "-fflags", "+bitexact"]
+        // These values are part of the output format, not user preferences. In
+        // particular, automatic filter and x264 thread counts change output bytes
+        // when the same project is exported on machines with different core counts.
+        // Disable FFmpeg's runtime SIMD dispatch too: the native AAC encoder can
+        // otherwise choose CPU-feature-specific floating-point implementations.
+        var args = ["-nostdin", "-y",
+                    "-cpuflags", "0",
+                    "-filter_threads", "1", "-filter_complex_threads", "1",
+                    "-sws_flags", "bicubic+accurate_rnd+bitexact"]
         for it in items {
             if it.isImage {
-                args += ["-framerate", FPS, "-loop", "1", "-t", fmt(it.duration), "-i", it.url.path]
+                args += ["-framerate", FPS, "-loop", "1", "-t", fmt(it.duration),
+                         "-fflags", "+bitexact", "-i", it.url.path]
             } else {
-                args += ["-i", it.url.path]
+                args += ["-fflags", "+bitexact", "-i", it.url.path]
             }
         }
         let musicIndex = items.count
-        if let audioURL { args += ["-i", audioURL.path] }
+        if let audioURL { args += ["-fflags", "+bitexact", "-i", audioURL.path] }
 
         var f = ""
         for (i, it) in items.enumerated() {
@@ -277,7 +278,7 @@ struct FFTools: Sendable {
             }
             if useOriginalAudio {
                 if it.hasAudio && !it.isImage {
-                    f += "[\(i):a]atrim=start=\(fmt(it.trimStart)):end=\(fmt(it.trimEnd)),asetpts=PTS-STARTPTS,aresample=44100[a\(i)];"
+                    f += "[\(i):a]atrim=start=\(fmt(it.trimStart)):end=\(fmt(it.trimEnd)),asetpts=PTS-STARTPTS,\(normalizeAudio)[a\(i)];"
                 } else {
                     f += "anullsrc=channel_layout=stereo:sample_rate=44100,atrim=0:\(fmt(it.duration)),asetpts=PTS-STARTPTS[a\(i)];"
                 }
@@ -293,24 +294,28 @@ struct FFTools: Sendable {
         } else {
             let total = items.reduce(0) { $0 + $1.duration }
             f += "\(concatIn)concat=n=\(items.count):v=1:a=0[vout];"
-            f += "[\(musicIndex):a]aresample=44100,apad,atrim=0:\(fmt(total)),asetpts=PTS-STARTPTS[aout]"
+            f += "[\(musicIndex):a]\(normalizeAudio),apad,atrim=0:\(fmt(total)),asetpts=PTS-STARTPTS[aout]"
         }
 
         args += ["-filter_complex", f, "-map", "[vout]", "-map", "[aout]"]
-        args += ["-c:v", "libx264", "-preset", settings.preset,
-                 "-crf", String(settings.crf), "-pix_fmt", "yuv420p"]
-        if settings.strictSingleThread { args += ["-x264-params", "threads=1"] }
-        args += ["-c:a", "aac", "-b:a", "192k"]
+        args += ["-c:v", "libx264", "-preset", "medium",
+                 "-crf", "18", "-pix_fmt", "yuv420p",
+                 "-x264-params", "threads=1:lookahead-threads=1:deterministic=1:cpu-independent=1"]
+        args += ["-c:a", "aac", "-b:a", "192k", "-aac_coder", "twoloop"]
         args += ["-map_metadata", "-1", "-map_chapters", "-1",
-                 "-flags", "+bitexact", "-movflags", "+faststart", output.path]
+                 // `-fflags` is a per-file option: this occurrence deliberately
+                 // sits after all inputs so it applies to the output muxer.
+                 "-fflags", "+bitexact",
+                 "-flags:v", "+bitexact", "-flags:a", "+bitexact",
+                 "-movflags", "+faststart", output.path]
         return args
     }
 
     nonisolated func exportAssembly(items: [AssemblyItem], audioURL: URL?, canvas: CanvasSpec,
-                                    output: URL, settings: ExportSettings,
+                                    output: URL,
                                     onProgress: (@Sendable (Double) -> Void)? = nil) async throws -> ExportResult {
         var args = Self.assembleArgs(items: items, audioURL: audioURL, canvas: canvas,
-                                     output: output, settings: settings)
+                                     output: output)
         let code: Int32, log: String
         if let onProgress {
             // Stream machine-readable progress on stdout; stderr stays the log.
@@ -333,11 +338,11 @@ struct FFTools: Sendable {
     // MARK: - Helpers
 
     /// Format a time/duration with fixed precision so the argument string itself is stable.
-    private static func fmt(_ x: Double) -> String {
+    private nonisolated static func fmt(_ x: Double) -> String {
         String(format: "%.6f", x)
     }
 
-    private static func parseRational(_ s: String?) -> Double? {
+    private nonisolated static func parseRational(_ s: String?) -> Double? {
         guard let s, s != "0/0" else { return nil }
         let parts = s.split(separator: "/")
         if parts.count == 2, let n = Double(parts[0]), let d = Double(parts[1]), d != 0 {
@@ -346,7 +351,7 @@ struct FFTools: Sendable {
         return Double(s)
     }
 
-    static func sha256(of url: URL) throws -> String {
+    nonisolated static func sha256(of url: URL) throws -> String {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
         var hasher = SHA256()
@@ -361,9 +366,10 @@ struct FFTools: Sendable {
     /// Like `run`, but expects `-progress pipe:1` in the args: parses the key=value
     /// blocks ffmpeg writes to stdout and reports `out_time_us / totalDuration` as a
     /// 0...1 fraction. stderr is captured as the log.
-    private static func runReportingProgress(_ url: URL, _ args: [String], totalDuration: Double,
-                                             onProgress: @escaping @Sendable (Double) -> Void)
-        async throws -> (Int32, String) {
+    private nonisolated static func runReportingProgress(
+        _ url: URL, _ args: [String], totalDuration: Double,
+        onProgress: @escaping @Sendable (Double) -> Void
+    ) async throws -> (Int32, String) {
         let box = ProcessBox()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { cont in
@@ -416,7 +422,7 @@ struct FFTools: Sendable {
     }
 
     /// Run a binary off the main actor and capture combined stdout+stderr.
-    private static func run(_ url: URL, _ args: [String]) async throws -> (Int32, String) {
+    private nonisolated static func run(_ url: URL, _ args: [String]) async throws -> (Int32, String) {
         try await withCheckedThrowingContinuation { cont in
             DispatchQueue.global(qos: .userInitiated).async {
                 let proc = Process()

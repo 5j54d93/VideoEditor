@@ -4,7 +4,7 @@
 ![GitHub repo size](https://img.shields.io/github/repo-size/5j54d93/VideoEditor)
 ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)
 
-A native macOS video editor built with SwiftUI that cuts on **real** frames and writes **byte-for-byte deterministic** MP4s：the same sources with the same cut points always produce a file with the same SHA-256, so re-uploading a re-export never creates a duplicate in Google Photos or iCloud. Trim, split, reorder, mix in stills and background music, then export through the app's own bundled FFmpeg — no Homebrew, no MacPorts, nothing to install.
+A native macOS video editor built with SwiftUI that cuts on **real** frames and writes repeatable MP4s：with the same app build, sources, cut points and CPU architecture, another export produces the same SHA-256, so re-exporting on the same Mac class does not create another upload in Google Photos or iCloud. Trim, split, reorder, mix in stills and background music, then export through the app's own bundled FFmpeg — no Homebrew, no MacPorts, nothing to install.
 
 ## Overview
 
@@ -50,9 +50,11 @@ The timeline **is** the output：every visible clip is part of the exported movi
 
 <kbd>⌘</kbd><kbd>E</kbd> opens a filename／destination sheet（remembering the last folder）, then a live progress sheet with the first frame, percentage, elapsed and estimated remaining — cancellable, and a cancelled export deletes its half-written file instead of leaving a torso behind.
 
-Everything is normalized onto one shared canvas — the largest dimensions among the clips, at the exact rational frame rate of the fastest video — scaled, letterboxed, concatenated, and encoded with libx264（CRF 18, `yuv420p`）plus AAC 192 kbps.
+Everything is normalized onto one shared canvas — the largest dimensions among the clips, at the exact rational frame rate of the fastest video — scaled, letterboxed, concatenated, and encoded with one fixed internal profile：libx264（medium, CRF 18, `yuv420p`）plus native AAC（two-loop coder, stereo 44.1 kHz, 192 kbps）. There is no hidden quality／threading setting that can silently change the file format.
 
-The determinism comes from `-fflags +bitexact -flags +bitexact -map_metadata -1 -map_chapters -1`：no wall-clock `creation_time`, no encoder version string, no random UUIDs — the metadata that normal editors（CapCut, plain ffmpeg）stamp onto every single export. A SHA-256 of the finished file is computed on every run, and `-movflags +faststart` keeps the result web-ready. For maximum reproducibility, x264 can additionally be pinned to a single thread.
+Reproducibility is enforced at every variable stage：FFmpeg-native CPU-feature dispatch is disabled, the filter graph runs on one worker, scaling uses accurate bitexact rounding with dithering disabled, audio resampling uses a fixed signed-32-bit internal format, and x264 is always pinned to one frame thread and one lookahead thread with deterministic／CPU-independent mode enabled. This trades a modest amount of export speed for same-architecture stability across machines. Output-side `-fflags +bitexact -flags +bitexact -map_metadata -1 -map_chapters -1` selects bitexact codec／muxer paths and removes volatile timestamps and inherited metadata; `-movflags +faststart` remains web-ready. A SHA-256 of the finished file is computed on every run.
+
+The guarantee is intentionally scoped to the **same bundled toolchain and CPU architecture**. In a raw-input validation of the shipped Universal 2 binary, the H.264 elementary stream was byte-identical between arm64 and x86_64 after these changes, but FFmpeg's native AAC encoder still produced different bytes across the two architectures even with fixed resampling, coder, sample format, AAC tools and CPU flags. The app keeps AAC for normal MP4／Apple-platform compatibility, so a whole-file SHA match across arm64 and x86_64 is not promised.
 
 ## Under the Hood
 

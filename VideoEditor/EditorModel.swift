@@ -102,7 +102,6 @@ final class EditorModel {
     var isTimelinePlaying = false
 
     // Export
-    var settings = ExportSettings()
     var isExporting = false
     var exportProgress: Double = 0
     var exportResult: ExportResult?
@@ -1421,7 +1420,6 @@ final class EditorModel {
         }
         let canvas = self.canvas
         let audio = self.audioURL
-        let settings = self.settings
         isExporting = true
         exportProgress = 0
         exportResult = nil
@@ -1434,7 +1432,7 @@ final class EditorModel {
             do {
                 self.exportResult = try await ff.exportAssembly(
                     items: assemblyItems, audioURL: audio,
-                    canvas: canvas, output: outURL, settings: settings,
+                    canvas: canvas, output: outURL,
                     onProgress: { [weak self] p in
                         Task { @MainActor [weak self] in self?.exportProgress = p }
                     })
