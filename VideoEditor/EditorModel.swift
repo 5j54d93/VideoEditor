@@ -676,6 +676,7 @@ final class EditorModel {
         let thumbnailURLs = itemURLs.union(library.compactMap { asset in
             asset.kind == .video ? normalizedSourceURL(asset.url) : nil
         })
+        scrub.reconcile(keeping: thumbnailURLs)
 
         let stalePlayerKeys = players.keys.filter {
             !itemURLs.contains(normalizedSourceURL($0))

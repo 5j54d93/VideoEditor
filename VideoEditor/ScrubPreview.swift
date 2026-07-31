@@ -90,6 +90,20 @@ final class ScrubPreviewPlayer {
     func invalidate(url: URL) {
         assets.removeValue(forKey: url)
         guard currentURL == url else { return }
+        clearCurrentSource()
+    }
+
+    /// Keep the scrub cache bounded by sources the current project can still
+    /// reference. Undo may restore an evicted URL later; preparing it again is
+    /// cheaper and safer than retaining every asset opened during the app's life.
+    func reconcile(keeping urls: Set<URL>) {
+        let staleURLs = assets.keys.filter { !urls.contains($0) }
+        for url in staleURLs { assets.removeValue(forKey: url) }
+        guard let currentURL, !urls.contains(currentURL) else { return }
+        clearCurrentSource()
+    }
+
+    private func clearCurrentSource() {
         sourceGeneration &+= 1
         player.currentItem?.cancelPendingSeeks()
         currentURL = nil
