@@ -11,7 +11,7 @@ import AppKit
 import UniformTypeIdentifiers
 
 struct TimelineView: View {
-    @Bindable var model: EditorModel
+    let model: EditorModel
 
     private let rulerHeight: CGFloat = 24
     private let baseTrackHeight: CGFloat = 100
@@ -556,7 +556,7 @@ struct TimelineView: View {
 }
 
 private struct TimelineClipView: View {
-    @Bindable var model: EditorModel
+    let model: EditorModel
     let item: ClipItem
     let timelineStart: Double
     let visibleTimelineRange: ClosedRange<Double>

@@ -11,7 +11,7 @@ import SwiftUI
 import AppKit
 
 struct LibraryPanel: View {
-    @Bindable var model: EditorModel
+    let model: EditorModel
 
     @State private var cardFrames: [LibraryAsset.ID: CGRect] = [:]
     @State private var marqueeStart: CGPoint?
@@ -232,7 +232,7 @@ struct LibraryPanel: View {
 /// One asset in the library grid: a large thumbnail with a duration badge,
 /// hover quick-actions, and the filename + vitals underneath.
 private struct LibraryAssetCard: View {
-    @Bindable var model: EditorModel
+    let model: EditorModel
     let asset: LibraryAsset
     @State private var videoThumb: CGImage?
     @State private var imageThumb: NSImage?
