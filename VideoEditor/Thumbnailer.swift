@@ -62,6 +62,21 @@ actor Thumbnailer {
         await exactFrames([ExactRequest(frameIndex: 0, time: time)])[0]
     }
 
+    /// The native-resolution frame used while placing a crop boundary. Unlike
+    /// `exactFrame`, this deliberately has no thumbnail-size ceiling: enlarging
+    /// a 480px preview cannot reveal detail that was discarded during decode.
+    func fullResolutionFrame(at time: Double) async -> CGImage? {
+        let generated = await Self.generate(
+            url: url,
+            requests: [GenerationRequest(id: 0, time: interiorFrameTime(time))],
+            maximumSize: nil,
+            toleranceBefore: .zero,
+            toleranceAfter: .zero
+        )
+        guard !Task.isCancelled else { return nil }
+        return generated[0]
+    }
+
     /// Exact frames are submitted to AVFoundation as one source-time-ordered
     /// batch. Results are keyed by the requested time rather than arrival order,
     /// so a failed or out-of-order decode can never shift later frame cells.
@@ -185,7 +200,7 @@ actor Thumbnailer {
     nonisolated private static func generate(
         url: URL,
         requests: [GenerationRequest],
-        maximumSize: CGSize,
+        maximumSize: CGSize?,
         toleranceBefore: CMTime,
         toleranceAfter: CMTime
     ) async -> [Int: CGImage] {
@@ -194,7 +209,7 @@ actor Thumbnailer {
         let asset = AVURLAsset(url: url)
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
-        generator.maximumSize = maximumSize
+        if let maximumSize { generator.maximumSize = maximumSize }
         generator.requestedTimeToleranceBefore = toleranceBefore
         generator.requestedTimeToleranceAfter = toleranceAfter
 

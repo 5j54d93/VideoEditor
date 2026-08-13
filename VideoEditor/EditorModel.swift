@@ -213,7 +213,7 @@ final class EditorModel {
         switch canvasSizing {
         case .automatic:
             size = derivedCanvasSize
-        case .fixed(let fixed):
+        case .fixed(let fixed), .custom(let fixed):
             size = fixed.isUsable ? fixed : derivedCanvasSize
         }
         // Use the exact rational of the fastest video so a fractional-fps source
@@ -329,7 +329,7 @@ final class EditorModel {
         // The black pad carries no frame lattice, and the frame this would snap
         // to sits before the pad even begins.
         if item.hasVideoPad,
-           hit.timelineTime > hit.timelineStart + item.contentDuration { return hit }
+           hit.timelineTime >= hit.timelineStart + item.contentDuration { return hit }
         let g = item.grid
         let firstFrame = item.trimStartFrame
         let endFrame = max(firstFrame + 1, item.trimEndFrame)
@@ -351,7 +351,7 @@ final class EditorModel {
         // from — `currentTime` is pinned to the final frame there — so deriving
         // it would yank the playhead back to where the picture stopped.
         if item.hasVideoPad,
-           timelineTime > start + item.contentDuration,
+           timelineTime >= start + item.contentDuration,
            timelineTime <= start + item.displayDuration + 1e-9 {
             return
         }
@@ -361,12 +361,12 @@ final class EditorModel {
         timelineTime = start + offset
     }
 
-    /// True while the playhead sits past the final real frame of the active
-    /// clip, inside black that the export will genuinely contain.
+    /// True while the playhead sits at or past the exclusive final-frame
+    /// boundary, inside black that the export will genuinely contain.
     var isPlayheadInVideoPad: Bool {
         guard let item = activeItem, item.hasVideoPad,
               let start = timelineStart(for: item.id) else { return false }
-        return timelineTime > start + item.contentDuration + 1e-9
+        return timelineTime >= start + item.contentDuration
     }
 
     /// The edit boundary represented by the global playhead. Previewing the
@@ -432,7 +432,7 @@ final class EditorModel {
         }
 
         if item.hasVideoPad,
-           hit.timelineTime > hit.timelineStart + item.contentDuration + 1e-9 {
+           hit.timelineTime >= hit.timelineStart + item.contentDuration {
             scrub.end()
             timelinePreview = TimelinePreview(itemID: item.id,
                                               timelineTime: hit.timelineTime,
@@ -898,6 +898,11 @@ final class EditorModel {
         item.url = sourceURL
         item.naturalWidth = info.width
         item.naturalHeight = info.height
+        if let crop = item.geometry.sourceCrop {
+            let size = item.sourcePixelSize
+            item.geometry.sourceCrop = crop.snappedToChromaGrid(in: size)
+                .flatMap { $0.coversWholeFrame(of: size) ? nil : $0 }
+        }
         item.sourceDuration = info.duration
         item.fps = info.fps
         item.fpsRational = info.fpsRational
@@ -1791,10 +1796,27 @@ final class EditorModel {
     ]
 
     func setCanvasSizing(_ sizing: CanvasSizing) {
-        guard sizing != canvasSizing else { return }
+        let normalized: CanvasSizing
+        switch sizing {
+        case .automatic:
+            normalized = .automatic
+        case .fixed(let size):
+            normalized = .fixed(normalizedCanvasSize(size))
+        case .custom(let size):
+            normalized = .custom(normalizedCanvasSize(size))
+        }
+        guard normalized != canvasSizing else { return }
         pauseTimelinePlayback()
         registerUndo()
-        canvasSizing = sizing
+        canvasSizing = normalized
+    }
+
+    /// yuv420p output requires even dimensions. Normalise at the edit boundary
+    /// as well as when resolving `canvas`, so the inspector never claims 1001px
+    /// while the file is actually 1002px wide.
+    private func normalizedCanvasSize(_ size: PixelSize) -> PixelSize {
+        guard size.isUsable else { return size }
+        return PixelSize(width: even(size.width), height: even(size.height))
     }
 
     func setSourceCrop(_ rect: PixelRect?, for id: ClipItem.ID) {
@@ -1887,7 +1909,7 @@ final class EditorModel {
     /// an unacknowledged source tail is visible on the timeline, but original
     /// audio is still capped at the exclusive final-video boundary here.
     func assemblyItemsForExport() -> [AssemblyItem] {
-        items.filter { $0.displayDuration > 1e-3 }.map { item -> AssemblyItem in
+        items.filter(\.isExportable).map { item -> AssemblyItem in
             if item.isImage {
                 return AssemblyItem(url: item.url, isImage: true,
                                     trimStartFrame: 0, trimEndFrame: 0,

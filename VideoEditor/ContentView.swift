@@ -12,6 +12,11 @@ import Synchronization
 struct ContentView: View {
     let model: EditorModel
     @State private var exportSheet = false
+    /// Reframing is occasional work, so its pane stays out of the way until
+    /// asked for — and the preview, which is the thing being judged, gets the
+    /// width back. Remembered across launches: someone who reframes every
+    /// project should not have to reopen it every time.
+    @AppStorage("showsGeometryInspector") private var showsInspector = false
     @State private var selectAllKey = SelectAllKeyMonitor()
     @State private var viewport = StageViewport()
     /// Offset at the start of a position drag, in canvas pixels.
@@ -46,6 +51,15 @@ struct ContentView: View {
                     .keyboardShortcut("e", modifiers: .command)
                     .disabled(model.isExporting || model.ffMissing)
                     .help("輸出成品（⌘E）")
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    Button { showsInspector.toggle() } label: {
+                        Label("版面", systemImage: showsInspector ? "crop.rotate" : "crop")
+                            .labelStyle(.iconOnly)
+                    }
+                    .buttonBorderShape(.circle)
+                    .keyboardShortcut("i", modifiers: [.command, .option])
+                    .help("畫布尺寸與片段裁剪（⌥⌘I）")
                 }
             }
         }
@@ -92,7 +106,7 @@ struct ContentView: View {
                     // Darker than the canvas is black, so the canvas reads as an
                     // object sitting on the pane rather than as the pane itself.
                     .background(Color(white: 0.13))
-                if model.hasProject {
+                if model.hasProject && showsInspector {
                     GeometryInspector(model: model)
                         .frame(minWidth: 250, idealWidth: 290, maxWidth: 400)
                 }
@@ -190,6 +204,9 @@ struct ContentView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .onChange(of: mode) { _, _ in viewport = StageViewport() }
+        // Deliberately does not reveal the inspector. The stage already carries
+        // the crop readout, the mode switch and the zoom, and forcing the pane
+        // open would write over a stored preference the user set on purpose.
         .onAppear { viewport = StageViewport() }
     }
 
@@ -232,16 +249,23 @@ struct ContentView: View {
         return CropStage(source: source, crop: crop, viewport: $viewport,
                          onChange: { model.setSourceCrop($0, for: item.id) },
                          onGestureBegin: { model.beginGeometryGesture(for: item.id) },
-                         onGestureEnd: { model.endGeometryGesture() }) {
+                         onGestureEnd: { model.endGeometryGesture() }) { scale in
+            let usesNearestNeighbour = StageViewport.usesNearestNeighbour(
+                pointsPerSourcePixel: scale)
             if item.isImage {
                 ImagePreview(
                     url: item.url,
-                    interpolation: viewport.zoom >= StageViewport.nearestNeighbourThreshold
-                        ? .none : .medium)
+                    interpolation: usesNearestNeighbour ? .none : .high)
             } else if let player = model.player {
-                RawPlayerSurface(
+                CropVideoPreview(
                     player: player,
-                    usesNearestNeighbour: viewport.zoom >= StageViewport.nearestNeighbourThreshold)
+                    thumbnailer: model.thumbnailer(for: item.url),
+                    time: item.grid.time(ofFrame: model.currentFrameIndex),
+                    request: CropFrameRequest(
+                        url: item.url,
+                        frameIndex: model.currentFrameIndex,
+                        sourceRevision: model.videoSourceRevision(for: item.url)),
+                    interpolation: usesNearestNeighbour ? .none : .high)
             }
         }
     }
@@ -568,6 +592,49 @@ private struct ImagePreview: View {
     }
 }
 
+/// Identity for one native-resolution crop preview request. Frame index is
+/// stable on VFR sources where tiny time-coordinate differences should still
+/// describe the same real picture; source revision invalidates a re-import.
+private struct CropFrameRequest: Hashable {
+    let url: URL
+    let frameIndex: Int
+    let sourceRevision: Int
+}
+
+/// AVPlayerLayer is ideal while a movie is moving, but a paused layer may keep
+/// the raster it produced for the small fit-to-pane view and simply magnify it.
+/// Crop mode swaps in an exact, native-resolution still for inspection while
+/// retaining the player underneath as the immediate loading/failure fallback.
+private struct CropVideoPreview: View {
+    let player: AVPlayer
+    let thumbnailer: Thumbnailer?
+    let time: Double
+    let request: CropFrameRequest
+    let interpolation: Image.Interpolation
+
+    @State private var frame: CGImage?
+
+    var body: some View {
+        ZStack {
+            if let frame {
+                Image(decorative: frame, scale: 1)
+                    .resizable()
+                    .interpolation(interpolation)
+            } else {
+                RawPlayerSurface(
+                    player: player,
+                    usesNearestNeighbour: interpolation == .none)
+            }
+        }
+        .task(id: request) {
+            frame = nil
+            let decoded = await thumbnailer?.fullResolutionFrame(at: time)
+            guard !Task.isCancelled else { return }
+            frame = decoded
+        }
+    }
+}
+
 /// "m:ss.mmm" (milliseconds truncated, matching frame-boundary display).
 private func timeFieldText(_ s: Double) -> String {
     let x = max(0, s)
@@ -598,11 +665,44 @@ private func exportSummaryText(_ model: EditorModel) -> String {
         + " · \(c.width)×\(c.height) @ \(fpsText(c.fpsValue))fps"
 }
 
-/// First frame of the first timeline clip, previewed before the output exists.
+/// Everything needed to draw the source picture as the first output frame.
+/// Pure and testable: the view consumes this exact resolved placement instead
+/// of rebuilding an approximation of FFmpeg's geometry in the export sheet.
+struct ExportPreviewDescriptor: Equatable {
+    let itemID: ClipItem.ID
+    let url: URL
+    let isImage: Bool
+    let sourceTime: Double
+    let sourceSize: PixelSize
+    let placement: Placement?
+
+    static func first(in items: [ClipItem], canvas: CanvasSpec) -> Self? {
+        guard let item = items.first(where: \.isExportable) else { return nil }
+        let sourceSize = item.sourcePixelSize
+        let placement = sourceSize.isUsable
+            ? FFTools.resolve(item.geometry, source: sourceSize, canvas: canvas)
+            : nil
+        // Export cuts videos by this exact frame index. Deriving the timestamp
+        // from the same grid avoids a future inPoint/PTS rounding drift.
+        let sourceTime = item.isImage ? 0 : item.grid.time(ofFrame: item.trimStartFrame)
+        return Self(itemID: item.id, url: item.url, isImage: item.isImage,
+                    sourceTime: sourceTime, sourceSize: sourceSize,
+                    placement: placement)
+    }
+}
+
+private func exportPreviewDescriptor(_ model: EditorModel) -> ExportPreviewDescriptor? {
+    ExportPreviewDescriptor.first(in: model.items, canvas: model.canvas)
+}
+
+/// First frame of the first rendered clip. Geometry is applied by
+/// `ExportCompositionThumbnail`; decode the source picture here without the
+/// filmstrip's 480px ceiling so a tight crop still has enough detail at 216pt.
 private func loadFirstItemThumbnail(_ model: EditorModel) async -> (video: CGImage?, image: NSImage?) {
-    guard let item = model.items.first else { return (nil, nil) }
-    if item.isImage { return (nil, NSImage(contentsOf: item.url)) }
-    return (await model.thumbnailer(for: item.url)?.exactFrame(at: item.inPoint), nil)
+    guard let preview = exportPreviewDescriptor(model) else { return (nil, nil) }
+    if preview.isImage { return (nil, NSImage(contentsOf: preview.url)) }
+    return (await model.thumbnailer(for: preview.url)?
+        .fullResolutionFrame(at: preview.sourceTime), nil)
 }
 
 /// Filename + destination form shown when 輸出 is clicked, replacing NSSavePanel.
@@ -618,6 +718,7 @@ private struct ExportSetupSheet: View {
     @FocusState private var nameFocused: Bool
 
     var body: some View {
+        let preview = exportPreviewDescriptor(model)
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 7) {
                 Image(systemName: "square.and.arrow.up").foregroundStyle(.secondary)
@@ -627,7 +728,12 @@ private struct ExportSetupSheet: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
 
-            ExportThumbnail(cgImage: videoThumb, nsImage: imageThumb)
+            ExportCompositionThumbnail(
+                canvas: model.canvas,
+                placement: preview?.placement,
+                sourceSize: preview?.sourceSize ?? .zero,
+                cgImage: videoThumb,
+                nsImage: imageThumb)
 
             VStack(alignment: .leading, spacing: 6) {
                 Text("檔名").font(.caption).foregroundStyle(.secondary)
@@ -731,7 +837,44 @@ private struct ExportSetupSheet: View {
     }
 }
 
-/// Letterboxed preview frame shared by both export sheet states.
+/// Before FFmpeg has produced a file, draw the first source frame through the
+/// same canvas/placement layout as the editor. The old export sheet displayed a
+/// raw, aspect-fitted source thumbnail here, so every crop, cover, scale and
+/// offset vanished precisely in the UI that called itself the output preview.
+private struct ExportCompositionThumbnail: View {
+    let canvas: CanvasSpec
+    let placement: Placement?
+    let sourceSize: PixelSize
+    let cgImage: CGImage?
+    var nsImage: NSImage? = nil
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.85)
+            if cgImage != nil || nsImage != nil {
+                CanvasStage(canvas: canvas, placement: placement, sourceSize: sourceSize) {
+                    sourceImage
+                }
+            } else {
+                Image(systemName: "film").font(.title2).foregroundStyle(.tertiary)
+            }
+        }
+        .frame(height: 216)
+        .frame(maxWidth: .infinity)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    @ViewBuilder
+    private var sourceImage: some View {
+        if let cgImage {
+            Image(decorative: cgImage, scale: 1).resizable().interpolation(.high)
+        } else if let nsImage {
+            Image(nsImage: nsImage).resizable().interpolation(.high)
+        }
+    }
+}
+
+/// The finished file's actual decoded first frame.
 private struct ExportThumbnail: View {
     let cgImage: CGImage?
     var nsImage: NSImage? = nil
@@ -764,6 +907,7 @@ private struct ExportProgressSheet: View {
     private let timer = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
 
     var body: some View {
+        let preview = exportPreviewDescriptor(model)
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 10) {
                 RoundedRectangle(cornerRadius: 8)
@@ -781,7 +925,12 @@ private struct ExportProgressSheet: View {
                 }
             }
 
-            ExportThumbnail(cgImage: videoThumb, nsImage: imageThumb)
+            ExportCompositionThumbnail(
+                canvas: model.canvas,
+                placement: preview?.placement,
+                sourceSize: preview?.sourceSize ?? .zero,
+                cgImage: videoThumb,
+                nsImage: imageThumb)
 
             VStack(spacing: 6) {
                 HStack(alignment: .firstTextBaseline) {
@@ -900,7 +1049,10 @@ private struct ExportDoneSheet: View {
         }
         .padding(24)
         .task(id: result.outputURL) {
-            thumb = await Thumbnailer(url: result.outputURL).exactFrame(at: 0)
+            // This is the real encoded result, not a filmstrip cell. Keep its
+            // native detail so a Retina export sheet does not enlarge the
+            // thumbnailer's 480px overview and look softer than the file.
+            thumb = await Thumbnailer(url: result.outputURL).fullResolutionFrame(at: 0)
         }
     }
 

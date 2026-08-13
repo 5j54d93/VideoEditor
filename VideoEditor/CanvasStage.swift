@@ -17,7 +17,7 @@ import AppKit
 /// asserted without a running window.
 enum CanvasStageLayout {
 
-    /// The canvas at the largest whole-point size that fits, aspect preserved.
+    /// The canvas at the largest size that fits, aspect preserved.
     /// Shared so a drag can translate pane points back into canvas pixels using
     /// the very scale the canvas was drawn at.
     static func displaySize(canvas: CanvasSpec, in available: CGSize) -> CGSize {
@@ -25,8 +25,12 @@ enum CanvasStageLayout {
               available.width > 0, available.height > 0 else { return available }
         let scale = min(available.width / CGFloat(canvas.width),
                         available.height / CGFloat(canvas.height))
-        return CGSize(width: max(1, (CGFloat(canvas.width) * scale).rounded(.down)),
-                      height: max(1, (CGFloat(canvas.height) * scale).rounded(.down)))
+        // Preserve one common scale on both axes. Flooring each dimension
+        // independently changes the aspect ratio; with a very tall custom
+        // canvas, a nominal one-point width used to leave a sizeable strip at
+        // the bottom that represented no output pixels at all.
+        return CGSize(width: CGFloat(canvas.width) * scale,
+                      height: CGFloat(canvas.height) * scale)
     }
 
     /// Display points per canvas pixel for a pane of this size.

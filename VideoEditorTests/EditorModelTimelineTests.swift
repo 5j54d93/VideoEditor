@@ -429,6 +429,30 @@ final class EditorModelTimelineTests: XCTestCase {
         XCTAssertEqual(model.totalOutputDuration, 1, accuracy: 1e-12)
     }
 
+    func testBlackPadPreviewBeginsAtTheExclusiveVideoBoundary() throws {
+        let video = LibraryAsset(
+            url: URL(fileURLWithPath: "/fixtures/pad-boundary.mp4"),
+            kind: .video, width: 640, height: 480,
+            duration: 1.4, fps: 25, fpsRational: "25",
+            hasAudio: true, frameTimes: [0, 0.96], frameEndTime: 1,
+            audioStartTime: 0, audioDuration: 1.4)
+        let model = EditorModel()
+        model.library = [video]
+        model.insertLibraryAsset(video.id)
+        model.extendVideoToAudioTail(for: model.items[0].id)
+
+        model.seekTimeline(to: 1 - 1e-6)
+        XCTAssertFalse(model.isPlayheadInVideoPad)
+        model.updateTimelineHover(at: 1 - 1e-6)
+        XCTAssertFalse(try XCTUnwrap(model.timelinePreview).isBlackPad)
+
+        model.seekTimeline(to: 1)
+        XCTAssertEqual(model.timelineTime, 1, accuracy: 1e-12)
+        XCTAssertTrue(model.isPlayheadInVideoPad)
+        model.updateTimelineHover(at: 1)
+        XCTAssertTrue(try XCTUnwrap(model.timelinePreview).isBlackPad)
+    }
+
     func testPadFollowsTheHalfThatStillEndsOnTheFinalFrame() {
         let video = LibraryAsset(
             url: URL(fileURLWithPath: "/fixtures/split-pad.mp4"),

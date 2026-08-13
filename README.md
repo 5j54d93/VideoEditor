@@ -47,12 +47,14 @@ The timeline **is** the output：every visible clip is part of the exported movi
 - **No black flash**：the scrub layer stays mounted and only fades in once it has a frame to display, so the committed preview shows through while a freshly loaded source is still decoding.
 - **Exact by construction**：hover positions are quantized onto the source frame grid first, then requested with zero seek tolerance and a one-nanosecond interior bias — so the frame on screen is always the frame the model, the timeline cell and the export all agree on.
 - **Stills get their own control**：selecting an image clip reveals a display-duration slider（0.2–20 s）right above the timeline.
+- **Reframe against source pixels**：double-click the preview or press <kbd>C</kbd> to crop the source and place it on the output canvas. Crop inspection decodes the current video frame at native resolution rather than enlarging a player thumbnail, with fit, 1:1 and up to 1600% zoom for precise boundaries.
+- **Choose the canvas**：the 版面 inspector offers automatic sizing, landscape／portrait／square presets and an explicit custom width and height. Custom yuv420p dimensions are normalised to even pixels in the fields and in the exported file.
 
 ## Deterministic Export
 
 <kbd>⌘</kbd><kbd>E</kbd> opens a filename／destination sheet（remembering the last folder）, then a live progress sheet with the first frame, percentage, elapsed and estimated remaining — cancellable, and a cancelled export deletes its half-written file instead of leaving a torso behind.
 
-Everything is normalized onto one shared canvas — the largest dimensions among the clips, at the exact rational frame rate of the fastest video — scaled, letterboxed, concatenated, and encoded with one fixed internal profile：libx264（medium, CRF 18, `yuv420p`）plus native AAC（two-loop coder, stereo 44.1 kHz, 192 kbps）. There is no hidden quality／threading setting that can silently change the file format.
+Everything is normalized onto one shared canvas — automatically the largest dimensions among the clips, or a preset/custom size chosen in the 版面 inspector — at the exact rational frame rate of the fastest video, scaled, letterboxed, concatenated, and encoded with one fixed internal profile：libx264（medium, CRF 18, `yuv420p`）plus native AAC（two-loop coder, stereo 44.1 kHz, 192 kbps）. There is no hidden quality／threading setting that can silently change the file format.
 
 Reproducibility is enforced at every variable stage：FFmpeg-native CPU-feature dispatch is disabled, the filter graph runs on one worker, scaling uses accurate bitexact rounding with dithering disabled, audio resampling uses a fixed signed-32-bit internal format, and x264 is always pinned to one frame thread and one lookahead thread with deterministic／CPU-independent mode enabled. This trades a modest amount of export speed for same-architecture stability across machines. Output-side `-fflags +bitexact -flags +bitexact -map_metadata -1 -map_chapters -1` selects bitexact codec／muxer paths and removes volatile timestamps and inherited metadata; `-movflags +faststart` remains web-ready. A SHA-256 of the finished file is computed on every run.
 
@@ -81,6 +83,8 @@ The guarantee is intentionally scoped to the **same bundled toolchain and CPU ar
 | <kbd>⌘</kbd><kbd>Z</kbd> <kbd>⇧</kbd><kbd>⌘</kbd><kbd>Z</kbd> | Undo／redo |
 | <kbd>⌘</kbd><kbd>I</kbd> | Import media |
 | <kbd>⌘</kbd><kbd>E</kbd> | Export |
+| <kbd>C</kbd> | Enter／leave crop and canvas-position editing |
+| <kbd>⌥</kbd><kbd>⌘</kbd><kbd>I</kbd> | Show／hide the 版面 inspector |
 
 Single-key shortcuts disable themselves while a text field has focus, so typing a filename or a timecode never triggers an edit.
 

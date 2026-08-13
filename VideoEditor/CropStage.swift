@@ -28,8 +28,9 @@ struct StageViewport: Equatable {
     static let maxPercent: CGFloat = 16
     /// Below this, a pixel grid would be denser than the pixels it describes.
     static let pixelGridThreshold: CGFloat = 8
-    /// Interpolating past this turns pixel edges into gradients, and the whole
-    /// point of zooming in is to see exactly where the edge is.
+    /// Points per source pixel beyond which interpolation turns pixel edges into
+    /// gradients, and the whole point of zooming in is to see exactly where the
+    /// edge is.
     static let nearestNeighbourThreshold: CGFloat = 4
 
     func zoomLimit(fitScale: CGFloat) -> CGFloat {
@@ -44,6 +45,13 @@ struct StageViewport: Equatable {
         zoom = min(max(1, value), zoomLimit(fitScale: fitScale))
         if zoom == 1 { pan = .zero }
     }
+
+    /// Whether displaying one source pixel across this many screen points needs
+    /// a hard edge. Kept here so callers cannot accidentally compare the
+    /// fit-relative `zoom` value with an absolute pixel threshold again.
+    static func usesNearestNeighbour(pointsPerSourcePixel: CGFloat) -> Bool {
+        pointsPerSourcePixel >= nearestNeighbourThreshold
+    }
 }
 
 // MARK: - Crop stage
@@ -55,7 +63,10 @@ struct CropStage<Content: View>: View {
     let onChange: (PixelRect) -> Void
     let onGestureBegin: () -> Void
     let onGestureEnd: () -> Void
-    @ViewBuilder var content: () -> Content
+    /// Receives the actual on-screen points per source pixel. The fit multiplier
+    /// alone is not a picture magnification and made interpolation change at a
+    /// different effective zoom for every pane and source size.
+    @ViewBuilder var content: (_ pointsPerSourcePixel: CGFloat) -> Content
 
     /// Screen-space size of a handle. Constant: at 800% a handle that scaled
     /// with the picture would cover a quarter of the crop rect.
@@ -77,7 +88,7 @@ struct CropStage<Content: View>: View {
                 Color.clear.contentShape(Rectangle())
                     .gesture(panGesture)
 
-                content()
+                content(scale)
                     .frame(width: picture.width, height: picture.height)
                     .placed(at: picture.origin, in: geo.size)
                     .allowsHitTesting(false)

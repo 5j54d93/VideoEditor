@@ -223,6 +223,35 @@ final class AssemblyArgumentsTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(FFTools.finiteDouble("10.25")), 10.25, accuracy: 1e-12)
     }
 
+    func testProbeDimensionsFollowDisplayRotation() {
+        let portrait = FFTools.displayDimensions(
+            codedWidth: 1920, codedHeight: 1080,
+            stream: ["side_data_list": [["rotation": -90]]])
+        XCTAssertEqual(portrait.width, 1080)
+        XCTAssertEqual(portrait.height, 1920)
+
+        let upsideDown = FFTools.displayDimensions(
+            codedWidth: 1920, codedHeight: 1080,
+            stream: ["side_data_list": [["rotation": 180]]])
+        XCTAssertEqual(upsideDown.width, 1920)
+        XCTAssertEqual(upsideDown.height, 1080)
+
+        let legacy = FFTools.displayDimensions(
+            codedWidth: 640, codedHeight: 480,
+            stream: ["tags": ["rotate": "90"]])
+        XCTAssertEqual(legacy.width, 480)
+        XCTAssertEqual(legacy.height, 640)
+
+        let orientedStill = FFTools.displayDimensions(
+            codedWidth: 120, codedHeight: 80,
+            metadataSources: [
+                ["side_data_list": [["rotation": -90]]],
+                ["width": 120, "height": 80],
+            ])
+        XCTAssertEqual(orientedStill.width, 80)
+        XCTAssertEqual(orientedStill.height, 120)
+    }
+
     func testBlackPadLengthensThePictureAndRaisesTheAudioCeiling() throws {
         let video = videoItem(
             path: "/fixtures/padded-tail.mp4",

@@ -202,8 +202,14 @@ struct FFTools: Sendable {
         }
         let a = streams.first(where: { ($0["codec_type"] as? String) == "audio" })
 
-        let width = (v["width"] as? Int) ?? 0
-        let height = (v["height"] as? Int) ?? 0
+        let codedWidth = (v["width"] as? Int) ?? 0
+        let codedHeight = (v["height"] as? Int) ?? 0
+        // AVPlayer, AVAssetImageGenerator with preferred transforms, and
+        // ffmpeg's default filter input all expose display-oriented pixels.
+        // Keep the model on that same lattice or a portrait phone video reports
+        // landscape crop coordinates and is squeezed in both preview and export.
+        let dimensions = Self.displayDimensions(
+            codedWidth: codedWidth, codedHeight: codedHeight, stream: v)
         let aCodec = a?["codec_name"] as? String
         let videoTiming = Self.streamTiming(v)
         let audioTiming = a.flatMap(Self.streamTiming)
@@ -257,24 +263,34 @@ struct FFTools: Sendable {
                          videoStartTime: videoStartTime,
                          videoDuration: videoDuration,
                          fps: fps, fpsRational: fpsRational,
-                         width: width, height: height,
+                         width: dimensions.width, height: dimensions.height,
                          audioCodec: aCodec,
                          audioStartTime: audioStartTime,
                          audioDuration: audioDuration,
                          frameTimes: framePackets.times)
     }
 
-    /// Just the pixel dimensions of the first video stream (used for still images).
+    /// Display-oriented pixel dimensions of a still image. JPEG/HEIF orientation
+    /// can live on the decoded frame rather than the stream; inspect one frame so
+    /// NSImage, the crop lattice and FFmpeg autorotation all describe the same
+    /// width/height.
     nonisolated func probeDimensions(_ url: URL) async throws -> (w: Int, h: Int) {
         let args = ["-v", "error", "-select_streams", "v:0",
-                    "-show_entries", "stream=width,height", "-of", "json", url.path]
+                    "-read_intervals", "%+#1", "-show_streams", "-show_frames",
+                    "-of", "json", url.path]
         let (code, out) = try await Self.run(ffprobe, args)
         guard code == 0, let data = out.data(using: .utf8),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let s = (root["streams"] as? [[String: Any]])?.first else {
             throw FFError.probeFailed(out)
         }
-        return ((s["width"] as? Int) ?? 0, (s["height"] as? Int) ?? 0)
+        let codedWidth = (s["width"] as? Int) ?? 0
+        let codedHeight = (s["height"] as? Int) ?? 0
+        let frame = (root["frames"] as? [[String: Any]])?.first
+        let dimensions = Self.displayDimensions(
+            codedWidth: codedWidth, codedHeight: codedHeight,
+            metadataSources: [frame, s].compactMap { $0 })
+        return (dimensions.width, dimensions.height)
     }
 
     /// Container duration in seconds (used for audio files).
@@ -418,7 +434,8 @@ struct FFTools: Sendable {
         // every export did before geometry existed.
         guard item.sourceSize.isUsable else {
             return "scale=\(W):\(H):force_original_aspect_ratio=decrease:\(scalerFlags)," +
-                   "pad=\(W):\(H):(ow-iw)/2:(oh-ih)/2,setsar=1,fps=\(canvas.fps),format=yuv420p"
+                   "format=yuv444p,pad=\(W):\(H):(ow-iw)/2:(oh-ih)/2," +
+                   "setsar=1,fps=\(canvas.fps),format=yuv420p"
         }
 
         let placement = resolve(item.geometry, source: item.sourceSize, canvas: canvas)
@@ -434,10 +451,33 @@ struct FFTools: Sendable {
 
         var parts: [String] = []
         if let crop = placement.sourceCrop {
-            parts.append("crop=\(crop.width):\(crop.height):\(crop.x):\(crop.y)")
+            // The editor's integer crop is exact even when a source happens to
+            // decode as yuv411p/yuv410p, whose chroma grid is wider than 2px.
+            // `exact=1` prevents crop from silently moving x/y or shrinking the
+            // requested rectangle to that source format's subsampling factor.
+            parts.append("crop=\(crop.width):\(crop.height):\(crop.x):\(crop.y):exact=1")
         }
         parts.append("scale=\(placement.scaledSize.width):\(placement.scaledSize.height):\(scalerFlags)")
-        if let visible = placement.visibleCrop {
+        // A yuv420 frame cannot represent an odd crop origin or pad offset on
+        // its subsampled chroma planes. crop/pad silently round such geometry
+        // down, while CanvasStage quite correctly draws the requested integer
+        // coordinate — producing a one-pixel preview/export drift. Compose on a
+        // full-resolution chroma grid, then convert the even canvas back to the
+        // delivery format only after every spatial operation is complete.
+        let visible = placement.visibleCrop
+        let canvasGridValues = [
+            placement.scaledSize.width, placement.scaledSize.height,
+            visible?.x ?? 0, visible?.y ?? 0,
+            visible?.width ?? 0, visible?.height ?? 0,
+            placement.padOrigin.x, placement.padOrigin.y,
+        ]
+        // Keep the ordinary all-even path free of a needless 4:2:0 → 4:4:4 →
+        // 4:2:0 round trip. Full chroma is only required when one of the actual
+        // canvas-grid operations needs to address an odd pixel coordinate.
+        if canvasGridValues.contains(where: { $0 % 2 != 0 }) {
+            parts.append("format=yuv444p")
+        }
+        if let visible {
             parts.append("crop=\(visible.width):\(visible.height):\(visible.x):\(visible.y)")
         }
         parts.append("pad=\(W):\(H):\(placement.padOrigin.x):\(placement.padOrigin.y)")
@@ -646,6 +686,43 @@ struct FFTools: Sendable {
         }
         guard let parsed, parsed.isFinite else { return nil }
         return parsed
+    }
+
+    /// Display size after ffmpeg's autorotation. Current ffprobe emits rotation
+    /// in `side_data_list`; accept the legacy tag too for older containers.
+    nonisolated static func displayDimensions(
+        codedWidth: Int,
+        codedHeight: Int,
+        stream: [String: Any]
+    ) -> (width: Int, height: Int) {
+        displayDimensions(codedWidth: codedWidth, codedHeight: codedHeight,
+                          metadataSources: [stream])
+    }
+
+    /// Prefer the first orientation source that actually carries a rotation.
+    /// Still images commonly attach it to frame side data; movies normally put
+    /// it on the stream display matrix.
+    nonisolated static func displayDimensions(
+        codedWidth: Int,
+        codedHeight: Int,
+        metadataSources: [[String: Any]]
+    ) -> (width: Int, height: Int) {
+        let rotation = metadataSources.lazy.compactMap { metadata -> Double? in
+            let sideRotation = (metadata["side_data_list"] as? [[String: Any]])?
+                .compactMap { finiteDouble($0["rotation"]) }
+                .first
+            let tagRotation = (metadata["tags"] as? [String: Any])
+                .flatMap { finiteDouble($0["rotate"]) }
+            return sideRotation ?? tagRotation
+        }.first ?? 0
+        // Work modulo 360 and tolerate the tiny decimal noise some matrices
+        // produce. Only quarter turns swap the axes; 0/180 keep them.
+        let normalized = ((rotation.truncatingRemainder(dividingBy: 360)) + 360)
+            .truncatingRemainder(dividingBy: 360)
+        let isQuarterTurn = abs(normalized - 90) < 0.5 || abs(normalized - 270) < 0.5
+        return isQuarterTurn
+            ? (width: codedHeight, height: codedWidth)
+            : (width: codedWidth, height: codedHeight)
     }
 
     private nonisolated static func parseRational(_ s: String?) -> Double? {

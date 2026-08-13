@@ -76,9 +76,21 @@ final class ClipGeometryTests: XCTestCase {
 
         XCTAssertEqual(chain,
                        "scale=1000:563:\(scalerFlags),"
-                       + "pad=1000:1000:0:218,setsar=1,fps=30,format=yuv420p")
+                       + "format=yuv444p,pad=1000:1000:0:218,"
+                       + "setsar=1,fps=30,format=yuv420p")
         XCTAssertFalse(chain.contains("force_original_aspect_ratio"))
         XCTAssertFalse(chain.contains("(ow-iw)"))
+    }
+
+    func testAllEvenCanvasPlacementAvoidsNeedlessFullChromaRoundTrip() {
+        let chain = FFTools.geometryChain(
+            for: item(source: PixelSize(width: 1920, height: 1080)),
+            canvas: canvas(PixelSize(width: 1920, height: 1080)))
+
+        XCTAssertFalse(chain.contains("format=yuv444p"))
+        XCTAssertEqual(chain,
+                       "scale=1920:1080:\(scalerFlags),pad=1920:1080:0:0,"
+                       + "setsar=1,fps=30,format=yuv420p")
     }
 
     /// Probing does not always report a frame size. Without one there is nothing
@@ -90,7 +102,8 @@ final class ClipGeometryTests: XCTestCase {
 
         XCTAssertEqual(chain,
                        "scale=1920:1080:force_original_aspect_ratio=decrease:\(scalerFlags),"
-                       + "pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p")
+                       + "format=yuv444p,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,"
+                       + "setsar=1,fps=30,format=yuv420p")
     }
 
     /// The horizontal-source-into-vertical-canvas case: crop acts on source
@@ -104,8 +117,9 @@ final class ClipGeometryTests: XCTestCase {
             canvas: canvas(PixelSize(width: 1080, height: 1920)))
 
         XCTAssertEqual(chain,
-                       "crop=1280:1080:320:0,scale=1080:911:\(scalerFlags),"
-                       + "pad=1080:1920:0:504,setsar=1,fps=30,format=yuv420p")
+                       "crop=1280:1080:320:0:exact=1,scale=1080:911:\(scalerFlags),"
+                       + "format=yuv444p,pad=1080:1920:0:504,"
+                       + "setsar=1,fps=30,format=yuv420p")
     }
 
     // MARK: Overflow
@@ -129,7 +143,8 @@ final class ClipGeometryTests: XCTestCase {
         // The trim has to sit between the scale and the pad: pad cannot take a
         // negative origin, which is the whole reason the second crop exists.
         XCTAssertEqual(chain,
-                       "scale=3413:1920:\(scalerFlags),crop=1080:1920:1166:0,"
+                       "scale=3413:1920:\(scalerFlags),format=yuv444p,"
+                       + "crop=1080:1920:1166:0,"
                        + "pad=1080:1920:0:0,setsar=1,fps=30,format=yuv420p")
     }
 
@@ -236,6 +251,16 @@ final class ClipGeometryTests: XCTestCase {
     }
 
     // MARK: Preview placement
+
+    func testCanvasDisplayUsesOneScaleForExtremeCustomAspectRatios() {
+        let target = canvas(PixelSize(width: 16, height: 7680))
+        let display = CanvasStageLayout.displaySize(
+            canvas: target, in: CGSize(width: 300, height: 500))
+
+        XCTAssertEqual(display.width / CGFloat(target.width),
+                       display.height / CGFloat(target.height), accuracy: 1e-12)
+        XCTAssertEqual(display.height, 500, accuracy: 1e-12)
+    }
 
     /// The preview draws from the unclamped origin and lets the canvas clip;
     /// export cannot, because pad rejects a negative origin. The two have to
@@ -449,6 +474,74 @@ final class ClipGeometryTests: XCTestCase {
         viewport.pan = CGSize(width: 120, height: -80)
         viewport.setZoom(1, fitScale: 0.5)
         XCTAssertEqual(viewport.pan, .zero)
+    }
+
+    /// Interpolation follows the absolute number of display points occupied by
+    /// one source pixel, not the fit-relative slider multiplier. A large source
+    /// starts below the threshold and only crosses it after enough zoom.
+    func testNearestNeighbourThresholdUsesActualSourcePixelScale() {
+        XCTAssertFalse(StageViewport.usesNearestNeighbour(pointsPerSourcePixel: 3.99))
+        XCTAssertTrue(StageViewport.usesNearestNeighbour(pointsPerSourcePixel: 4))
+        XCTAssertTrue(StageViewport.usesNearestNeighbour(pointsPerSourcePixel: 8))
+    }
+
+    // MARK: Canvas sizing
+
+    func testCustomCanvasPreservesItsIdentityAtPresetDimensions() {
+        let model = EditorModel()
+        let preset = PixelSize(width: 1920, height: 1080)
+
+        model.setCanvasSizing(.custom(preset))
+
+        XCTAssertEqual(model.canvasSizing, .custom(preset))
+        XCTAssertEqual(model.canvas.width, 1920)
+        XCTAssertEqual(model.canvas.height, 1080)
+    }
+
+    func testCustomCanvasStillNormalisesOddDimensionsForExport() {
+        let model = EditorModel()
+
+        model.setCanvasSizing(.custom(PixelSize(width: 1001, height: 777)))
+
+        XCTAssertEqual(model.canvasSizing,
+                       .custom(PixelSize(width: 1002, height: 778)))
+        XCTAssertEqual(model.canvas.width, 1002)
+        XCTAssertEqual(model.canvas.height, 778)
+    }
+
+    // MARK: Export preview
+
+    /// The setup/progress sheet must describe the same first item and resolved
+    /// placement that reaches FFmpeg. Before this regression, it simply fitted
+    /// the raw source thumbnail and ignored crop, scale, offset and canvas.
+    func testExportPreviewUsesFirstRenderableItemAndResolvedGeometry() throws {
+        let empty = ClipItem(
+            url: URL(fileURLWithPath: "/fixtures/empty.mov"), kind: .video,
+            naturalWidth: 640, naturalHeight: 480, sourceDuration: 1,
+            fps: 30, hasAudio: false, outPoint: 0)
+        var rendered = ClipItem(
+            url: URL(fileURLWithPath: "/fixtures/rendered.mov"), kind: .video,
+            naturalWidth: 1920, naturalHeight: 1080, sourceDuration: 4,
+            fps: 30, hasAudio: false, outPoint: 3)
+        rendered.frameTimes = [1, 2, 3]
+        rendered.videoStartTime = 1
+        rendered.videoDuration = 3
+        rendered.inPoint = 2
+        rendered.geometry.sourceCrop = PixelRect(x: 320, y: 0,
+                                                 width: 1280, height: 1080)
+        rendered.geometry.offset = PixelOffset(x: -100, y: 40)
+
+        let target = canvas(PixelSize(width: 1080, height: 1920))
+        let preview = try XCTUnwrap(
+            ExportPreviewDescriptor.first(in: [empty, rendered], canvas: target))
+
+        XCTAssertEqual(preview.itemID, rendered.id)
+        XCTAssertEqual(preview.sourceTime, 2)
+        XCTAssertEqual(preview.sourceSize, rendered.sourcePixelSize)
+        XCTAssertEqual(preview.placement,
+                       FFTools.resolve(rendered.geometry,
+                                       source: rendered.sourcePixelSize,
+                                       canvas: target))
     }
 
     // MARK: Helpers

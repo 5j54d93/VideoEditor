@@ -263,7 +263,14 @@ nonisolated enum GeometryEditMode: Equatable, Sendable {
 /// source clips, so a project nobody has reframed exports exactly as before.
 nonisolated enum CanvasSizing: Equatable, Sendable {
     case automatic
+    /// A named size from the inspector. Kept as the original `fixed` case so
+    /// existing model callers continue to mean the same thing.
     case fixed(PixelSize)
+    /// An explicitly editable size. This has to remain distinct even when its
+    /// current numbers happen to equal a preset; otherwise choosing 自訂 from a
+    /// 1920×1080 canvas immediately snaps the picker back to that preset and the
+    /// width/height fields never appear.
+    case custom(PixelSize)
 }
 
 struct ClipItem: Identifiable, Equatable {
@@ -307,6 +314,10 @@ struct ClipItem: Identifiable, Equatable {
     var contentDuration: Double { max(0, outPoint - inPoint) }
     /// The clip's span on the output timeline, which the black pad extends.
     var displayDuration: Double { contentDuration + max(0, videoPadDuration) }
+    /// FFmpeg drops empty timeline placeholders before building its concat graph.
+    /// Export previews use this same predicate so their purported first frame
+    /// cannot come from an item that never reaches the output file.
+    var isExportable: Bool { displayDuration > 1e-3 }
     var hasVideoPad: Bool { videoPadDuration > 1e-9 }
     var effectiveFps: Double { fps > 0 ? fps : 30 }
     var frameDuration: Double { 1.0 / effectiveFps }

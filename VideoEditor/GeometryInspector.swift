@@ -63,13 +63,15 @@ struct GeometryInspector: View {
             }
             .labelsHidden()
 
-            if case .fixed(let size) = model.canvasSizing, !isPreset(size) {
+            if let size = editableCanvasSize {
                 HStack(spacing: 6) {
                     PixelField(label: "寬", value: size.width, range: 16...7680) {
-                        model.setCanvasSizing(.fixed(PixelSize(width: $0, height: size.height)))
+                        model.setCanvasSizing(.custom(PixelSize(width: $0, height: size.height)))
+                        return model.canvas.width
                     } onFocusChange: { model.isTextEditing = $0 }
                     PixelField(label: "高", value: size.height, range: 16...7680) {
-                        model.setCanvasSizing(.fixed(PixelSize(width: size.width, height: $0)))
+                        model.setCanvasSizing(.custom(PixelSize(width: size.width, height: $0)))
+                        return model.canvas.height
                     } onFocusChange: { model.isTextEditing = $0 }
                 }
             }
@@ -90,6 +92,8 @@ struct GeometryInspector: View {
             case .fixed(let size):
                 return EditorModel.canvasPresets.firstIndex { $0.size == size }
                     .map { CanvasChoice.preset($0) } ?? .custom
+            case .custom:
+                return .custom
             }
         } set: { choice in
             switch choice {
@@ -102,9 +106,22 @@ struct GeometryInspector: View {
                 // Seed the custom fields with whatever is on screen, so picking
                 // 自訂 never moves the canvas by itself.
                 let canvas = model.canvas
-                model.setCanvasSizing(.fixed(PixelSize(width: canvas.width,
-                                                       height: canvas.height)))
+                model.setCanvasSizing(.custom(PixelSize(width: canvas.width,
+                                                        height: canvas.height)))
             }
+        }
+    }
+
+    /// A legacy/programmatic fixed size that is not one of our named presets is
+    /// also editable. Once changed it becomes an explicit custom selection.
+    private var editableCanvasSize: PixelSize? {
+        switch model.canvasSizing {
+        case .custom(let size):
+            return size
+        case .fixed(let size) where !isPreset(size):
+            return size
+        case .automatic, .fixed:
+            return nil
         }
     }
 
@@ -154,20 +171,26 @@ struct GeometryInspector: View {
                         PixelField(label: "寬", value: crop.width, range: 2...source.width) {
                             var updated = crop; updated.width = $0
                             model.setSourceCrop(updated, for: item.id)
+                            return model.items.first { $0.id == item.id }?.geometry.sourceCrop?.width
+                                ?? source.width
                         } onFocusChange: { model.isTextEditing = $0 }
                         PixelField(label: "高", value: crop.height, range: 2...source.height) {
                             var updated = crop; updated.height = $0
                             model.setSourceCrop(updated, for: item.id)
+                            return model.items.first { $0.id == item.id }?.geometry.sourceCrop?.height
+                                ?? source.height
                         } onFocusChange: { model.isTextEditing = $0 }
                     }
                     GridRow {
                         PixelField(label: "X", value: crop.x, range: 0...max(0, source.width - 2)) {
                             var updated = crop; updated.x = $0
                             model.setSourceCrop(updated, for: item.id)
+                            return model.items.first { $0.id == item.id }?.geometry.sourceCrop?.x ?? 0
                         } onFocusChange: { model.isTextEditing = $0 }
                         PixelField(label: "Y", value: crop.y, range: 0...max(0, source.height - 2)) {
                             var updated = crop; updated.y = $0
                             model.setSourceCrop(updated, for: item.id)
+                            return model.items.first { $0.id == item.id }?.geometry.sourceCrop?.y ?? 0
                         } onFocusChange: { model.isTextEditing = $0 }
                     }
                 }
@@ -188,11 +211,15 @@ struct GeometryInspector: View {
                            range: -model.canvas.width...model.canvas.width) {
                     model.setGeometryOffset(PixelOffset(x: $0, y: item.geometry.offset.y),
                                             for: item.id)
+                    return model.items.first { $0.id == item.id }?.geometry.offset.x
+                        ?? item.geometry.offset.x
                 } onFocusChange: { model.isTextEditing = $0 }
                 PixelField(label: "位移 Y", value: item.geometry.offset.y,
                            range: -model.canvas.height...model.canvas.height) {
                     model.setGeometryOffset(PixelOffset(x: item.geometry.offset.x, y: $0),
                                             for: item.id)
+                    return model.items.first { $0.id == item.id }?.geometry.offset.y
+                        ?? item.geometry.offset.y
                 } onFocusChange: { model.isTextEditing = $0 }
             }
 
@@ -264,7 +291,10 @@ private struct PixelField: View {
     let label: String
     let value: Int
     let range: ClosedRange<Int>
-    let onCommit: (Int) -> Void
+    /// Applies the submitted value and returns the model's canonical value after
+    /// clamping/snapping. Reading it back is necessary even for a model no-op,
+    /// where SwiftUI emits no value-change notification.
+    let onCommit: (Int) -> Int
     let onFocusChange: (Bool) -> Void
 
     @State private var text: String = ""
@@ -283,9 +313,12 @@ private struct PixelField: View {
                 .onSubmit(commit)
         }
         .onAppear { text = String(value) }
-        // While the field has focus the model's value is the one being typed
-        // over; adopting it would fight the cursor.
-        .onChange(of: value) { _, new in if !focused { text = String(new) } }
+        // The model only changes after a commit, so adopting its value cannot
+        // fight an in-progress keystroke. It *can* reflect a further model snap
+        // (for example a 1001px canvas becoming the required even 1002px).
+        .onChange(of: value) { _, new in
+            text = String(new)
+        }
         .onChange(of: focused) { _, isFocused in
             onFocusChange(isFocused)
             if !isFocused { commit() }
@@ -298,9 +331,6 @@ private struct PixelField: View {
             return
         }
         let clamped = min(max(range.lowerBound, parsed), range.upperBound)
-        onCommit(clamped)
-        // The model may snap further (even alignment, bounds); show what it did
-        // rather than what was typed.
-        text = String(clamped)
+        text = String(onCommit(clamped))
     }
 }
