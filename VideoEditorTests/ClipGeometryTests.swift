@@ -293,6 +293,31 @@ final class ClipGeometryTests: XCTestCase {
         XCTAssertEqual(visible.height, Double(placement.scaledSize.height), accuracy: 0.5)
     }
 
+    /// The preview needs two clips, not one. A crop leaves the source frame
+    /// wider than the region it keeps, and the discarded part lands *inside*
+    /// the canvas, where the canvas edge cannot cut it. The inner window is what
+    /// removes it, so it has to be exactly the region export keeps.
+    func testCropWindowCoversOnlyWhatExportKeeps() {
+        let source = PixelSize(width: 1920, height: 1080)
+        var geometry = ClipGeometry()
+        geometry.sourceCrop = PixelRect(x: 0, y: 0, width: 690, height: 1080)
+
+        let target = canvas(PixelSize(width: 1920, height: 1080))
+        let placement = FFTools.resolve(geometry, source: source, canvas: target)
+        let window = CanvasStageLayout.cropWindow(placement: placement,
+                                                  pointsPerCanvasPixel: 1)
+
+        // 690 wide, centred in 1920 — not the whole 1920-wide source frame.
+        XCTAssertEqual(window, CGRect(x: 615, y: 0, width: 690, height: 1080))
+
+        // And the source frame really is wider than that window, which is why
+        // relying on the canvas edge alone let the discarded pixels through.
+        let frame = try! XCTUnwrap(CanvasStageLayout.sourceFrame(
+            placement: placement, sourceSize: source, pointsPerCanvasPixel: 1))
+        XCTAssertGreaterThan(frame.width, window.width)
+        XCTAssertEqual(frame.minX, window.minX, accuracy: 0.01)   // crop starts at x=0
+    }
+
     /// An overflowing placement is where the two halves could most easily
     /// disagree: export trims with a second crop, the preview just lets the
     /// canvas clip.
@@ -357,6 +382,50 @@ final class ClipGeometryTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(snapped.width, 2)
         XCTAssertGreaterThanOrEqual(snapped.x, 0)
         XCTAssertLessThanOrEqual(snapped.x + snapped.width, source.width)
+    }
+
+    // MARK: Timeline strip
+
+    /// The strip reflects the crop but nothing else. Without a crop it has to
+    /// reduce to what it always did — fill the tile and centre — or every
+    /// project's timeline shifts the moment this ships.
+    func testUncroppedStripFramingIsUnchanged() {
+        let source = PixelSize(width: 1920, height: 1080)
+        let tile = CGSize(width: 70, height: 44)
+        let frame = try! XCTUnwrap(SourceRegionLayout.wholeSourceFrame(
+            crop: nil, source: source, filling: tile))
+
+        // scaledToFill: the larger of the two ratios, then centred.
+        let expected = max(tile.width / 1920, tile.height / 1080)
+        XCTAssertEqual(frame.width, 1920 * expected, accuracy: 0.01)
+        XCTAssertEqual(frame.height, 1080 * expected, accuracy: 0.01)
+        XCTAssertEqual(frame.midX, tile.width / 2, accuracy: 0.01)
+        XCTAssertEqual(frame.midY, tile.height / 2, accuracy: 0.01)
+    }
+
+    func testCroppedStripCentresTheKeptRegionOnly() {
+        let source = PixelSize(width: 1920, height: 1080)
+        let tile = CGSize(width: 70, height: 44)
+        let crop = PixelRect(x: 320, y: 0, width: 1280, height: 1080)
+        let frame = try! XCTUnwrap(SourceRegionLayout.wholeSourceFrame(
+            crop: crop, source: source, filling: tile))
+
+        // The crop's own centre — not the source's — lands in the tile's centre.
+        let scale = max(tile.width / 1280, tile.height / 1080)
+        let cropCentreX = frame.minX + (320 + 1280 / 2) * scale
+        let cropCentreY = frame.minY + (0 + 1080 / 2) * scale
+        XCTAssertEqual(cropCentreX, tile.width / 2, accuracy: 0.01)
+        XCTAssertEqual(cropCentreY, tile.height / 2, accuracy: 0.01)
+        // And it covers the tile: nothing the crop kept leaves a gap.
+        XCTAssertLessThanOrEqual(frame.minX + 320 * scale, 0.01)
+        XCTAssertGreaterThanOrEqual(frame.minX + (320 + 1280) * scale, tile.width - 0.01)
+    }
+
+    func testStripFramingIsSkippedWithoutAUsableSource() {
+        XCTAssertNil(SourceRegionLayout.wholeSourceFrame(
+            crop: nil, source: .zero, filling: CGSize(width: 70, height: 44)))
+        XCTAssertNil(SourceRegionLayout.wholeSourceFrame(
+            crop: nil, source: PixelSize(width: 1920, height: 1080), filling: .zero))
     }
 
     // MARK: Viewport

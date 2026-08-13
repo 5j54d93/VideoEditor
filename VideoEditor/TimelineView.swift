@@ -783,10 +783,14 @@ private struct TimelineClipView: View {
     @ViewBuilder
     private func mediaStrip(height laneHeight: CGFloat) -> some View {
         if item.isImage {
-            TimelineImageStrip(url: item.url)
+            TimelineImageStrip(url: item.url,
+                               source: item.sourcePixelSize,
+                               crop: item.geometry.sourceCrop)
         } else {
             TimelineVideoStrip(
                 itemID: item.id,
+                source: item.sourcePixelSize,
+                crop: item.geometry.sourceCrop,
                 sourceRevision: model.videoSourceRevision(for: item.url),
                 thumbnailer: model.thumbnailer(for: item.url),
                 grid: item.grid,
@@ -957,19 +961,23 @@ private struct TailChip: View {
 
 private struct TimelineImageStrip: View {
     let url: URL
+    let source: PixelSize
+    let crop: PixelRect?
     @State private var image: NSImage?
 
     var body: some View {
-        ZStack {
-            Color.black.opacity(0.82)
-            if let image {
-                Color.clear.overlay {
-                    Image(nsImage: image).resizable().scaledToFill()
+        GeometryReader { geo in
+            ZStack {
+                Color.black.opacity(0.82)
+                if let image {
+                    Image(nsImage: image)
+                        .resizable()
+                        .showingSourceRegion(crop, of: source, filling: geo.size)
+                } else {
+                    ProgressView().controlSize(.small)
                 }
-                .clipped()
-            } else {
-                ProgressView().controlSize(.small)
             }
+            .frame(width: geo.size.width, height: geo.size.height)
         }
         .task(id: url) { image = NSImage(contentsOf: url) }
     }
@@ -1021,6 +1029,8 @@ private struct TimelineRuler: View {
 /// horizontal room it switches to exact, individually aligned frame cells.
 private struct TimelineVideoStrip: View {
     let itemID: ClipItem.ID
+    let source: PixelSize
+    let crop: PixelRect?
     let sourceRevision: Int
     let thumbnailer: Thumbnailer?
     let grid: FrameGrid
@@ -1040,6 +1050,8 @@ private struct TimelineVideoStrip: View {
         if frameWidth >= 28 {
             ExactFrameTimelineStrip(
                 itemID: itemID,
+                source: source,
+                crop: crop,
                 sourceRevision: sourceRevision,
                 thumbnailer: thumbnailer,
                 grid: grid,
@@ -1053,7 +1065,8 @@ private struct TimelineVideoStrip: View {
                 preferredFrame: preferredFrame
             )
         } else {
-            FilmstripStrip(sourceRevision: sourceRevision,
+            FilmstripStrip(source: source, crop: crop,
+                           sourceRevision: sourceRevision,
                            thumbnailer: thumbnailer, grid: grid,
                            start: start, end: end,
                            width: width, height: height)
@@ -1063,6 +1076,8 @@ private struct TimelineVideoStrip: View {
 
 private struct ExactFrameTimelineStrip: View {
     let itemID: ClipItem.ID
+    let source: PixelSize
+    let crop: PixelRect?
     let sourceRevision: Int
     let thumbnailer: Thumbnailer?
     let grid: FrameGrid
@@ -1143,14 +1158,15 @@ private struct ExactFrameTimelineStrip: View {
         ZStack(alignment: .bottomLeading) {
             Color.secondary.opacity(0.13)
             if let image = frames[frameIndex] {
-                // Size + clip the image itself: a bare scaledToFill inside the ZStack
-                // grows the stack to the image's overflow size, which shifts the
-                // clipping window (side gaps) and pushes the badge out of view.
+                // The image is sized and clipped to the cell rather than left to
+                // overflow: a bare scaledToFill grows the enclosing stack to the
+                // overflow size, shifting the clipping window and pushing the
+                // badge out of view.
                 Image(decorative: image, scale: 1)
                     .resizable()
-                    .scaledToFill()
-                    .frame(width: cellWidth(frameIndex) + 0.5, height: height)
-                    .clipped()
+                    .showingSourceRegion(crop, of: source,
+                                         filling: CGSize(width: cellWidth(frameIndex) + 0.5,
+                                                         height: height))
             }
             if frameWidth >= 44 {
                 Text("f\(frameIndex)")
@@ -1208,6 +1224,8 @@ private struct ExactFrameTimelineStrip: View {
 /// Thumbnails tiling a kept source range [start, end]. The requested times and
 /// rendered tile widths both scale with the clip, so the strip always fills it.
 struct FilmstripStrip: View {
+    let source: PixelSize
+    let crop: PixelRect?
     let sourceRevision: Int
     let thumbnailer: Thumbnailer?
     let grid: FrameGrid
@@ -1230,12 +1248,11 @@ struct FilmstripStrip: View {
                 ZStack {
                     Color.secondary.opacity(0.12)
                     if tiles.indices.contains(index), let image = tiles[index] {
-                        Color.clear.overlay {
-                            Image(decorative: image, scale: 1)
-                                .resizable()
-                                .scaledToFill()
-                        }
-                        .clipped()
+                        Image(decorative: image, scale: 1)
+                            .resizable()
+                            .showingSourceRegion(crop, of: source,
+                                                 filling: CGSize(width: tileWidth,
+                                                                 height: height))
                     }
                 }
                 .frame(width: tileWidth, height: height)

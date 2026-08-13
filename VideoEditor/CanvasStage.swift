@@ -34,6 +34,19 @@ enum CanvasStageLayout {
         displaySize(canvas: canvas, in: available).width / CGFloat(max(1, canvas.width))
     }
 
+    /// The window on the canvas that the clip's kept pixels fill, in display
+    /// points relative to the canvas's top-left.
+    ///
+    /// Content has to be clipped to *this*, not merely to the canvas. A crop
+    /// makes the source frame wider than the region it keeps, and the discarded
+    /// part lands inside the canvas where the canvas edge cannot cut it away.
+    static func cropWindow(placement: Placement, pointsPerCanvasPixel scale: CGFloat) -> CGRect {
+        CGRect(x: CGFloat(placement.origin.x) * scale,
+               y: CGFloat(placement.origin.y) * scale,
+               width: CGFloat(placement.scaledSize.width) * scale,
+               height: CGFloat(placement.scaledSize.height) * scale)
+    }
+
     /// Frame for the *whole* source picture, in display points relative to the
     /// canvas's top-left. Larger than the canvas whenever the clip is cropped:
     /// the caller clips, and what survives is the exported frame.
@@ -75,6 +88,51 @@ extension View {
     func placed(at origin: CGPoint, in bounds: CGSize) -> some View {
         offset(x: origin.x, y: origin.y)
             .frame(width: bounds.width, height: bounds.height, alignment: .topLeading)
+    }
+
+    /// Show only the part of a source frame that a crop keeps, filling `size`.
+    /// The receiver must draw the *whole* source frame at whatever size it gets.
+    ///
+    /// Used by the timeline: the strip is the output's index, so pixels a crop
+    /// removes should not survive there either. Placement on the canvas —
+    /// letterboxing, offset, scale — deliberately does *not* show up here; a
+    /// 70pt tile spent on black bars tells you less than one filled with
+    /// picture, and the strip's job is to let you find a moment.
+    ///
+    /// With no crop the result is exactly `scaledToFill` plus centring, so an
+    /// unreframed clip's strip is unchanged.
+    func showingSourceRegion(_ crop: PixelRect?, of source: PixelSize,
+                             filling size: CGSize) -> some View {
+        Group {
+            if let frame = SourceRegionLayout.wholeSourceFrame(crop: crop, source: source,
+                                                               filling: size) {
+                self.frame(width: frame.width, height: frame.height)
+                    .placed(at: frame.origin, in: size)
+            } else {
+                scaledToFill()
+            }
+        }
+        .clipped()
+    }
+}
+
+/// Where the whole source frame sits so that the kept region fills a tile.
+/// Separated from the view so the property that matters can be asserted: with
+/// no crop this has to reduce to exactly what the strip did before — fill and
+/// centre — or every unreframed project's timeline shifts.
+enum SourceRegionLayout {
+    static func wholeSourceFrame(crop: PixelRect?, source: PixelSize,
+                                 filling size: CGSize) -> CGRect? {
+        let region = crop ?? PixelRect(x: 0, y: 0, width: source.width, height: source.height)
+        guard source.isUsable, region.width > 0, region.height > 0,
+              size.width > 0, size.height > 0 else { return nil }
+        let scale = max(size.width / CGFloat(region.width),
+                        size.height / CGFloat(region.height))
+        return CGRect(
+            x: (size.width - CGFloat(region.width) * scale) / 2 - CGFloat(region.x) * scale,
+            y: (size.height - CGFloat(region.height) * scale) / 2 - CGFloat(region.y) * scale,
+            width: CGFloat(source.width) * scale,
+            height: CGFloat(source.height) * scale)
     }
 }
 
@@ -137,13 +195,23 @@ struct CanvasStage<Content: View>: View {
     }
 
     /// `scale` is display points per canvas pixel.
+    ///
+    /// Two nested clips, not one. The inner window is the region the crop keeps;
+    /// the source frame around it is discarded there. The canvas then clips
+    /// whatever of that window a nudge or a zoom pushed over its own edge.
     @ViewBuilder
     private func picture(scale: CGFloat, display: CGSize) -> some View {
         if let placement, let frame = CanvasStageLayout.sourceFrame(
             placement: placement, sourceSize: sourceSize, pointsPerCanvasPixel: scale) {
+            let window = CanvasStageLayout.cropWindow(placement: placement,
+                                                      pointsPerCanvasPixel: scale)
             content()
                 .frame(width: frame.width, height: frame.height)
-                .placed(at: frame.origin, in: display)
+                .placed(at: CGPoint(x: frame.minX - window.minX,
+                                    y: frame.minY - window.minY),
+                        in: window.size)
+                .clipped()
+                .placed(at: window.origin, in: display)
         } else if placement == nil {
             content().frame(maxWidth: .infinity, maxHeight: .infinity)
         }

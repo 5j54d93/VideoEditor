@@ -13,27 +13,39 @@ struct GeometryInspector: View {
     @Bindable var model: EditorModel
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                canvasSection
+        // The footer sits outside the scroll view. It carries the two actions
+        // people reach for most, and inside it they were the first thing to fall
+        // off the bottom edge — a warning appearing higher up was enough to push
+        // them out of reach.
+        VStack(spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    canvasSection
 
-                if let item = model.activeItem {
-                    Divider()
-                    reframeButton(item)
-                    fitSection(item)
-                    cropSection(item)
-                    placementSection(item)
-                    Divider()
-                    footer(item)
-                } else {
-                    Divider()
-                    Text("選取時間軸上的片段以調整它的裁剪與位置")
-                        .font(.callout)
-                        .foregroundStyle(.tertiary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                    if let item = model.activeItem {
+                        Divider()
+                        reframeButton(item)
+                        fitSection(item)
+                        cropSection(item)
+                        placementSection(item)
+                    } else {
+                        Divider()
+                        Text("選取時間軸上的片段以調整它的裁剪與位置")
+                            .font(.callout)
+                            .foregroundStyle(.tertiary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
                 }
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(14)
+
+            if let item = model.activeItem {
+                Divider()
+                footer(item)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+            }
         }
     }
 
