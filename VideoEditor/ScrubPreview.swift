@@ -179,21 +179,31 @@ final class ScrubPreviewPlayer {
 /// transparent so the committed preview shows through instead of a black flash.
 struct ScrubPlayerSurface: NSViewRepresentable {
     let player: AVPlayer
+    /// `.resize` when the caller has already sized this view to the picture's
+    /// exact aspect — inside the canvas stage, letting the layer letterbox again
+    /// would inset the frame within its own placement.
+    var videoGravity: AVLayerVideoGravity = .resizeAspect
 
-    func makeNSView(context: Context) -> ScrubPlayerNSView { ScrubPlayerNSView(player: player) }
-    func updateNSView(_ view: ScrubPlayerNSView, context: Context) { view.setPlayer(player) }
+    func makeNSView(context: Context) -> ScrubPlayerNSView {
+        ScrubPlayerNSView(player: player, videoGravity: videoGravity)
+    }
+
+    func updateNSView(_ view: ScrubPlayerNSView, context: Context) {
+        view.setPlayer(player)
+        view.setVideoGravity(videoGravity)
+    }
 }
 
 final class ScrubPlayerNSView: NSView {
     private let playerLayer = AVPlayerLayer()
     private var readyObservation: NSKeyValueObservation?
 
-    init(player: AVPlayer) {
+    init(player: AVPlayer, videoGravity: AVLayerVideoGravity = .resizeAspect) {
         super.init(frame: .zero)
         wantsLayer = true
         layer?.backgroundColor = NSColor.black.cgColor
         layer?.opacity = 0                        // fades in when the frame is ready
-        playerLayer.videoGravity = .resizeAspect
+        playerLayer.videoGravity = videoGravity
         playerLayer.player = player
         layer?.addSublayer(playerLayer)
         observeReadiness()
@@ -205,6 +215,11 @@ final class ScrubPlayerNSView: NSView {
         guard playerLayer.player !== player else { return }
         playerLayer.player = player
         observeReadiness()
+    }
+
+    func setVideoGravity(_ gravity: AVLayerVideoGravity) {
+        guard playerLayer.videoGravity != gravity else { return }
+        playerLayer.videoGravity = gravity
     }
 
     private func observeReadiness() {

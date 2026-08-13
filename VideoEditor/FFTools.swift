@@ -86,6 +86,15 @@ nonisolated struct Placement: Equatable, Sendable {
     var padOrigin: PixelOffset
     /// The picture missed the canvas entirely. The segment becomes black.
     var isFullyOffCanvas: Bool
+
+    /// Top-left of the scaled picture on the canvas *before* the canvas edge
+    /// clamps it — negative when a nudge or a zoom hangs it off the left or top.
+    /// Export cannot use this (`pad` rejects a negative origin, which is why the
+    /// visible crop exists) but the preview can, because it just clips.
+    var origin: PixelOffset {
+        guard let visibleCrop else { return padOrigin }
+        return PixelOffset(x: padOrigin.x - visibleCrop.x, y: padOrigin.y - visibleCrop.y)
+    }
 }
 
 /// The shared output canvas everything is scaled/padded into.

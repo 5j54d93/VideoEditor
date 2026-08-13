@@ -482,6 +482,7 @@ final class EditorModel {
         var selectedLibraryIDs: Set<LibraryAsset.ID>
         var currentTime: Double
         var timelineTime: Double
+        var canvasSizing: CanvasSizing
     }
 
     private var undoStack: [ProjectSnapshot] = []
@@ -504,7 +505,8 @@ final class EditorModel {
                         audioDuration: audioDuration,
                         activeItemID: activeItemID, selectedIDs: selectedIDs,
                         selectedLibraryIDs: selectedLibraryIDs,
-                        currentTime: currentTime, timelineTime: timelineTime)
+                        currentTime: currentTime, timelineTime: timelineTime,
+                        canvasSizing: canvasSizing)
     }
 
     /// Push the current project state as one undo step. Call exactly once per
@@ -539,6 +541,7 @@ final class EditorModel {
         audioDurationRequestID &+= 1
         library = s.library
         items = s.items
+        canvasSizing = s.canvasSizing
         audioURL = s.audioURL
         audioName = s.audioName
         audioDuration = s.audioDuration
@@ -1695,6 +1698,100 @@ final class EditorModel {
         }
         return FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask).first
             ?? FileManager.default.homeDirectoryForCurrentUser
+    }
+
+    // MARK: - Canvas geometry
+
+    /// Where `item` lands on the canvas. The same resolver export uses, so the
+    /// preview cannot drift from the file.
+    func placement(for item: ClipItem) -> Placement? {
+        guard item.sourcePixelSize.isUsable else { return nil }
+        return FFTools.resolve(item.geometry, source: item.sourcePixelSize, canvas: canvas)
+    }
+
+    func placement(forItemID id: ClipItem.ID) -> Placement? {
+        items.first { $0.id == id }.flatMap(placement(for:))
+    }
+
+    /// Canvas presets offered alongside the derived size. 1080-based rather than
+    /// 4K so a reframe never silently upscales a typical source.
+    static let canvasPresets: [(label: String, size: PixelSize)] = [
+        ("橫式 16:9 · 1920×1080", PixelSize(width: 1920, height: 1080)),
+        ("直式 9:16 · 1080×1920", PixelSize(width: 1080, height: 1920)),
+        ("方形 1:1 · 1080×1080", PixelSize(width: 1080, height: 1080)),
+    ]
+
+    func setCanvasSizing(_ sizing: CanvasSizing) {
+        guard sizing != canvasSizing else { return }
+        pauseTimelinePlayback()
+        registerUndo()
+        canvasSizing = sizing
+    }
+
+    func setSourceCrop(_ rect: PixelRect?, for id: ClipItem.ID) {
+        updateGeometry(for: id) { geometry, source in
+            guard let rect else { geometry.sourceCrop = nil; return }
+            guard let snapped = rect.snappedToChromaGrid(in: source) else { return }
+            geometry.sourceCrop = snapped.coversWholeFrame(of: source) ? nil : snapped
+        }
+    }
+
+    func setFitMode(_ fit: FitMode, for id: ClipItem.ID) {
+        updateGeometry(for: id) { geometry, _ in geometry.fit = fit }
+    }
+
+    func setGeometryScale(_ scale: Double, for id: ClipItem.ID) {
+        updateGeometry(for: id) { geometry, _ in
+            geometry.scale = min(max(0.05, scale), 8)
+        }
+    }
+
+    func setGeometryOffset(_ offset: PixelOffset, for id: ClipItem.ID) {
+        updateGeometry(for: id) { [canvas] geometry, _ in
+            // Keep a nudge from throwing the picture off the canvas entirely.
+            // Export would paint the segment black, which is never what a drag
+            // that overshot by a few pixels meant.
+            geometry.offset = PixelOffset(
+                x: min(max(-canvas.width, offset.x), canvas.width),
+                y: min(max(-canvas.height, offset.y), canvas.height))
+        }
+    }
+
+    func resetGeometry(for id: ClipItem.ID) {
+        updateGeometry(for: id) { geometry, _ in geometry = ClipGeometry() }
+    }
+
+    /// Copy one clip's framing onto every other clip. The crop is expressed in
+    /// source pixels, so it is re-snapped against each target's own frame size
+    /// rather than assumed to fit.
+    func applyGeometryToAllItems(from id: ClipItem.ID) {
+        guard let source = items.first(where: { $0.id == id })?.geometry else { return }
+        guard items.count > 1 else { return }
+        pauseTimelinePlayback()
+        registerUndo()
+        for index in items.indices where items[index].id != id {
+            var geometry = source
+            if let crop = source.sourceCrop {
+                let size = items[index].sourcePixelSize
+                geometry.sourceCrop = crop.snappedToChromaGrid(in: size)
+                    .flatMap { $0.coversWholeFrame(of: size) ? nil : $0 }
+            }
+            items[index].geometry = geometry
+        }
+    }
+
+    /// One undo step per call, and never one for a no-op: the inspector's number
+    /// fields re-send their value on every keystroke and on focus changes.
+    private func updateGeometry(for id: ClipItem.ID,
+                                _ change: (inout ClipGeometry, PixelSize) -> Void) {
+        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        let source = items[index].sourcePixelSize
+        var updated = items[index].geometry
+        change(&updated, source)
+        guard updated != items[index].geometry else { return }
+        pauseTimelinePlayback()
+        registerUndo()
+        items[index].geometry = updated
     }
 
     /// True when `url` is a clip or the music track this project reads from.

@@ -86,7 +86,13 @@ struct ContentView: View {
                     .frame(minWidth: 230, idealWidth: 300, maxWidth: 460)
                 preview
                     .frame(maxWidth: .infinity, minHeight: 160, maxHeight: .infinity)
-                    .background(.black)
+                    // Darker than the canvas is black, so the canvas reads as an
+                    // object sitting on the pane rather than as the pane itself.
+                    .background(Color(white: 0.13))
+                if model.hasProject {
+                    GeometryInspector(model: model)
+                        .frame(minWidth: 250, idealWidth: 290, maxWidth: 400)
+                }
             }
             .frame(maxWidth: .infinity, minHeight: 200, maxHeight: .infinity)
             bottomPane
@@ -120,36 +126,63 @@ struct ContentView: View {
 
             // A padded clip's tail is genuinely black in the exported file, so
             // neither the frozen final frame nor a stale scrub frame may stand
-            // in for it.
+            // in for it. Canvas-shaped, because that is the shape of the black.
             if model.isPlayheadInVideoPad || model.timelinePreview?.isBlackPad == true {
-                Color.black
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .allowsHitTesting(false)
+                CanvasStage(canvas: model.canvas, placement: nil, sourceSize: .zero) {
+                    Color.black
+                }
+                .allowsHitTesting(false)
             }
 
-            // Stays mounted so the scrub player's layer keeps its last frame and
-            // never re-fades between hovers; only visible while scrubbing a video
-            // clip. It draws behind the HUD overlay below.
-            ScrubPlayerSurface(player: model.scrubPlayer)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .opacity(model.timelinePreview?.showsScrubPlayer == true ? 1 : 0)
+            scrubPreviewLayer
+
+            if let hover = model.timelinePreview, let imageURL = hover.imageURL {
+                CanvasStage(canvas: model.canvas,
+                            placement: model.placement(forItemID: hover.itemID),
+                            sourceSize: model.items.first { $0.id == hover.itemID }?
+                                .sourcePixelSize ?? .zero) {
+                    ImagePreview(url: imageURL)
+                }
                 .allowsHitTesting(false)
+            }
 
             if let timelinePreview = model.timelinePreview {
-                timelinePreviewOverlay(timelinePreview)
+                timelinePreviewHUD(timelinePreview)
             }
         }
+    }
+
+    /// Stays mounted so the scrub player's layer keeps its last frame and never
+    /// re-fades between hovers; only visible while scrubbing a video clip. It is
+    /// framed by the *hovered* clip's geometry, which need not be the selected
+    /// clip's.
+    @ViewBuilder
+    private var scrubPreviewLayer: some View {
+        let hovered = model.timelinePreview.flatMap { hover in
+            model.items.first { $0.id == hover.itemID }
+        }
+        CanvasStage(canvas: model.canvas,
+                    placement: hovered.flatMap { model.placement(for: $0) },
+                    sourceSize: hovered?.sourcePixelSize ?? .zero) {
+            ScrubPlayerSurface(player: model.scrubPlayer, videoGravity: .resize)
+        }
+        .opacity(model.timelinePreview?.showsScrubPlayer == true ? 1 : 0)
+        .allowsHitTesting(false)
     }
 
     @ViewBuilder
     private var committedPreview: some View {
         if let item = model.activeItem {
-            if item.isImage {
-                ImagePreview(url: item.url)
-            } else if let player = model.player {
-                PlayerSurface(player: player)
-                    .allowsHitTesting(false)
-                    .accessibilityHidden(true)
+            CanvasStage(canvas: model.canvas,
+                        placement: model.placement(for: item),
+                        sourceSize: item.sourcePixelSize) {
+                if item.isImage {
+                    ImagePreview(url: item.url)
+                } else if let player = model.player {
+                    PlayerSurface(player: player)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                }
             }
         } else {
             VStack(spacing: 8) {
@@ -163,16 +196,13 @@ struct ContentView: View {
         }
     }
 
+    /// Just the readout. The hovered frame itself is drawn by the canvas layers
+    /// beneath, so this must not cover them.
     @ViewBuilder
-    private func timelinePreviewOverlay(_ hover: TimelinePreview) -> some View {
+    private func timelinePreviewHUD(_ hover: TimelinePreview) -> some View {
         ZStack(alignment: .bottomLeading) {
-            if let imageURL = hover.imageURL {
-                ImagePreview(url: imageURL)
-            } else {
-                // Video frames are drawn by the ScrubPlayerSurface layered behind.
-                Color.clear
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
+            Color.clear
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             HStack(spacing: 7) {
                 Image(systemName: "cursorarrow.motionlines")
@@ -322,6 +352,9 @@ private struct PlayerSurface: NSViewRepresentable {
     func makeNSView(context: Context) -> AVPlayerView {
         let view = AVPlayerView()
         view.controlsStyle = .none
+        // The canvas stage has already sized this view to the picture's exact
+        // aspect; letterboxing again would inset the frame within its placement.
+        view.videoGravity = .resize
         view.player = player
         return view
     }
@@ -331,13 +364,19 @@ private struct PlayerSurface: NSViewRepresentable {
     }
 }
 
+/// Only ever drawn inside a `CanvasStage`, which has already sized the frame to
+/// the picture's exact aspect — so the image fills it rather than fitting into
+/// it, and the black behind it belongs to the canvas.
 private struct ImagePreview: View {
     let url: URL
     @State private var img: NSImage?
     var body: some View {
         ZStack {
-            Color.black
-            if let img { Image(nsImage: img).resizable().scaledToFit() } else { ProgressView() }
+            if let img {
+                Image(nsImage: img).resizable()
+            } else {
+                ProgressView().controlSize(.small)
+            }
         }
         .task(id: url) { img = NSImage(contentsOf: url) }
     }

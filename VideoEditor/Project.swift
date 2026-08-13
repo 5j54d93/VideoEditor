@@ -183,6 +183,39 @@ nonisolated struct PixelRect: Equatable, Sendable {
     var width: Int
     var height: Int
     var size: PixelSize { PixelSize(width: width, height: height) }
+
+    /// Snap onto the chroma grid and clamp inside `source`.
+    ///
+    /// ffmpeg's `crop` rounds an odd offset down to the subsampling grid without
+    /// saying so — on yuv420p, `crop=…:3:3` and `crop=…:2:2` produce identical
+    /// bytes. A rect the editor displays therefore has to already sit on that
+    /// grid, or the numbers would describe a frame the export never makes.
+    /// Returns `nil` when the source is too small to crop meaningfully.
+    func snappedToChromaGrid(in source: PixelSize) -> PixelRect? {
+        guard source.isUsable else { return nil }
+        let limitWidth = source.width - source.width % 2
+        let limitHeight = source.height - source.height % 2
+        guard limitWidth >= 2, limitHeight >= 2 else { return nil }
+
+        let snappedWidth = min(max(2, width - width % 2), limitWidth)
+        let snappedHeight = min(max(2, height - height % 2), limitHeight)
+        var snappedX = max(0, x)
+        var snappedY = max(0, y)
+        snappedX -= snappedX % 2
+        snappedY -= snappedY % 2
+
+        return PixelRect(x: min(snappedX, limitWidth - snappedWidth),
+                         y: min(snappedY, limitHeight - snappedHeight),
+                         width: snappedWidth, height: snappedHeight)
+    }
+
+    /// True when this rect keeps every source pixel, in which case the editor
+    /// stores no crop at all. Deliberately compared against the real source
+    /// size, not the even-snapped one: an odd-sized image cropped to its even
+    /// limit is a genuine crop and must stay one.
+    func coversWholeFrame(of source: PixelSize) -> Bool {
+        x == 0 && y == 0 && width == source.width && height == source.height
+    }
 }
 
 nonisolated struct PixelOffset: Equatable, Sendable {
