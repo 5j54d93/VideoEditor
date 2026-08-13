@@ -203,14 +203,31 @@ final class EditorModel {
 
     private func even(_ x: Int) -> Int { x % 2 == 0 ? max(2, x) : x + 1 }
 
+    /// User override for the output canvas. Frame rate deliberately stays
+    /// derived: it belongs to the frame lattice, not to the framing, and tying
+    /// the two to one control would let a reframe resample the timeline.
+    var canvasSizing: CanvasSizing = .automatic
+
     var canvas: CanvasSpec {
-        let w = items.map { $0.naturalWidth }.filter { $0 > 0 }.max() ?? 1280
-        let h = items.map { $0.naturalHeight }.filter { $0 > 0 }.max() ?? 720
+        let size: PixelSize
+        switch canvasSizing {
+        case .automatic:
+            size = derivedCanvasSize
+        case .fixed(let fixed):
+            size = fixed.isUsable ? fixed : derivedCanvasSize
+        }
         // Use the exact rational of the fastest video so a fractional-fps source
         // (e.g. 24.9713) is never resampled to a rounded integer rate.
         let best = items.filter { !$0.isImage && $0.fps > 0 }.max { $0.fps < $1.fps }
-        return CanvasSpec(width: even(w), height: even(h),
+        return CanvasSpec(width: even(size.width), height: even(size.height),
                           fps: best?.fpsRational ?? "30", fpsValue: best?.fps ?? 30)
+    }
+
+    /// The canvas the sources imply: large enough to hold the biggest of them.
+    private var derivedCanvasSize: PixelSize {
+        let w = items.map { $0.naturalWidth }.filter { $0 > 0 }.max() ?? 1280
+        let h = items.map { $0.naturalHeight }.filter { $0 > 0 }.max() ?? 720
+        return PixelSize(width: w, height: h)
     }
 
     private(set) var totalOutputDuration: Double = 0
@@ -1701,7 +1718,9 @@ final class EditorModel {
                 return AssemblyItem(url: item.url, isImage: true,
                                     trimStartFrame: 0, trimEndFrame: 0,
                                     trimStart: 0, trimEnd: item.displayDuration,
-                                    duration: item.displayDuration, hasAudio: false)
+                                    duration: item.displayDuration, hasAudio: false,
+                                    sourceSize: item.sourcePixelSize,
+                                    geometry: item.geometry)
             }
             // Resolve the in/out points to indices in the real frame grid: the cut
             // lands on exactly the frames the preview showed, no matter how the
@@ -1730,7 +1749,9 @@ final class EditorModel {
                                 inputStartTime: item.containerStartTime,
                                 audioStartTime: item.audioStartTime,
                                 audioEndTime: audioEnd,
-                                padDuration: pad)
+                                padDuration: pad,
+                                sourceSize: item.sourcePixelSize,
+                                geometry: item.geometry)
         }
     }
 

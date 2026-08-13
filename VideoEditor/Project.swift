@@ -162,10 +162,74 @@ struct LibraryAsset: Identifiable, Equatable {
     var audioDuration: Double? = nil
 }
 
+// MARK: - Canvas geometry
+
+/// Integer pixel primitives. Every geometry value the editor holds is an exact
+/// pixel count: the resolver turns them into ffmpeg arguments without a float
+/// surviving the trip, which is what keeps the same project exporting the same
+/// bytes.
+nonisolated struct PixelSize: Equatable, Sendable {
+    var width: Int
+    var height: Int
+    static let zero = PixelSize(width: 0, height: 0)
+    /// Probing can fail to report a size. Geometry falls back to letting ffmpeg
+    /// work the fit out at runtime when it does.
+    var isUsable: Bool { width > 0 && height > 0 }
+}
+
+nonisolated struct PixelRect: Equatable, Sendable {
+    var x: Int
+    var y: Int
+    var width: Int
+    var height: Int
+    var size: PixelSize { PixelSize(width: width, height: height) }
+}
+
+nonisolated struct PixelOffset: Equatable, Sendable {
+    var x: Int
+    var y: Int
+    static let zero = PixelOffset(x: 0, y: 0)
+}
+
+/// How a clip's picture is sized against the canvas, before `scale` and
+/// `offset` move it.
+nonisolated enum FitMode: Equatable, Sendable {
+    case contain   // 完整放進畫布，四周留黑
+    case cover     // 填滿畫布，超出的裁掉
+    case actual    // 來源像素 1:1
+}
+
+/// Where one clip's pixels land on the shared canvas. The default value is the
+/// editor's only historical behaviour — whole source frame, contained, centred
+/// — and `isIdentity` is how export proves nothing has moved.
+nonisolated struct ClipGeometry: Equatable, Sendable {
+    /// Source-pixel rect kept from the decoded frame. `nil` keeps all of it.
+    var sourceCrop: PixelRect? = nil
+    var fit: FitMode = .contain
+    /// Extra magnification on top of `fit`. Deliberately not called `zoom`:
+    /// that word belongs to the editor's view zoom, which is a different thing
+    /// entirely and never reaches the output.
+    var scale: Double = 1
+    /// Canvas-pixel nudge away from centred, +x right / +y down.
+    var offset: PixelOffset = .zero
+
+    var isIdentity: Bool {
+        sourceCrop == nil && fit == .contain && scale == 1 && offset == .zero
+    }
+}
+
+/// The output canvas size. `automatic` reproduces the size derived from the
+/// source clips, so a project nobody has reframed exports exactly as before.
+nonisolated enum CanvasSizing: Equatable, Sendable {
+    case automatic
+    case fixed(PixelSize)
+}
+
 struct ClipItem: Identifiable, Equatable {
     let id = UUID()
     var url: URL
     var kind: ClipKind
+    var geometry = ClipGeometry()
 
     var naturalWidth: Int
     var naturalHeight: Int
@@ -196,6 +260,7 @@ struct ClipItem: Identifiable, Equatable {
     var videoPadDuration: Double = 0
 
     var isImage: Bool { kind == .image }
+    var sourcePixelSize: PixelSize { PixelSize(width: naturalWidth, height: naturalHeight) }
     /// The clip's real frame span. All source-time arithmetic uses this — the
     /// pad has no source time behind it, only black.
     var contentDuration: Double { max(0, outPoint - inPoint) }

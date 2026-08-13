@@ -68,6 +68,24 @@ struct AssemblyItem: Sendable {
     /// play. Included in `duration`; it raises the audio ceiling by the same
     /// amount, which is the whole point of the pad.
     var padDuration: Double = 0
+    /// Decoded frame size. `.zero` means probing never reported one, and the
+    /// geometry chain falls back to letting ffmpeg fit at runtime.
+    var sourceSize: PixelSize = .zero
+    var geometry = ClipGeometry()
+}
+
+/// The exact integers one clip's geometry becomes on the ffmpeg command line.
+/// Both optional crops are omitted from the chain when `nil`.
+nonisolated struct Placement: Equatable, Sendable {
+    /// Applied to the decoded frame, before scaling: the user's crop.
+    var sourceCrop: PixelRect?
+    var scaledSize: PixelSize
+    /// Applied after scaling: trims whatever a nudge or a zoom pushed past the
+    /// canvas edge, because `pad` cannot take a negative origin.
+    var visibleCrop: PixelRect?
+    var padOrigin: PixelOffset
+    /// The picture missed the canvas entirely. The segment becomes black.
+    var isFullyOffCanvas: Bool
 }
 
 /// The shared output canvas everything is scaled/padded into.
@@ -306,6 +324,120 @@ struct FFTools: Sendable {
         return (times.sorted(), hasCompleteDurations ? endTime : nil)
     }
 
+    // MARK: Geometry
+
+    /// Source size + the user's framing + the canvas → the integers ffmpeg is
+    /// told. Pure, and shared with the preview, so the two can never disagree
+    /// about where a clip sits.
+    ///
+    /// The rounding here is copied from ffmpeg rather than chosen. `scale`'s
+    /// `force_original_aspect_ratio` rescales with round-half-away-from-zero and
+    /// does *not* force even dimensions; `pad`'s `(ow-iw)/2` truncates. An odd
+    /// intermediate height is legal because `format=yuv420p` sits after `pad`,
+    /// at canvas size. Reproducing all three exactly is what lets this replace
+    /// the expression-based chain without moving a single output byte.
+    nonisolated static func resolve(_ geometry: ClipGeometry,
+                                    source: PixelSize,
+                                    canvas: CanvasSpec) -> Placement {
+        let bounds = PixelSize(width: canvas.width, height: canvas.height)
+        let cropped = geometry.sourceCrop?.size ?? source
+        var size = fitted(cropped, in: bounds, mode: geometry.fit)
+        if geometry.scale != 1 {
+            size = PixelSize(
+                width: max(1, roundHalfAwayFromZero(Double(size.width) * geometry.scale)),
+                height: max(1, roundHalfAwayFromZero(Double(size.height) * geometry.scale)))
+        }
+
+        // Truncating division matches how pad evaluates `(ow-iw)/2` and casts.
+        let originX = (bounds.width - size.width) / 2 + geometry.offset.x
+        let originY = (bounds.height - size.height) / 2 + geometry.offset.y
+
+        let left = max(0, originX)
+        let top = max(0, originY)
+        let right = min(bounds.width, originX + size.width)
+        let bottom = min(bounds.height, originY + size.height)
+        guard right > left, bottom > top else {
+            return Placement(sourceCrop: geometry.sourceCrop, scaledSize: size,
+                             visibleCrop: nil, padOrigin: .zero, isFullyOffCanvas: true)
+        }
+
+        let visible = PixelRect(x: left - originX, y: top - originY,
+                                width: right - left, height: bottom - top)
+        let whole = PixelRect(x: 0, y: 0, width: size.width, height: size.height)
+        return Placement(sourceCrop: geometry.sourceCrop,
+                         scaledSize: size,
+                         visibleCrop: visible == whole ? nil : visible,
+                         padOrigin: PixelOffset(x: left, y: top),
+                         isFullyOffCanvas: false)
+    }
+
+    /// ffmpeg's own `force_original_aspect_ratio` arithmetic, in integers.
+    private nonisolated static func fitted(_ source: PixelSize, in canvas: PixelSize,
+                                           mode: FitMode) -> PixelSize {
+        guard source.isUsable else { return canvas }
+        if mode == .actual { return source }
+        let widthAtCanvasHeight = rescale(canvas.height, source.width, source.height)
+        let heightAtCanvasWidth = rescale(canvas.width, source.height, source.width)
+        return mode == .contain
+            ? PixelSize(width: min(widthAtCanvasHeight, canvas.width),
+                        height: min(heightAtCanvasWidth, canvas.height))
+            : PixelSize(width: max(widthAtCanvasHeight, canvas.width),
+                        height: max(heightAtCanvasWidth, canvas.height))
+    }
+
+    /// `av_rescale` with `AV_ROUND_NEAR_INF`: `(a·b + c/2) / c`, all integer.
+    /// Doing it in Double instead would round 562.5 to 562 under the default
+    /// banker's rounding, one pixel away from what ffmpeg picks.
+    private nonisolated static func rescale(_ a: Int, _ b: Int, _ c: Int) -> Int {
+        guard c != 0 else { return 0 }
+        return (a * b + c / 2) / c
+    }
+
+    private nonisolated static func roundHalfAwayFromZero(_ x: Double) -> Int {
+        Int(x.rounded(.toNearestOrAwayFromZero))
+    }
+
+    /// The picture half of one item's filter chain, from decoded frame to a
+    /// canvas-sized `yuv420p` image.
+    nonisolated static func geometryChain(for item: AssemblyItem,
+                                          canvas: CanvasSpec) -> String {
+        let W = canvas.width, H = canvas.height
+        let scalerFlags = "flags=bicubic+accurate_rnd+bitexact:sws_dither=none"
+
+        // Without a probed frame size there is nothing to compute a fit from.
+        // Hand the job back to ffmpeg's runtime expression — byte for byte what
+        // every export did before geometry existed.
+        guard item.sourceSize.isUsable else {
+            return "scale=\(W):\(H):force_original_aspect_ratio=decrease:\(scalerFlags)," +
+                   "pad=\(W):\(H):(ow-iw)/2:(oh-ih)/2,setsar=1,fps=\(canvas.fps),format=yuv420p"
+        }
+
+        let placement = resolve(item.geometry, source: item.sourceSize, canvas: canvas)
+
+        // Nothing of the picture reaches the canvas. Its scaled size may well be
+        // larger than the canvas, so `pad` would reject it outright — go
+        // straight to a canvas-sized frame and paint it out, keeping only the
+        // segment's timing.
+        guard !placement.isFullyOffCanvas else {
+            return "scale=\(W):\(H):\(scalerFlags),setsar=1,fps=\(canvas.fps),format=yuv420p," +
+                   "drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill"
+        }
+
+        var parts: [String] = []
+        if let crop = placement.sourceCrop {
+            parts.append("crop=\(crop.width):\(crop.height):\(crop.x):\(crop.y)")
+        }
+        parts.append("scale=\(placement.scaledSize.width):\(placement.scaledSize.height):\(scalerFlags)")
+        if let visible = placement.visibleCrop {
+            parts.append("crop=\(visible.width):\(visible.height):\(visible.x):\(visible.y)")
+        }
+        parts.append("pad=\(W):\(H):\(placement.padOrigin.x):\(placement.padOrigin.y)")
+        parts.append("setsar=1")
+        parts.append("fps=\(canvas.fps)")
+        parts.append("format=yuv420p")
+        return parts.joined(separator: ",")
+    }
+
     // MARK: Export
 
     /// Build ffmpeg args to assemble several assets (videos + images) into one clip
@@ -314,10 +446,7 @@ struct FFTools: Sendable {
     /// fixed, byte-repeatable-within-one-architecture output profile.
     nonisolated static func assembleArgs(items: [AssemblyItem], audioURL: URL?, canvas: CanvasSpec,
                                          output: URL) -> [String] {
-        let W = canvas.width, H = canvas.height, FPS = canvas.fps
-        let fit = "scale=\(W):\(H):force_original_aspect_ratio=decrease:" +
-                  "flags=bicubic+accurate_rnd+bitexact:sws_dither=none," +
-                  "pad=\(W):\(H):(ow-iw)/2:(oh-ih)/2,setsar=1,fps=\(FPS),format=yuv420p"
+        let FPS = canvas.fps
         let normalizeAudio = "aresample=sample_rate=44100:out_chlayout=stereo:" +
                              "out_sample_fmt=fltp:internal_sample_fmt=s32p:" +
                              "dither_method=none:exact_rational=1"
@@ -352,6 +481,9 @@ struct FFTools: Sendable {
             let videoPad = it.padDuration > 1e-9
                 ? ",tpad=stop_mode=add:stop_duration=\(fmt(it.padDuration)):color=black"
                 : ""
+            // Each item resolves its own crop/scale/placement, so this is no
+            // longer one string shared by the whole graph.
+            let fit = geometryChain(for: it, canvas: canvas)
             if it.isImage {
                 f += "[\(i):v]\(fit),setpts=PTS-STARTPTS[v\(i)];"
             } else {
