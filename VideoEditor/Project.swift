@@ -251,6 +251,14 @@ nonisolated struct ClipGeometry: Equatable, Sendable {
     }
 }
 
+/// Which half of the framing the preview is handing to the pointer. The two
+/// need different pictures: adjusting a crop means seeing the pixels being cut
+/// away, which the canvas composition has already thrown out.
+nonisolated enum GeometryEditMode: Equatable, Sendable {
+    case crop       // 裁剪來源：整張來源畫格，框外壓暗
+    case position   // 畫布位置：畫布合成，拖曳整張畫面
+}
+
 /// The output canvas size. `automatic` reproduces the size derived from the
 /// source clips, so a project nobody has reframed exports exactly as before.
 nonisolated enum CanvasSizing: Equatable, Sendable {

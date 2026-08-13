@@ -13,6 +13,9 @@ struct ContentView: View {
     let model: EditorModel
     @State private var exportSheet = false
     @State private var selectAllKey = SelectAllKeyMonitor()
+    @State private var viewport = StageViewport()
+    /// Offset at the start of a position drag, in canvas pixels.
+    @State private var positionDragOrigin: PixelOffset?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -121,6 +124,15 @@ struct ContentView: View {
 
     @ViewBuilder
     private var preview: some View {
+        if let mode = model.geometryEditing, let item = model.activeItem {
+            reframingStage(mode, item: item)
+        } else {
+            playbackPreview
+        }
+    }
+
+    @ViewBuilder
+    private var playbackPreview: some View {
         ZStack(alignment: .bottomLeading) {
             committedPreview
 
@@ -150,6 +162,131 @@ struct ContentView: View {
                 timelinePreviewHUD(timelinePreview)
             }
         }
+        // Double-clicking the picture is the other way in, alongside C and the
+        // inspector's button.
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2) {
+            guard model.activeItem != nil else { return }
+            model.beginGeometryEditing()
+        }
+    }
+
+    // MARK: Reframing
+
+    /// The preview becomes an editing surface. 裁剪來源 shows the whole source
+    /// frame with the crop over it; 畫布位置 shows the canvas composition and
+    /// drags the picture inside it.
+    @ViewBuilder
+    private func reframingStage(_ mode: GeometryEditMode, item: ClipItem) -> some View {
+        VStack(spacing: 0) {
+            reframingBar(mode, item: item)
+            Divider().opacity(0.4)
+            Group {
+                switch mode {
+                case .crop:   cropStage(item)
+                case .position: positionStage(item)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .onChange(of: mode) { _, _ in viewport = StageViewport() }
+        .onAppear { viewport = StageViewport() }
+    }
+
+    private func reframingBar(_ mode: GeometryEditMode, item: ClipItem) -> some View {
+        HStack(spacing: 12) {
+            Picker("", selection: Binding(
+                get: { mode }, set: { model.beginGeometryEditing($0) }
+            )) {
+                Text("裁剪來源").tag(GeometryEditMode.crop)
+                Text("畫布位置").tag(GeometryEditMode.position)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 180)
+
+            Spacer(minLength: 8)
+
+            Text(verbatim: "方向鍵微調 \(EditorModel.geometryNudgeStep)px．⇧ ×10")
+                .font(.caption).foregroundStyle(.white.opacity(0.45))
+                .lineLimit(1)
+                .layoutPriority(-1)     // first thing to go when the pane narrows
+
+            Button { model.endGeometryEditing() } label: {
+                HStack(spacing: 5) {
+                    Text("完成")
+                    KeyCapHint("↩", prominent: true)
+                }
+            }
+            .keyboardShortcut(.defaultAction)
+            .fixedSize()                // the way out never gets clipped
+        }
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        .background(Color(white: 0.17))
+    }
+
+    private func cropStage(_ item: ClipItem) -> some View {
+        let source = item.sourcePixelSize
+        let crop = item.geometry.sourceCrop
+            ?? PixelRect(x: 0, y: 0, width: source.width, height: source.height)
+        return CropStage(source: source, crop: crop, viewport: $viewport,
+                         onChange: { model.setSourceCrop($0, for: item.id) },
+                         onGestureBegin: { model.beginGeometryGesture(for: item.id) },
+                         onGestureEnd: { model.endGeometryGesture() }) {
+            if item.isImage {
+                ImagePreview(
+                    url: item.url,
+                    interpolation: viewport.zoom >= StageViewport.nearestNeighbourThreshold
+                        ? .none : .medium)
+            } else if let player = model.player {
+                RawPlayerSurface(
+                    player: player,
+                    usesNearestNeighbour: viewport.zoom >= StageViewport.nearestNeighbourThreshold)
+            }
+        }
+    }
+
+    /// Dragging the picture moves it on the canvas. The dashed outline shows the
+    /// part being pushed off the edge, which is the part you cannot otherwise see.
+    private func positionStage(_ item: ClipItem) -> some View {
+        GeometryReader { geo in
+            // The drag has to undo exactly the mapping the stage drew with, or
+            // the picture lags behind the pointer at anything but 1:1.
+            let scale = CanvasStageLayout.pointsPerCanvasPixel(canvas: model.canvas,
+                                                               in: geo.size)
+            CanvasStage(canvas: model.canvas,
+                        placement: model.placement(for: item),
+                        sourceSize: item.sourcePixelSize,
+                        showsPictureBounds: true) {
+                if item.isImage {
+                    ImagePreview(url: item.url)
+                } else if let player = model.player {
+                    RawPlayerSurface(player: player)
+                }
+            }
+            .contentShape(Rectangle())
+            .gesture(positionDrag(item, pointsPerCanvasPixel: scale))
+        }
+    }
+
+    private func positionDrag(_ item: ClipItem,
+                              pointsPerCanvasPixel scale: CGFloat) -> some Gesture {
+        DragGesture(minimumDistance: 1)
+            .onChanged { value in
+                if positionDragOrigin == nil {
+                    positionDragOrigin = item.geometry.offset
+                    model.beginGeometryGesture(for: item.id)
+                }
+                guard let origin = positionDragOrigin, scale > 0 else { return }
+                model.setGeometryOffset(
+                    PixelOffset(x: origin.x + Int((value.translation.width / scale).rounded()),
+                                y: origin.y + Int((value.translation.height / scale).rounded())),
+                    for: item.id)
+            }
+            .onEnded { _ in
+                positionDragOrigin = nil
+                model.endGeometryGesture()
+            }
     }
 
     /// Stays mounted so the scrub player's layer keeps its last frame and never
@@ -269,27 +406,73 @@ struct ContentView: View {
 
     // MARK: Keyboard
 
+    /// One hidden button per key equivalent, branching inside on the mode.
+    ///
+    /// Registering the same shortcut twice and separating the pair with
+    /// `.disabled` does not work: SwiftUI picks one of the two, and if it picks
+    /// the disabled one the key does nothing at all. Reframing needs the arrows
+    /// the transport already owns, so the two behaviours share a button.
     private var shortcutButtons: some View {
         Group {
-            Button("") { model.stepFrame(-1) }.keyboardShortcut(.leftArrow, modifiers: [])
-            Button("") { model.stepFrame(1) }.keyboardShortcut(.rightArrow, modifiers: [])
-            Button("") { model.stepFrame(-10) }.keyboardShortcut(.leftArrow, modifiers: .shift)
-            Button("") { model.stepFrame(10) }.keyboardShortcut(.rightArrow, modifiers: .shift)
-            Button("") { model.togglePlay() }.keyboardShortcut(.space, modifiers: [])
-            Button("") { model.deleteBeforePlayhead() }.keyboardShortcut("q", modifiers: [])
-            Button("") { model.deleteAfterPlayhead() }.keyboardShortcut("w", modifiers: [])
-            Button("") { model.splitAtPlayhead() }.keyboardShortcut("s", modifiers: [])
-            Button("") { model.requestTimelineAutoFit() }.keyboardShortcut("z", modifiers: .shift)
+            Button("") { arrow(dx: -1, dy: 0) }.keyboardShortcut(.leftArrow, modifiers: [])
+            Button("") { arrow(dx: 1, dy: 0) }.keyboardShortcut(.rightArrow, modifiers: [])
+            Button("") { arrow(dx: 0, dy: -1) }.keyboardShortcut(.upArrow, modifiers: [])
+            Button("") { arrow(dx: 0, dy: 1) }.keyboardShortcut(.downArrow, modifiers: [])
+            Button("") { arrow(dx: -1, dy: 0) }.keyboardShortcut(.leftArrow, modifiers: .shift)
+            Button("") { arrow(dx: 1, dy: 0) }.keyboardShortcut(.rightArrow, modifiers: .shift)
+            Button("") { arrow(dx: 0, dy: -1) }.keyboardShortcut(.upArrow, modifiers: .shift)
+            Button("") { arrow(dx: 0, dy: 1) }.keyboardShortcut(.downArrow, modifiers: .shift)
+
+            Button("") { whileEditing { model.togglePlay() } }
+                .keyboardShortcut(.space, modifiers: [])
+            Button("") { whileEditing { model.deleteBeforePlayhead() } }
+                .keyboardShortcut("q", modifiers: [])
+            Button("") { whileEditing { model.deleteAfterPlayhead() } }
+                .keyboardShortcut("w", modifiers: [])
+            Button("") { whileEditing { model.splitAtPlayhead() } }
+                .keyboardShortcut("s", modifiers: [])
+            Button("") { whileEditing { model.requestTimelineAutoFit() } }
+                .keyboardShortcut("z", modifiers: .shift)
             Button("") {
-                if model.timelineHasFocus {
-                    model.removeSelectedItems()
-                } else {
-                    model.removeSelectedLibraryAssets()
+                whileEditing {
+                    if model.timelineHasFocus {
+                        model.removeSelectedItems()
+                    } else {
+                        model.removeSelectedLibraryAssets()
+                    }
                 }
             }.keyboardShortcut(.delete, modifiers: [])
+
+            Button("") { model.toggleGeometryEditing() }.keyboardShortcut("c", modifiers: [])
+            // Esc leaves the mode rather than reverting: every change is already
+            // live and already on the undo stack, and giving Esc two meanings
+            // only makes people afraid to press it.
+            Button("") { model.endGeometryEditing() }.keyboardShortcut(.cancelAction)
         }
         .disabled(model.isTextEditing)   // don't fire single-key shortcuts while typing a time
         .opacity(0).frame(width: 0, height: 0).accessibilityHidden(true)
+    }
+
+    /// Arrows step frames normally and nudge the framing while reframing.
+    ///
+    /// Shift is read from the event rather than distinguished by a second
+    /// `keyboardShortcut`: with both `[]` and `.shift` registered for one key,
+    /// which of the two SwiftUI picks is not guaranteed, and picking the plain
+    /// one silently turns a coarse nudge into a fine one. Reading the flag makes
+    /// either match produce the same, correct result.
+    private func arrow(dx: Int, dy: Int) {
+        let coarse = NSEvent.modifierFlags.contains(.shift)
+        if model.isGeometryEditing {
+            model.nudgeGeometry(dx: dx, dy: dy, coarse: coarse)
+        } else if dy == 0 {
+            model.stepFrame(dx * (coarse ? 10 : 1))
+        }
+    }
+
+    /// Timeline edits stand aside while the preview is an editing surface.
+    private func whileEditing(_ action: () -> Void) {
+        guard !model.isGeometryEditing else { return }
+        action()
     }
 
     // MARK: Helpers
@@ -369,11 +552,14 @@ private struct PlayerSurface: NSViewRepresentable {
 /// it, and the black behind it belongs to the canvas.
 private struct ImagePreview: View {
     let url: URL
+    /// `.none` past the zoom where interpolation turns a pixel edge into a
+    /// gradient — the boundary being placed has to stay visibly where it is.
+    var interpolation: Image.Interpolation = .medium
     @State private var img: NSImage?
     var body: some View {
         ZStack {
             if let img {
-                Image(nsImage: img).resizable()
+                Image(nsImage: img).resizable().interpolation(interpolation)
             } else {
                 ProgressView().controlSize(.small)
             }

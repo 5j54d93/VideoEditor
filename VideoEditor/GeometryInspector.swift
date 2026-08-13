@@ -19,6 +19,7 @@ struct GeometryInspector: View {
 
                 if let item = model.activeItem {
                     Divider()
+                    reframeButton(item)
                     fitSection(item)
                     cropSection(item)
                     placementSection(item)
@@ -62,7 +63,7 @@ struct GeometryInspector: View {
             }
 
             let canvas = model.canvas
-            Text("輸出 \(canvas.width)×\(canvas.height) @ \(frameRateText(canvas.fpsValue))fps")
+            Text(verbatim: "輸出 \(canvas.width)×\(canvas.height) @ \(frameRateText(canvas.fpsValue))fps")
                 .font(.caption).foregroundStyle(.secondary).monospacedDigit()
         }
     }
@@ -100,6 +101,18 @@ struct GeometryInspector: View {
     }
 
     // MARK: Per-clip framing
+
+    private func reframeButton(_ item: ClipItem) -> some View {
+        Button {
+            model.isGeometryEditing ? model.endGeometryEditing() : model.beginGeometryEditing()
+        } label: {
+            Label(model.isGeometryEditing ? "結束調整" : "在預覽中調整",
+                  systemImage: model.isGeometryEditing ? "checkmark" : "crop")
+                .frame(maxWidth: .infinity)
+        }
+        .controlSize(.large)
+        .help("在預覽區直接拖曳裁剪框與畫面位置（C）")
+    }
 
     private func fitSection(_ item: ClipItem) -> some View {
         VStack(alignment: .leading, spacing: 7) {
@@ -146,7 +159,7 @@ struct GeometryInspector: View {
                         } onFocusChange: { model.isTextEditing = $0 }
                     }
                 }
-                Text("來源 \(source.width)×\(source.height)．座標吸附偶數")
+                Text(verbatim: "來源 \(source.width)×\(source.height)．座標吸附偶數")
                     .font(.caption).foregroundStyle(.tertiary).monospacedDigit()
             } else {
                 Text("這個素材沒有回報畫面尺寸，無法裁剪")

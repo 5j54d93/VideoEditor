@@ -523,6 +523,7 @@ final class EditorModel {
 
     func undo() {
         imageDurationEditingSession = nil
+        endGeometryEditing()
         guard let past = undoStack.popLast() else { return }
         redoStack.append(snapshot())
         apply(past)
@@ -530,6 +531,7 @@ final class EditorModel {
 
     func redo() {
         imageDurationEditingSession = nil
+        endGeometryEditing()
         guard let future = redoStack.popLast() else { return }
         undoStack.append(snapshot())
         apply(future)
@@ -1066,6 +1068,9 @@ final class EditorModel {
                                     sourceTime requestedSourceTime: Double? = nil,
                                     timelinePosition requestedTimelinePosition: Double? = nil) {
         player?.pause()
+        // Reframing targets one clip. Moving to another leaves the mode rather
+        // than silently retargeting the handles at a different picture.
+        if activeItemID != id { endGeometryEditing() }
         activeItemID = id
         guard let item = activeItem else { detachObserver(); player = nil; return }
         let itemTimelineStart = timelineStart(for: item.id) ?? 0
@@ -1702,6 +1707,70 @@ final class EditorModel {
 
     // MARK: - Canvas geometry
 
+    /// Reframing is a mode rather than always-on handles, because the keys it
+    /// needs are already spoken for: arrows step frames, space plays, Q/W/S cut.
+    /// The same `shortcutButtons` gate that stands aside for text entry stands
+    /// aside for this.
+    var geometryEditing: GeometryEditMode?
+    var isGeometryEditing: Bool { geometryEditing != nil }
+
+    /// One undo step per drag, not per pixel. Mirrors the image-duration
+    /// slider's session: the snapshot is only pushed once the gesture actually
+    /// changes something, so a click that moves nothing costs no history.
+    @ObservationIgnored private var geometryGestureSession: (
+        itemID: ClipItem.ID,
+        undoSnapshot: ProjectSnapshot,
+        hasRegisteredUndo: Bool
+    )?
+
+    func beginGeometryEditing(_ mode: GeometryEditMode = .crop) {
+        guard activeItem != nil else { return }
+        pauseTimelinePlayback()
+        clearTimelineHover()
+        geometryEditing = mode
+    }
+
+    func endGeometryEditing() {
+        geometryEditing = nil
+        geometryGestureSession = nil
+    }
+
+    func toggleGeometryEditing() {
+        isGeometryEditing ? endGeometryEditing() : beginGeometryEditing()
+    }
+
+    func beginGeometryGesture(for id: ClipItem.ID) {
+        guard geometryGestureSession?.itemID != id else { return }
+        geometryGestureSession = (id, snapshot(), false)
+    }
+
+    func endGeometryGesture() {
+        geometryGestureSession = nil
+    }
+
+    /// Arrows move by one chroma step, so a nudge always lands somewhere the
+    /// export can reproduce exactly rather than on a coordinate ffmpeg would
+    /// quietly round off.
+    static let geometryNudgeStep = 2
+
+    func nudgeGeometry(dx: Int, dy: Int, coarse: Bool = false) {
+        guard let mode = geometryEditing, let item = activeItem else { return }
+        let step = Self.geometryNudgeStep * (coarse ? 10 : 1)
+        switch mode {
+        case .crop:
+            let source = item.sourcePixelSize
+            var crop = item.geometry.sourceCrop
+                ?? PixelRect(x: 0, y: 0, width: source.width, height: source.height)
+            crop.x += dx * step
+            crop.y += dy * step
+            setSourceCrop(crop, for: item.id)
+        case .position:
+            setGeometryOffset(PixelOffset(x: item.geometry.offset.x + dx * step,
+                                          y: item.geometry.offset.y + dy * step),
+                              for: item.id)
+        }
+    }
+
     /// Where `item` lands on the canvas. The same resolver export uses, so the
     /// preview cannot drift from the file.
     func placement(for item: ClipItem) -> Placement? {
@@ -1790,7 +1859,15 @@ final class EditorModel {
         change(&updated, source)
         guard updated != items[index].geometry else { return }
         pauseTimelinePlayback()
-        registerUndo()
+        if var session = geometryGestureSession, session.itemID == id {
+            if !session.hasRegisteredUndo {
+                registerUndo(session.undoSnapshot)
+                session.hasRegisteredUndo = true
+                geometryGestureSession = session
+            }
+        } else {
+            registerUndo()
+        }
         items[index].geometry = updated
     }
 

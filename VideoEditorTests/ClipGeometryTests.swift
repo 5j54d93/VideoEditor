@@ -324,6 +324,64 @@ final class ClipGeometryTests: XCTestCase {
             pointsPerCanvasPixel: 1))
     }
 
+    // MARK: Handles
+
+    /// Each handle moves only the edges it sits on. Getting this wrong is
+    /// invisible until someone drags a corner and the opposite edge follows.
+    func testHandlesMoveOnlyTheirOwnEdges() {
+        let rect = PixelRect(x: 100, y: 100, width: 400, height: 300)
+
+        XCTAssertEqual(CropHandle.topLeft.resize(rect, dx: 20, dy: 10),
+                       PixelRect(x: 120, y: 110, width: 380, height: 290))
+        XCTAssertEqual(CropHandle.bottomRight.resize(rect, dx: 20, dy: 10),
+                       PixelRect(x: 100, y: 100, width: 420, height: 310))
+        XCTAssertEqual(CropHandle.top.resize(rect, dx: 999, dy: 10),
+                       PixelRect(x: 100, y: 110, width: 400, height: 290))
+        XCTAssertEqual(CropHandle.left.resize(rect, dx: 20, dy: 999),
+                       PixelRect(x: 120, y: 100, width: 380, height: 300))
+        XCTAssertEqual(CropHandle.bottomLeft.resize(rect, dx: -20, dy: 10),
+                       PixelRect(x: 80, y: 100, width: 420, height: 310))
+        XCTAssertEqual(CropHandle.right.resize(rect, dx: -50, dy: 0),
+                       PixelRect(x: 100, y: 100, width: 350, height: 300))
+    }
+
+    /// A handle dragged past the opposite edge asks for a negative size. The
+    /// snapper is what keeps that legal, so the two have to work together.
+    func testHandleDraggedThroughTheOppositeEdgeStaysLegal() {
+        let source = PixelSize(width: 1920, height: 1080)
+        let rect = PixelRect(x: 100, y: 100, width: 400, height: 300)
+        let inverted = CropHandle.left.resize(rect, dx: 900, dy: 0)
+
+        XCTAssertLessThan(inverted.width, 0)
+        let snapped = try! XCTUnwrap(inverted.snappedToChromaGrid(in: source))
+        XCTAssertGreaterThanOrEqual(snapped.width, 2)
+        XCTAssertGreaterThanOrEqual(snapped.x, 0)
+        XCTAssertLessThanOrEqual(snapped.x + snapped.width, source.width)
+    }
+
+    // MARK: Viewport
+
+    func testZoomIsClampedToFitAndSixteenHundredPercent() {
+        var viewport = StageViewport()
+        // A source shown at a quarter size needs zoom 64 to reach 1600%.
+        viewport.setZoom(1000, fitScale: 0.25)
+        XCTAssertEqual(viewport.zoom, 64, accuracy: 0.001)
+        XCTAssertEqual(viewport.percent(fitScale: 0.25), 1600)
+
+        viewport.setZoom(0.1, fitScale: 0.25)
+        XCTAssertEqual(viewport.zoom, 1, accuracy: 0.001)
+    }
+
+    /// Returning to fit has to drop the pan too, or the picture snaps back to
+    /// full size somewhere off screen.
+    func testReturningToFitClearsThePan() {
+        var viewport = StageViewport()
+        viewport.setZoom(4, fitScale: 0.5)
+        viewport.pan = CGSize(width: 120, height: -80)
+        viewport.setZoom(1, fitScale: 0.5)
+        XCTAssertEqual(viewport.pan, .zero)
+    }
+
     // MARK: Helpers
 
     private func canvas(_ size: PixelSize) -> CanvasSpec {
