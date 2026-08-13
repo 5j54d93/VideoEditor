@@ -74,9 +74,105 @@ final class AssemblyArgumentsTests: XCTestCase {
         let filter = try XCTUnwrap(args.value(after: "-filter_complex"))
         XCTAssertTrue(filter.contains("[0:v]trim=start_frame=7:end_frame=19"))
         XCTAssertTrue(filter.contains("[0:a]atrim=start=1.250000:end=2.750000"))
+        XCTAssertTrue(filter.contains("apad=whole_len=66150,atrim=end_sample=66150,asetpts=N/SR/TB[a0]"))
+        XCTAssertFalse(filter.contains("adelay="), "A track already covering the video start needs no silence prefix")
         XCTAssertTrue(filter.contains("[1:v]scale=1280:720"))
-        XCTAssertTrue(filter.contains("anullsrc=channel_layout=stereo:sample_rate=44100,atrim=0:2.000000"))
+        XCTAssertTrue(filter.contains("anullsrc=channel_layout=stereo:sample_rate=44100,atrim=end_sample=88200"))
         XCTAssertTrue(filter.contains("[v0][a0][v1][a1]concat=n=2:v=1:a=1[vout][aout]"))
+    }
+
+    func testDelayedAudioKeepsItsVideoRelativeOffset() throws {
+        let video = videoItem(
+            path: "/fixtures/delayed.mov",
+            trimStart: 10,
+            trimEnd: 14,
+            duration: 4,
+            hasAudio: true,
+            inputStartTime: 10,
+            audioStartTime: 12,
+            audioEndTime: 14
+        )
+
+        let filter = try filter(for: video)
+
+        XCTAssertTrue(filter.contains("[0:a]atrim=start=2.000000:end=4.000000"),
+                      "Absolute source timestamps must be translated to ffmpeg's input-local clock")
+        XCTAssertTrue(filter.contains("adelay=88200S:all=1"),
+                      "Two seconds of leading silence must be expressed in exact samples")
+        XCTAssertTrue(filter.contains("apad=whole_len=176400,atrim=end_sample=176400"))
+    }
+
+    func testAudioStartingBeforeVideoTrimsWithoutLeadingDelay() throws {
+        let video = videoItem(
+            path: "/fixtures/early.mov",
+            trimStart: 10,
+            trimEnd: 12,
+            duration: 2,
+            hasAudio: true,
+            inputStartTime: 9,
+            audioStartTime: 9,
+            audioEndTime: 13
+        )
+
+        let filter = try filter(for: video)
+
+        XCTAssertTrue(filter.contains("[0:a]atrim=start=1.000000:end=3.000000"))
+        XCTAssertFalse(filter.contains("adelay="))
+        XCTAssertTrue(filter.contains("apad=whole_len=88200,atrim=end_sample=88200"))
+    }
+
+    func testAudioEndingBeforeVideoIsPaddedToSegmentDuration() throws {
+        let video = videoItem(
+            path: "/fixtures/short-audio.mov",
+            trimStart: 0,
+            trimEnd: 2,
+            duration: 2,
+            hasAudio: true,
+            audioStartTime: 0,
+            audioEndTime: 1
+        )
+
+        let filter = try filter(for: video)
+
+        XCTAssertTrue(filter.contains("[0:a]atrim=start=0.000000:end=1.000000"))
+        XCTAssertTrue(filter.contains("apad=whole_len=88200,atrim=end_sample=88200"))
+    }
+
+    func testAudioOutsideVideoSelectionUsesSilentConcatSegment() throws {
+        let video = videoItem(
+            path: "/fixtures/no-overlap.mov",
+            trimStart: 0,
+            trimEnd: 2,
+            duration: 2,
+            hasAudio: true,
+            audioStartTime: 3,
+            audioEndTime: 4
+        )
+
+        let filter = try filter(for: video)
+
+        XCTAssertFalse(filter.contains("[0:a]atrim="),
+                       "An empty real-audio stream would make concat fail")
+        XCTAssertTrue(filter.contains("anullsrc=channel_layout=stereo:sample_rate=44100,atrim=end_sample=88200"))
+        XCTAssertTrue(filter.contains("[v0][a0]concat=n=1:v=1:a=1[vout][aout]"))
+    }
+
+    func testUnknownAudioDurationKeepsSourceThroughVideoBoundary() throws {
+        let video = videoItem(
+            path: "/fixtures/unknown-duration.mkv",
+            trimStart: 0.25,
+            trimEnd: 1.25,
+            duration: 1,
+            hasAudio: true,
+            audioStartTime: 0.5,
+            audioEndTime: nil
+        )
+
+        let filter = try filter(for: video)
+
+        XCTAssertTrue(filter.contains("[0:a]atrim=start=0.500000:end=1.250000"))
+        XCTAssertTrue(filter.contains("adelay=11025S:all=1"))
+        XCTAssertFalse(filter.contains("anullsrc=channel_layout=stereo:sample_rate=44100"))
     }
 
     func testBackgroundAudioUsesFollowingInputAndExactTimelineDuration() throws {
@@ -102,6 +198,61 @@ final class AssemblyArgumentsTests: XCTestCase {
         XCTAssertFalse(filter.contains("[0:a]atrim="), "Background music must override source audio")
     }
 
+    func testProbeParsersRetainTrackAndFinalPacketTiming() throws {
+        let packets = FFTools.parseFramePackets("0,48\n48,48\n96,24\n", timeBase: 1.0 / 600)
+        XCTAssertEqual(packets.times, [0, 0.08, 0.16])
+        XCTAssertEqual(try XCTUnwrap(packets.endTime), 0.20, accuracy: 1e-12)
+
+        let missingDuration = FFTools.parseFramePackets("0,48\n48,\n96,24\n", timeBase: 1.0 / 600)
+        XCTAssertEqual(missingDuration.times, [0, 0.08, 0.16])
+        XCTAssertNil(missingDuration.endTime,
+                     "One unknown packet duration must make probe use the stream-level end")
+        let nonPositiveDuration = FFTools.parseFramePackets("0,48\n48,0\n96,24\n", timeBase: 1.0 / 600)
+        XCTAssertEqual(nonPositiveDuration.times, [0, 0.08, 0.16])
+        XCTAssertNil(nonPositiveDuration.endTime)
+
+        let timing = try XCTUnwrap(FFTools.streamTiming([
+            "start_time": "0.125",
+            "duration": "1.500"
+        ]))
+        XCTAssertEqual(timing.start, 0.125, accuracy: 1e-12)
+        XCTAssertEqual(timing.duration, 1.5, accuracy: 1e-12)
+        XCTAssertEqual(timing.end, 1.625, accuracy: 1e-12)
+        XCTAssertNil(FFTools.streamTiming(["start_time": "0.500"]),
+                     "A missing duration is unknown timing, not a zero-length track")
+        XCTAssertEqual(try XCTUnwrap(FFTools.finiteDouble("10.25")), 10.25, accuracy: 1e-12)
+    }
+
+    func testBlackPadLengthensThePictureAndRaisesTheAudioCeiling() throws {
+        let video = videoItem(
+            path: "/fixtures/padded-tail.mp4",
+            trimStart: 0,
+            trimEnd: 1,
+            duration: 1.4,
+            hasAudio: true,
+            audioStartTime: 0,
+            audioEndTime: 1.4,
+            padDuration: 0.4
+        )
+
+        let filter = try filter(for: video)
+
+        XCTAssertTrue(filter.contains("format=yuv420p,tpad=stop_mode=add:" +
+                                      "stop_duration=0.400000:color=black[v0]"),
+                      "Black is generated on the canvas lattice, after the fit chain")
+        XCTAssertTrue(filter.contains("[0:a]atrim=start=0.000000:end=1.400000"),
+                      "The pad exists so real audio may outrun the final frame")
+        // 1.4 s at 44.1 kHz — the segment, black included, is sample-exact.
+        XCTAssertTrue(filter.contains("apad=whole_len=61740,atrim=end_sample=61740"))
+    }
+
+    func testUnpaddedSegmentsCarryNoPadFilter() throws {
+        let video = videoItem(path: "/fixtures/plain.mp4", hasAudio: true,
+                              audioStartTime: 0, audioEndTime: 1)
+
+        XCTAssertFalse(try filter(for: video).contains("tpad"))
+    }
+
     private func videoItem(
         path: String,
         startFrame: Int = 0,
@@ -109,7 +260,11 @@ final class AssemblyArgumentsTests: XCTestCase {
         trimStart: Double = 0,
         trimEnd: Double = 1,
         duration: Double = 1,
-        hasAudio: Bool
+        hasAudio: Bool,
+        inputStartTime: Double = 0,
+        audioStartTime: Double = 0,
+        audioEndTime: Double? = nil,
+        padDuration: Double = 0
     ) -> AssemblyItem {
         AssemblyItem(
             url: URL(fileURLWithPath: path),
@@ -119,8 +274,22 @@ final class AssemblyArgumentsTests: XCTestCase {
             trimStart: trimStart,
             trimEnd: trimEnd,
             duration: duration,
-            hasAudio: hasAudio
+            hasAudio: hasAudio,
+            inputStartTime: inputStartTime,
+            audioStartTime: audioStartTime,
+            audioEndTime: audioEndTime,
+            padDuration: padDuration
         )
+    }
+
+    private func filter(for item: AssemblyItem) throws -> String {
+        let args = FFTools.assembleArgs(
+            items: [item],
+            audioURL: nil,
+            canvas: CanvasSpec(width: 1280, height: 720, fps: "25", fpsValue: 25),
+            output: URL(fileURLWithPath: "/exports/result.mp4")
+        )
+        return try XCTUnwrap(args.value(after: "-filter_complex"))
     }
 }
 

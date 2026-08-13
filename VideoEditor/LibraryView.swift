@@ -11,23 +11,17 @@ import SwiftUI
 import AppKit
 
 struct LibraryPanel: View {
-    let model: EditorModel
+    // Bindable so the search field and kind picker can drive the model's own
+    // filter state — ⌘A selects what the grid shows, so the grid and the
+    // select-all have to read the same filter.
+    @Bindable var model: EditorModel
 
     @State private var cardFrames: [LibraryAsset.ID: CGRect] = [:]
     @State private var marqueeStart: CGPoint?
     @State private var marqueeRect: CGRect?
-    @State private var searchText = ""
-    @State private var kindFilter: AssetKind?
     @FocusState private var searchFocused: Bool
 
-    private var filteredAssets: [LibraryAsset] {
-        model.library.filter { asset in
-            (kindFilter == nil || asset.kind == kindFilter)
-                && (searchText.isEmpty
-                    || asset.url.lastPathComponent
-                        .localizedCaseInsensitiveContains(searchText))
-        }
-    }
+    private var filteredAssets: [LibraryAsset] { model.visibleLibraryAssets }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -50,7 +44,10 @@ struct LibraryPanel: View {
                 }
             }
         }
-        .onChange(of: searchFocused) { _, focused in model.isTextEditing = focused }
+        .onChange(of: searchFocused) { _, focused in
+            model.isTextEditing = focused
+            if focused { model.focusedPane = .library }
+        }
     }
 
     // MARK: Header / search / footer
@@ -84,12 +81,12 @@ struct LibraryPanel: View {
             HStack(spacing: 5) {
                 Image(systemName: "magnifyingglass")
                     .font(.caption).foregroundStyle(.secondary)
-                TextField("搜尋素材", text: $searchText)
+                TextField("搜尋素材", text: $model.librarySearchText)
                     .textFieldStyle(.plain)
                     .font(.callout)
                     .focused($searchFocused)
-                if !searchText.isEmpty {
-                    Button { searchText = "" } label: {
+                if !model.librarySearchText.isEmpty {
+                    Button { model.librarySearchText = "" } label: {
                         Image(systemName: "xmark.circle.fill")
                             .font(.caption).foregroundStyle(.secondary)
                     }
@@ -101,7 +98,7 @@ struct LibraryPanel: View {
             .background(RoundedRectangle(cornerRadius: 7).fill(Color.gray.opacity(0.09)))
 
             Menu {
-                Picker("種類", selection: $kindFilter) {
+                Picker("種類", selection: $model.libraryKindFilter) {
                     Text("全部").tag(AssetKind?.none)
                     Label("影片", systemImage: "film").tag(AssetKind?.some(.video))
                     Label("圖片", systemImage: "photo").tag(AssetKind?.some(.image))
@@ -109,7 +106,7 @@ struct LibraryPanel: View {
                 }
                 .pickerStyle(.inline)
             } label: {
-                Image(systemName: kindFilter == nil
+                Image(systemName: model.libraryKindFilter == nil
                       ? "line.3.horizontal.decrease.circle"
                       : "line.3.horizontal.decrease.circle.fill")
             }
@@ -128,8 +125,8 @@ struct LibraryPanel: View {
             Text("沒有符合的素材")
                 .font(.caption).foregroundStyle(.secondary)
             Button("清除條件") {
-                searchText = ""
-                kindFilter = nil
+                model.librarySearchText = ""
+                model.libraryKindFilter = nil
             }
             .controlSize(.small)
         }
@@ -170,6 +167,8 @@ struct LibraryPanel: View {
                             $0.contains(value.location)
                         }) else { return }
                         model.clearSelection()
+                        model.focusedPane = .library
+                        model.endTextEditing()
                     }
             )
             .simultaneousGesture(
@@ -204,6 +203,8 @@ struct LibraryPanel: View {
             }) else { return }
             marqueeStart = value.startLocation
             model.selectedIDs = []
+            model.focusedPane = .library
+            model.endTextEditing()
         }
         guard let start = marqueeStart else { return }
         let rect = CGRect(x: min(start.x, value.location.x),

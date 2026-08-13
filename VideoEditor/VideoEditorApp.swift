@@ -28,6 +28,16 @@ struct VideoEditorApp: App {
                     .keyboardShortcut("z", modifiers: [.command, .shift])
                     .disabled(model.isTextEditing || !model.canRedo)
             }
+            // The stock "全部選取" only reaches the first responder, and the
+            // timeline isn't one — so ⌘A dies there. Own a second select-all
+            // right after it: AppKit skips the stock item while it is disabled
+            // and lands on this one, yet a focused text field still keeps ⌘A
+            // for its own text (this item disables itself while typing).
+            CommandGroup(after: .pasteboard) {
+                Button("全選") { model.selectAllInFocusedPane() }
+                    .keyboardShortcut("a", modifiers: .command)
+                    .disabled(model.isTextEditing)
+            }
         }
     }
 }

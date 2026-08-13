@@ -33,6 +33,9 @@ struct TimelinePreview {
     /// A video clip is being scrubbed — the preview frame comes from the shared
     /// `ScrubPreviewPlayer`, not a still image.
     let showsScrubPlayer: Bool
+    /// The pointer is over a clip's black pad. There is no frame to show there
+    /// and the export really is black, so the preview must be black too.
+    var isBlackPad: Bool = false
 }
 
 private enum ProbedLibraryImport: Sendable {
@@ -69,6 +72,18 @@ final class EditorModel {
 
     // Project
     var library: [LibraryAsset] = []
+    /// The sidebar's search / kind filter. It lives here rather than in the view
+    /// so ⌘A can select exactly the cards the sidebar is showing, no more.
+    var librarySearchText = ""
+    var libraryKindFilter: AssetKind?
+    var visibleLibraryAssets: [LibraryAsset] {
+        library.filter { asset in
+            (libraryKindFilter == nil || asset.kind == libraryKindFilter)
+                && (librarySearchText.isEmpty
+                    || asset.url.lastPathComponent
+                        .localizedCaseInsensitiveContains(librarySearchText))
+        }
+    }
     var items: [ClipItem] = [] {
         didSet { rebuildTimelineIndex() }
     }
@@ -81,6 +96,20 @@ final class EditorModel {
     /// Library-side selection. The two selection domains are mutually exclusive —
     /// selecting in one clears the other, so Delete always has one clear target.
     var selectedLibraryIDs: Set<LibraryAsset.ID> = []
+    /// The pane that last took a click. Only consulted when neither domain holds
+    /// a selection (both panes clear their selection on a blank-space click),
+    /// which is the one case the selection itself cannot disambiguate.
+    var focusedPane: Pane = .timeline
+
+    enum Pane { case timeline, library }
+
+    /// Whether ⌘A / Delete address the timeline. A live selection speaks for
+    /// itself; the last-clicked pane only breaks the tie when nothing is selected.
+    var timelineHasFocus: Bool {
+        if !selectedIDs.isEmpty { return true }
+        if !selectedLibraryIDs.isEmpty { return false }
+        return focusedPane == .timeline
+    }
     var audioURL: URL?
     var audioName: String?
     var audioDuration: Double = 0
@@ -100,8 +129,17 @@ final class EditorModel {
     /// Incremented only when the first video is inserted into an empty timeline.
     /// TimelineView consumes this request using its current measured width.
     private(set) var timelineAutoFitRequestID = 0
+    /// A pending "scroll this output time into view" request. The scale is
+    /// already applied when this is published; only the scroll is outstanding.
+    private(set) var timelineZoomRequest: TimelineZoomRequest?
+    @ObservationIgnored private var timelineZoomRequestCounter = 0
     var timelinePreview: TimelinePreview?
     var isTimelinePlaying = false
+
+    struct TimelineZoomRequest: Equatable {
+        let id: Int
+        let time: Double
+    }
 
     // Export
     var isExporting = false
@@ -271,6 +309,10 @@ final class EditorModel {
     private func frameSnapped(_ hit: TimelineHit) -> TimelineHit {
         let item = items[hit.itemIndex]
         guard !item.isImage else { return hit }
+        // The black pad carries no frame lattice, and the frame this would snap
+        // to sits before the pad even begins.
+        if item.hasVideoPad,
+           hit.timelineTime > hit.timelineStart + item.contentDuration { return hit }
         let g = item.grid
         let firstFrame = item.trimStartFrame
         let endFrame = max(firstFrame + 1, item.trimEndFrame)
@@ -288,10 +330,26 @@ final class EditorModel {
             timelineTime = min(max(0, timelineTime), totalOutputDuration)
             return
         }
+        // A playhead parked in the clip's black pad has no source time to sync
+        // from — `currentTime` is pinned to the final frame there — so deriving
+        // it would yank the playhead back to where the picture stopped.
+        if item.hasVideoPad,
+           timelineTime > start + item.contentDuration,
+           timelineTime <= start + item.displayDuration + 1e-9 {
+            return
+        }
         let offset = item.isImage
-            ? min(max(0, currentTime), item.displayDuration)
-            : min(max(0, currentTime - item.inPoint), item.displayDuration)
+            ? min(max(0, currentTime), item.contentDuration)
+            : min(max(0, currentTime - item.inPoint), item.contentDuration)
         timelineTime = start + offset
+    }
+
+    /// True while the playhead sits past the final real frame of the active
+    /// clip, inside black that the export will genuinely contain.
+    var isPlayheadInVideoPad: Bool {
+        guard let item = activeItem, item.hasVideoPad,
+              let start = timelineStart(for: item.id) else { return false }
+        return timelineTime > start + item.contentDuration + 1e-9
     }
 
     /// The edit boundary represented by the global playhead. Previewing the
@@ -353,6 +411,17 @@ final class EditorModel {
                                               timelineTime: hit.timelineTime,
                                               imageURL: item.url,
                                               showsScrubPlayer: false)
+            return
+        }
+
+        if item.hasVideoPad,
+           hit.timelineTime > hit.timelineStart + item.contentDuration + 1e-9 {
+            scrub.end()
+            timelinePreview = TimelinePreview(itemID: item.id,
+                                              timelineTime: hit.timelineTime,
+                                              imageURL: nil,
+                                              showsScrubPlayer: false,
+                                              isBlackPad: true)
             return
         }
 
@@ -639,7 +708,13 @@ final class EditorModel {
                      duration: info.duration, fps: info.fps,
                      fpsRational: info.fpsRational,
                      hasAudio: info.audioCodec != nil,
-                     frameTimes: info.frameTimes)
+                     frameTimes: info.frameTimes,
+                     containerStartTime: info.containerStartTime,
+                     videoStartTime: info.videoStartTime,
+                     videoDuration: info.videoDuration,
+                     frameEndTime: info.videoEndTime,
+                     audioStartTime: info.audioStartTime,
+                     audioDuration: info.audioDuration)
     }
 
     /// Replace every object that can retain the old inode behind a file URL.
@@ -742,6 +817,12 @@ final class EditorModel {
         asset.fpsRational = info.fpsRational
         asset.hasAudio = info.audioCodec != nil
         asset.frameTimes = info.frameTimes
+        asset.containerStartTime = info.containerStartTime
+        asset.videoStartTime = info.videoStartTime
+        asset.videoDuration = info.videoDuration
+        asset.frameEndTime = info.videoEndTime
+        asset.audioStartTime = info.audioStartTime
+        asset.audioDuration = info.audioDuration
     }
 
     private func refreshVideoSnapshot(_ snapshot: inout ProjectSnapshot,
@@ -769,7 +850,7 @@ final class EditorModel {
             .reduce(0) { $0 + $1.displayDuration }
         let offset = activeItem.isImage
             ? snapshot.currentTime : snapshot.currentTime - activeItem.inPoint
-        snapshot.timelineTime = timelineStart + min(max(0, offset), activeItem.displayDuration)
+        snapshot.timelineTime = timelineStart + min(max(0, offset), activeItem.contentDuration)
     }
 
     private func refreshVideoItem(_ item: inout ClipItem,
@@ -779,7 +860,10 @@ final class EditorModel {
         let keptSourceEnd = item.trimEndFrame >= oldGrid.frameCount
         let newGrid = FrameGrid(times: info.frameTimes,
                                 nominalFps: info.fps > 0 ? info.fps : 30,
-                                fallbackDuration: info.duration)
+                                fallbackDuration: info.videoDuration > 0
+                                    ? info.videoDuration : info.duration,
+                                fallbackStartTime: info.videoStartTime,
+                                observedEndTime: info.videoEndTime)
         let firstFrame = min(newGrid.firstDisplayedFrame, newGrid.frameCount - 1)
         let lastPossibleStart = max(firstFrame, newGrid.frameCount - 1)
         let requestedStart = keptSourceStart
@@ -797,8 +881,20 @@ final class EditorModel {
         item.fpsRational = info.fpsRational
         item.hasAudio = info.audioCodec != nil
         item.frameTimes = info.frameTimes
+        item.containerStartTime = info.containerStartTime
+        item.videoStartTime = info.videoStartTime
+        item.videoDuration = info.videoDuration
+        item.frameEndTime = info.videoEndTime
+        item.audioStartTime = info.audioStartTime
+        item.audioDuration = info.audioDuration
         item.inPoint = newGrid.boundary(startFrame)
         item.outPoint = newGrid.boundary(endFrame)
+        if item.audioOutPoint != nil {
+            item.audioOutPoint = min(item.effectiveAudioOutPoint, item.outPoint)
+        }
+        if item.containerOutPoint != nil {
+            item.containerOutPoint = min(item.effectiveContainerOutPoint, item.outPoint)
+        }
     }
 
     func libraryAsset(_ id: LibraryAsset.ID) -> LibraryAsset? {
@@ -822,14 +918,23 @@ final class EditorModel {
             // whose video doesn't start at t = 0 begin life on the grid.
             let grid = FrameGrid(times: asset.frameTimes,
                                  nominalFps: asset.fps > 0 ? asset.fps : 30,
-                                 fallbackDuration: asset.duration)
+                                 fallbackDuration: asset.videoDuration > 0
+                                    ? asset.videoDuration : asset.duration,
+                                 fallbackStartTime: asset.videoStartTime,
+                                 observedEndTime: asset.frameEndTime)
             insertItem(ClipItem(url: asset.url, kind: .video,
                                 naturalWidth: asset.width, naturalHeight: asset.height,
                                 sourceDuration: asset.duration, fps: asset.fps,
                                 fpsRational: asset.fpsRational,
                                 hasAudio: asset.hasAudio, frameTimes: asset.frameTimes,
                                 inPoint: grid.boundary(grid.firstDisplayedFrame),
-                                outPoint: grid.boundary(grid.frameCount)), at: index)
+                                outPoint: grid.boundary(grid.frameCount),
+                                containerStartTime: asset.containerStartTime,
+                                videoStartTime: asset.videoStartTime,
+                                videoDuration: asset.videoDuration,
+                                frameEndTime: asset.frameEndTime,
+                                audioStartTime: asset.audioStartTime,
+                                audioDuration: asset.audioDuration), at: index)
         }
     }
 
@@ -965,7 +1070,7 @@ final class EditorModel {
         let target = min(max(item.inPoint, requestedSourceTime ?? item.inPoint), item.outPoint)
         currentTime = target
         timelineTime = requestedTimelinePosition
-            ?? (itemTimelineStart + min(max(0, target - item.inPoint), item.displayDuration))
+            ?? (itemTimelineStart + min(max(0, target - item.inPoint), item.contentDuration))
         seekPlayer(to: target)
     }
 
@@ -974,11 +1079,46 @@ final class EditorModel {
     func selectOnly(_ id: ClipItem.ID) {
         selectedIDs = [id]
         selectedLibraryIDs = []
+        focusedPane = .timeline
     }
 
     func toggleSelection(_ id: ClipItem.ID) {
         if selectedIDs.contains(id) { selectedIDs.remove(id) } else { selectedIDs.insert(id) }
         selectedLibraryIDs = []
+        focusedPane = .timeline
+    }
+
+    /// ⌘A on the timeline: every clip becomes selected, ready for a bulk Delete.
+    /// The playhead and the active clip stay where they are.
+    func selectAllItems() {
+        guard !items.isEmpty else { return }
+        selectedIDs = Set(items.map(\.id))
+        selectedLibraryIDs = []
+        focusedPane = .timeline
+    }
+
+    /// ⌘A in the sidebar. Filtered-out cards are not selected: Delete would
+    /// otherwise remove assets the user cannot even see.
+    func selectAllLibraryAssets() {
+        let visible = visibleLibraryAssets
+        guard !visible.isEmpty else { return }
+        selectedLibraryIDs = Set(visible.map(\.id))
+        selectedIDs = []
+        focusedPane = .library
+    }
+
+    /// ⌘A: whichever pane is in play selects everything it is showing. Returns
+    /// false when that pane has nothing to select, leaving the keystroke free.
+    @discardableResult
+    func selectAllInFocusedPane() -> Bool {
+        if timelineHasFocus {
+            guard !items.isEmpty else { return false }
+            selectAllItems()
+        } else {
+            guard !visibleLibraryAssets.isEmpty else { return false }
+            selectAllLibraryAssets()
+        }
+        return true
     }
 
     func clearSelection() {
@@ -989,6 +1129,11 @@ final class EditorModel {
     func selectLibraryAsset(_ id: LibraryAsset.ID) {
         selectedLibraryIDs = [id]
         selectedIDs = []
+        focusedPane = .library
+        // The sidebar's counterpart to `pauseTimelinePlayback`: touching a card
+        // means the search field is done, and a search field that silently kept
+        // focus would keep swallowing ⌘A and every single-key shortcut.
+        endTextEditing()
     }
 
     func toggleLibrarySelection(_ id: LibraryAsset.ID) {
@@ -998,6 +1143,8 @@ final class EditorModel {
             selectedLibraryIDs.insert(id)
         }
         selectedIDs = []
+        focusedPane = .library
+        endTextEditing()
     }
 
     /// Remove every selected clip. The playhead lands on the nearest remaining
@@ -1122,6 +1269,9 @@ final class EditorModel {
         guard newValue != item.outPoint else { return }
         registerUndo()
         items[index].outPoint = newValue
+        // The pad exists to carry audio past a specific final frame. Once that
+        // frame moves, black held after it is just black.
+        items[index].videoPadDuration = 0
         if activeItemID == id {
             currentTime = min(currentTime, items[index].outPoint)
             seekPlayer(to: currentTime)
@@ -1137,6 +1287,81 @@ final class EditorModel {
     func setOutHere() {
         guard let id = activeItemID else { return }
         setTrimEnd(activeEditSourceTime, for: id)
+    }
+
+    /// Below this a pad is not a decision worth offering: a quarter second of
+    /// black to rescue a quarter second of room tone is a worse movie.
+    static let minimumWorthwhilePad = 0.25
+
+    /// Acknowledge a source tail. This is deliberately *not* an edit — export
+    /// already caps original audio at the final video boundary and rebuilds the
+    /// container, so the recorded caps change nothing about the output. They
+    /// only retire the warning. Snapshot undo restores it.
+    func dismissTrailingOverhang(for id: ClipItem.ID) {
+        pauseTimelinePlayback()
+        guard let index = items.firstIndex(where: { $0.id == id }),
+              items[index].trailingOverhangDuration > 1e-9 else { return }
+        registerUndo()
+        dismissTrailingOverhang(at: index)
+    }
+
+    /// Retire every outstanding tail warning at once. Safe as a bulk action
+    /// precisely because dismissing cannot change the exported movie.
+    func dismissAllTrailingOverhangs() {
+        pauseTimelinePlayback()
+        let targets = items.indices.filter { items[$0].trailingOverhangDuration > 1e-9 }
+        guard !targets.isEmpty else { return }
+        registerUndo()
+        for index in targets { dismissTrailingOverhang(at: index) }
+    }
+
+    private func dismissTrailingOverhang(at index: Int) {
+        // Cap at the padded boundary, not the final frame: a clip that was
+        // already extended keeps the audio its black tail exists to carry.
+        if items[index].audioTailDuration > 1e-9 {
+            items[index].audioOutPoint = items[index].paddedOutPoint
+        }
+        if items[index].containerTailDuration > 1e-9 {
+            items[index].containerOutPoint = items[index].paddedOutPoint
+        }
+    }
+
+    var clipsWithTrailingOverhang: Int {
+        items.reduce(0) { $0 + ($1.trailingOverhangDuration > 1e-9 ? 1 : 0) }
+    }
+
+    var canExtendVideoToAudioTail: Bool {
+        (activeItem?.videoPadCandidate ?? 0) >= Self.minimumWorthwhilePad
+    }
+
+    /// Append black video so the whole source-audio tail plays. Unlike
+    /// dismissing, this *is* an edit: the clip, the movie and the exported file
+    /// all grow, and the added frames are real black frames in the output.
+    func extendVideoToAudioTail(for id: ClipItem.ID) {
+        pauseTimelinePlayback()
+        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        let pad = items[index].videoPadCandidate
+        guard pad > 1e-9 else { return }
+        registerUndo()
+        items[index].videoPadDuration += pad
+        // The audio that motivated the pad now runs to the end of it. Anything
+        // the container carries beyond that stays an unacknowledged tail.
+        items[index].audioOutPoint = items[index].paddedOutPoint
+        syncTimelineTimeFromActive()
+    }
+
+    /// Ask the timeline view to zoom until a clip's tail reads as a length
+    /// rather than a mark, and to bring that boundary into view. The model has
+    /// no viewport width, so the view consumes the request — same pattern as
+    /// auto-fit.
+    func zoomToTail(for id: ClipItem.ID) {
+        guard let item = items.first(where: { $0.id == id }),
+              item.trailingOverhangDuration > 1e-9,
+              let start = timelineStart(for: id) else { return }
+        setTimelineScale(24 / item.trailingOverhangDuration)
+        timelineZoomRequestCounter &+= 1
+        timelineZoomRequest = TimelineZoomRequest(id: timelineZoomRequestCounter,
+                                                  time: start + item.displayDuration)
     }
 
     /// The playhead as an editable frame boundary strictly inside the active
@@ -1175,12 +1400,23 @@ final class EditorModel {
         guard idx > seg.trimStartFrame, idx < seg.trimEndFrame else { return }
         let t = g.boundary(idx)
         registerUndo()
-        var left = seg; left.outPoint = t
+        // The pad hangs off the source's final frame, so it belongs to whichever
+        // half still ends there.
+        var left = seg; left.outPoint = t; left.videoPadDuration = 0
         let right = ClipItem(url: seg.url, kind: .video, naturalWidth: seg.naturalWidth,
                             naturalHeight: seg.naturalHeight, sourceDuration: seg.sourceDuration,
                             fps: seg.fps, fpsRational: seg.fpsRational,
                             hasAudio: seg.hasAudio, frameTimes: seg.frameTimes,
-                            inPoint: t, outPoint: seg.outPoint)
+                            inPoint: t, outPoint: seg.outPoint,
+                            containerStartTime: seg.containerStartTime,
+                            videoStartTime: seg.videoStartTime,
+                            videoDuration: seg.videoDuration,
+                            frameEndTime: seg.frameEndTime,
+                            audioStartTime: seg.audioStartTime,
+                            audioDuration: seg.audioDuration,
+                            audioOutPoint: seg.audioOutPoint,
+                            containerOutPoint: seg.containerOutPoint,
+                            videoPadDuration: seg.videoPadDuration)
         items[i] = left
         items.insert(right, at: i + 1)
         selectItem(right.id)
@@ -1213,7 +1449,7 @@ final class EditorModel {
                     self.syncTimelineTimeFromActive()
                     if self.isTimelinePlaying, !self.isAdvancingPlayback {
                         Task { @MainActor [weak self] in
-                            self?.advanceTimelinePlayback(after: item.id)
+                            self?.playVideoPadThenAdvance(after: item.id)
                         }
                     }
                 } else {
@@ -1348,6 +1584,13 @@ final class EditorModel {
                 self.advanceTimelinePlayback(after: item.id)
             }
         } else {
+            // Resuming with the playhead already inside the black tail must run
+            // the tail, not rewind the clip: `currentTime` is pinned to the out
+            // point there, which the restart check below would read as "ended".
+            if isPlayheadInVideoPad {
+                playVideoPadThenAdvance(after: item.id)
+                return
+            }
             guard let player else {
                 pauseTimelinePlayback()
                 return
@@ -1358,6 +1601,40 @@ final class EditorModel {
                 syncTimelineTimeFromActive()
             }
             player.play()
+        }
+    }
+
+    /// Play a clip's black tail, then continue to the next clip. Nothing decodes
+    /// here — the player has already stopped on the final frame — so the pad
+    /// advances on wall-clock time, exactly the way a still image's span does.
+    private func playVideoPadThenAdvance(after itemID: ClipItem.ID) {
+        guard isTimelinePlaying,
+              let item = items.first(where: { $0.id == itemID }), item.hasVideoPad,
+              let start = timelineStart(for: itemID) else {
+            advanceTimelinePlayback(after: itemID)
+            return
+        }
+        let padEnd = start + item.displayDuration
+        let initial = min(max(start + item.contentDuration, timelineTime), padEnd)
+        guard padEnd - initial > 1e-6 else {
+            advanceTimelinePlayback(after: itemID)
+            return
+        }
+        player?.pause()
+        timelineTime = initial
+        imagePlaybackTask?.cancel()
+        imagePlaybackTask = Task { [weak self] in
+            let startedAt = Date()
+            while !Task.isCancelled {
+                guard let self, self.isTimelinePlaying,
+                      self.activeItemID == itemID else { return }
+                self.timelineTime = min(padEnd, initial + Date().timeIntervalSince(startedAt))
+                if self.timelineTime >= padEnd - 1e-6 { break }
+                try? await Task.sleep(for: .milliseconds(33))
+            }
+            guard !Task.isCancelled, let self, self.isTimelinePlaying,
+                  self.activeItemID == itemID else { return }
+            self.advanceTimelinePlayback(after: itemID)
         }
     }
 
@@ -1403,16 +1680,23 @@ final class EditorModel {
             ?? FileManager.default.homeDirectoryForCurrentUser
     }
 
+    /// True when `url` is a clip or the music track this project reads from.
+    /// Exporting there is supported, but it consumes the source.
+    func isSourceMedia(_ url: URL) -> Bool {
+        let target = url.standardizedFileURL.resolvingSymlinksInPath().path
+        return (items.map(\.url) + [audioURL].compactMap { $0 })
+            .contains { $0.standardizedFileURL.resolvingSymlinksInPath().path == target }
+    }
+
     func rememberExportFolder(_ url: URL) {
         UserDefaults.standard.set(url.path, forKey: Self.exportFolderDefaultsKey)
     }
 
-    func export(to outURL: URL) {
-        guard let ff, hasProject else { return }
-        let usable = items.filter { $0.displayDuration > 1e-3 }
-        guard !usable.isEmpty else { errorMessage = "沒有可輸出的素材。"; return }
-
-        let assemblyItems = usable.map { item -> AssemblyItem in
+    /// Resolve the UI model into FFmpeg cuts. Kept as a separate, testable step:
+    /// an unacknowledged source tail is visible on the timeline, but original
+    /// audio is still capped at the exclusive final-video boundary here.
+    func assemblyItemsForExport() -> [AssemblyItem] {
+        items.filter { $0.displayDuration > 1e-3 }.map { item -> AssemblyItem in
             if item.isImage {
                 return AssemblyItem(url: item.url, isImage: true,
                                     trimStartFrame: 0, trimEndFrame: 0,
@@ -1427,11 +1711,33 @@ final class EditorModel {
             let endFrame = max(startFrame + 1, item.trimEndFrame)
             let start = g.boundary(startFrame)
             let end = g.boundary(endFrame)
+            let audioEnd: Double?
+            if let sourceEnd = item.sourceAudioEndTime,
+               let explicitCap = item.audioOutPoint {
+                audioEnd = min(sourceEnd, explicitCap)
+            } else {
+                audioEnd = item.audioOutPoint ?? item.sourceAudioEndTime
+            }
+            // Keep absolute media timing here. FFTools translates it into the
+            // input-local clock ffmpeg exposes without `-copyts`, preserves any
+            // delayed track start as silence, and caps/pads the segment to video.
+            let pad = max(0, item.videoPadDuration)
             return AssemblyItem(url: item.url, isImage: false,
                                 trimStartFrame: startFrame, trimEndFrame: endFrame,
                                 trimStart: start, trimEnd: end,
-                                duration: end - start, hasAudio: item.hasAudio)
+                                duration: end - start + pad,
+                                hasAudio: item.hasAudio,
+                                inputStartTime: item.containerStartTime,
+                                audioStartTime: item.audioStartTime,
+                                audioEndTime: audioEnd,
+                                padDuration: pad)
         }
+    }
+
+    func export(to outURL: URL) {
+        guard let ff, hasProject else { return }
+        let assemblyItems = assemblyItemsForExport()
+        guard !assemblyItems.isEmpty else { errorMessage = "沒有可輸出的素材。"; return }
         let canvas = self.canvas
         let audio = self.audioURL
         isExporting = true
@@ -1451,8 +1757,8 @@ final class EditorModel {
                         Task { @MainActor [weak self] in self?.exportProgress = p }
                     })
             } catch is CancellationError {
-                // ffmpeg was terminated mid-write; don't leave the torso behind.
-                try? FileManager.default.removeItem(at: outURL)
+                // ffmpeg only ever wrote to FFTools' scratch file, which it removes
+                // itself; anything already sitting at outURL is the user's and stays.
             } catch {
                 self.errorMessage = (error as? FFError)?.errorDescription ?? error.localizedDescription
             }

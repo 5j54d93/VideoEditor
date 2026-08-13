@@ -19,12 +19,20 @@ import CryptoKit
 // MARK: - Probed media info
 
 struct MediaInfo: Sendable {
-    var duration: Double          // seconds
+    var duration: Double          // container duration (a length, not an absolute end)
+    var containerStartTime: Double
+    var videoEndTime: Double      // end of the final displayed video packet
+    var videoStartTime: Double
+    var videoDuration: Double     // video-track duration, used by the nominal fallback grid
     var fps: Double               // nominal frame rate (fallback 30 if unknown)
     var fpsRational: String       // exact rate as ffmpeg rational, e.g. "21700/869"
     var width: Int
     var height: Int
     var audioCodec: String?
+    var audioStartTime: Double    // presentation start of the audio track
+    /// Displayed audio-track duration after edit lists. Some containers omit it;
+    /// `nil` must preserve the track rather than being interpreted as zero audio.
+    var audioDuration: Double?
     var frameTimes: [Double]      // pts_time of every frame, ascending; [] if unavailable
 }
 
@@ -47,6 +55,19 @@ struct AssemblyItem: Sendable {
     var trimEnd: Double      // video: real boundary where it ends (audio cut)
     var duration: Double     // display duration (video: trimEnd-trimStart; image: its duration)
     var hasAudio: Bool       // video with an audio track
+    /// Absolute source timestamp which ffmpeg removes from this input when
+    /// `-copyts` is absent. Audio trim bounds are translated into that local
+    /// filter coordinate before being passed to `atrim`.
+    var inputStartTime: Double = 0
+    /// Absolute first presentation timestamp of the source audio track.
+    var audioStartTime: Double = 0
+    /// Absolute known source-audio end and/or explicit user cap. `nil` means
+    /// unknown, so export keeps real audio through the selected video boundary.
+    var audioEndTime: Double? = nil
+    /// Black appended after the final real frame so the source-audio tail can
+    /// play. Included in `duration`; it raises the audio ceiling by the same
+    /// amount, which is the whole point of the pad.
+    var padDuration: Double = 0
 }
 
 /// The shared output canvas everything is scaled/padded into.
@@ -157,6 +178,8 @@ struct FFTools: Sendable {
         let width = (v["width"] as? Int) ?? 0
         let height = (v["height"] as? Int) ?? 0
         let aCodec = a?["codec_name"] as? String
+        let videoTiming = Self.streamTiming(v)
+        let audioTiming = a.flatMap(Self.streamTiming)
 
         // Keep the exact rational (e.g. "21700/869" ≈ 24.9713) alongside the Double:
         // the export pipeline passes the rational to ffmpeg so a fractional-fps source
@@ -173,17 +196,45 @@ struct FFTools: Sendable {
 
         var duration = Double(format["duration"] as? String ?? "") ?? 0
         if duration == 0 { duration = Double(v["duration"] as? String ?? "") ?? 0 }
+        let explicitContainerStart = Self.finiteDouble(format["start_time"])
 
         // Packet `pts_time` is printed by ffprobe with only six decimal places.
         // Preserve the integer PTS and apply the stream time base ourselves so
         // zero-tolerance preview seeks cannot fall on the preceding frame after
         // decimal/time-scale rounding.
         let videoTimeBase = Self.parseRational(v["time_base"] as? String)
-        let frameTimes = (try? await framePacketTimes(url, timeBase: videoTimeBase)) ?? []
+        let framePackets = (try? await framePackets(url, timeBase: videoTimeBase))
+            ?? (times: [], endTime: nil)
+        let videoStartTime = videoTiming?.start
+            ?? Self.finiteDouble(v["start_time"])
+            ?? framePackets.times.first(where: { $0 >= -1e-9 })
+            ?? explicitContainerStart
+            ?? 0
+        let videoDuration = videoTiming?.duration
+            ?? framePackets.endTime.map { max(0, $0 - videoStartTime) }
+            ?? duration
+        let videoEndTime = framePackets.endTime
+            ?? videoTiming?.end
+            ?? videoStartTime + videoDuration
+        let audioStartTime = audioTiming?.start
+            ?? a.flatMap { Self.finiteDouble($0["start_time"]) }
+            ?? explicitContainerStart
+            ?? videoStartTime
+        let audioDuration = a.flatMap { Self.finiteDouble($0["duration"]) }
+        let containerStartTime = explicitContainerStart
+            ?? min(videoStartTime, a == nil ? videoStartTime : audioStartTime)
 
-        return MediaInfo(duration: duration, fps: fps, fpsRational: fpsRational,
+        return MediaInfo(duration: duration,
+                         containerStartTime: containerStartTime,
+                         videoEndTime: videoEndTime,
+                         videoStartTime: videoStartTime,
+                         videoDuration: videoDuration,
+                         fps: fps, fpsRational: fpsRational,
                          width: width, height: height,
-                         audioCodec: aCodec, frameTimes: frameTimes)
+                         audioCodec: aCodec,
+                         audioStartTime: audioStartTime,
+                         audioDuration: audioDuration,
+                         frameTimes: framePackets.times)
     }
 
     /// Just the pixel dimensions of the first video stream (used for still images).
@@ -215,21 +266,44 @@ struct FFTools: Sendable {
     /// lattice ffmpeg's `trim` counts frames on. Returns [] when any packet lacks
     /// a numeric pts: a partial table would misalign index-based cuts, so such
     /// sources fall back to the nominal k/fps grid instead.
-    private nonisolated func framePacketTimes(_ url: URL,
-                                              timeBase: Double?) async throws -> [Double] {
-        guard let timeBase, timeBase.isFinite, timeBase > 0 else { return [] }
+    private nonisolated func framePackets(
+        _ url: URL, timeBase: Double?
+    ) async throws -> (times: [Double], endTime: Double?) {
+        guard let timeBase, timeBase.isFinite, timeBase > 0 else { return ([], nil) }
         let args = ["-v", "error", "-select_streams", "v:0",
-                    "-show_entries", "packet=pts", "-of", "csv=p=0", url.path]
+                    "-show_entries", "packet=pts,duration", "-of", "csv=p=0", url.path]
         let (code, out) = try await Self.run(ffprobe, args)
         guard code == 0 else { throw FFError.probeFailed(out) }
+        return Self.parseFramePackets(out, timeBase: timeBase)
+    }
+
+    /// Decode ffprobe's compact packet table while retaining the packet duration
+    /// of the true final sample. A missing duration does not invalidate the PTS
+    /// lattice; it only makes the caller fall back to the stream duration for EOF.
+    nonisolated static func parseFramePackets(
+        _ out: String, timeBase: Double
+    ) -> (times: [Double], endTime: Double?) {
         var times: [Double] = []
+        var endTime: Double?
+        var hasCompleteDurations = true
         for line in out.split(whereSeparator: \.isNewline) {
-            let text = line.trimmingCharacters(in: CharacterSet(charactersIn: ", \r"))
-            guard !text.isEmpty else { continue }
-            guard let pts = Int64(text) else { return [] }
-            times.append(Double(pts) * timeBase)
+            let columns = line.split(separator: ",", omittingEmptySubsequences: false)
+            guard let first = columns.first else { continue }
+            let ptsText = first.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !ptsText.isEmpty else { continue }
+            guard let pts = Int64(ptsText) else { return ([], nil) }
+            let seconds = Double(pts) * timeBase
+            times.append(seconds)
+            guard columns.count > 1,
+                  let duration = Int64(columns[1].trimmingCharacters(in: .whitespacesAndNewlines)),
+                  duration > 0 else {
+                hasCompleteDurations = false
+                continue
+            }
+            endTime = max(endTime ?? -.infinity,
+                          seconds + Double(duration) * timeBase)
         }
-        return times.sorted()
+        return (times.sorted(), hasCompleteDurations ? endTime : nil)
     }
 
     // MARK: Export
@@ -247,6 +321,7 @@ struct FFTools: Sendable {
         let normalizeAudio = "aresample=sample_rate=44100:out_chlayout=stereo:" +
                              "out_sample_fmt=fltp:internal_sample_fmt=s32p:" +
                              "dither_method=none:exact_rational=1"
+        let audioSampleRate = 44_100.0
         let useOriginalAudio = (audioURL == nil)
 
         // These values are part of the output format, not user preferences. In
@@ -271,16 +346,55 @@ struct FFTools: Sendable {
 
         var f = ""
         for (i, it) in items.enumerated() {
+            // Pad after `fit`: the black is generated at canvas size, in the
+            // output pixel format, on the already-constant frame lattice, so its
+            // length quantizes to whole output frames.
+            let videoPad = it.padDuration > 1e-9
+                ? ",tpad=stop_mode=add:stop_duration=\(fmt(it.padDuration)):color=black"
+                : ""
             if it.isImage {
                 f += "[\(i):v]\(fit),setpts=PTS-STARTPTS[v\(i)];"
             } else {
-                f += "[\(i):v]trim=start_frame=\(it.trimStartFrame):end_frame=\(it.trimEndFrame),setpts=PTS-STARTPTS,\(fit)[v\(i)];"
+                f += "[\(i):v]trim=start_frame=\(it.trimStartFrame):end_frame=\(it.trimEndFrame),setpts=PTS-STARTPTS,\(fit)\(videoPad)[v\(i)];"
             }
             if useOriginalAudio {
                 if it.hasAudio && !it.isImage {
-                    f += "[\(i):a]atrim=start=\(fmt(it.trimStart)):end=\(fmt(it.trimEnd)),asetpts=PTS-STARTPTS,\(normalizeAudio)[a\(i)];"
+                    let sourceAudioStart = max(it.trimStart, it.audioStartTime)
+                    // Black appended to the picture raises the ceiling on real
+                    // audio by exactly its own length — otherwise the pad would
+                    // hold silence and preserve nothing.
+                    let audioCeiling = it.trimEnd + max(0, it.padDuration)
+                    let sourceAudioEnd = min(audioCeiling, it.audioEndTime ?? audioCeiling)
+                    let targetSamples = max(1, Int64(floor(it.duration * audioSampleRate + 1e-9)))
+                    if sourceAudioEnd > sourceAudioStart + 1e-9 {
+                        // ffmpeg rebases each input by its container start when
+                        // `-copyts` is absent. Trim in that input-local coordinate,
+                        // then explicitly restore the audio track's offset from the
+                        // selected video boundary as leading silence.
+                        let localStart = sourceAudioStart - it.inputStartTime
+                        let localEnd = sourceAudioEnd - it.inputStartTime
+                        let leadDuration = max(0, sourceAudioStart - it.trimStart)
+                        let leadSamples = max(0, Int64((leadDuration * audioSampleRate).rounded()))
+                        f += "[\(i):a]atrim=start=\(fmt(localStart)):end=\(fmt(localEnd))," +
+                             "asetpts=PTS-STARTPTS,\(normalizeAudio)"
+                        if leadSamples > 0 {
+                            // Sample units avoid adelay's millisecond default and
+                            // preserve sub-millisecond source offsets.
+                            f += ",adelay=\(leadSamples)S:all=1"
+                        }
+                        f += ",apad=whole_len=\(targetSamples)," +
+                             "atrim=end_sample=\(targetSamples),asetpts=N/SR/TB[a\(i)];"
+                    } else {
+                        // A real track wholly outside this video selection would
+                        // produce an empty concat input. Supply an exact-length
+                        // silent segment instead.
+                        f += "anullsrc=channel_layout=stereo:sample_rate=44100," +
+                             "atrim=end_sample=\(targetSamples),asetpts=N/SR/TB[a\(i)];"
+                    }
                 } else {
-                    f += "anullsrc=channel_layout=stereo:sample_rate=44100,atrim=0:\(fmt(it.duration)),asetpts=PTS-STARTPTS[a\(i)];"
+                    let targetSamples = max(1, Int64(floor(it.duration * audioSampleRate + 1e-9)))
+                    f += "anullsrc=channel_layout=stereo:sample_rate=44100," +
+                         "atrim=end_sample=\(targetSamples),asetpts=N/SR/TB[a\(i)];"
                 }
             }
         }
@@ -314,8 +428,17 @@ struct FFTools: Sendable {
     nonisolated func exportAssembly(items: [AssemblyItem], audioURL: URL?, canvas: CanvasSpec,
                                     output: URL,
                                     onProgress: (@Sendable (Double) -> Void)? = nil) async throws -> ExportResult {
+        // ffmpeg refuses to open an output path that is also one of its inputs
+        // ("cannot edit existing files in-place"), which is exactly what happens
+        // when a project is re-exported over one of its own source clips. Write a
+        // sibling scratch file instead and swap it in once ffmpeg exits cleanly:
+        // the sources stay readable for the whole run, and a failed or cancelled
+        // export leaves whatever already sat at `output` untouched.
+        let scratch = Self.scratchURL(besides: output)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+
         var args = Self.assembleArgs(items: items, audioURL: audioURL, canvas: canvas,
-                                     output: output)
+                                     output: scratch)
         let code: Int32, log: String
         if let onProgress {
             // Stream machine-readable progress on stdout; stderr stays the log.
@@ -330,9 +453,31 @@ struct FFTools: Sendable {
         // of a bogus export-failed error.
         try Task.checkCancellation()
         guard code == 0 else { throw FFError.exportFailed(code: code, log: log) }
+        try Self.install(scratch, at: output)
         let sha = try Self.sha256(of: output)
-        let pretty = ([ffmpeg.lastPathComponent] + args).joined(separator: " ")
+        // Report the command the user asked for, not the scratch path it ran under.
+        let pretty = ([ffmpeg.lastPathComponent] +
+                      args.map { $0 == scratch.path ? output.path : $0 }).joined(separator: " ")
         return ExportResult(outputURL: output, sha256: sha, command: pretty, log: log)
+    }
+
+    /// A hidden sibling of `output` — same directory, so installing it is a
+    /// same-volume rename — keeping the `.mp4` extension ffmpeg muxes by.
+    private nonisolated static func scratchURL(besides output: URL) -> URL {
+        let base = output.deletingPathExtension().lastPathComponent
+        let ext = output.pathExtension.isEmpty ? "mp4" : output.pathExtension
+        return output.deletingLastPathComponent()
+            .appendingPathComponent(".\(base).partial-\(UUID().uuidString).\(ext)")
+    }
+
+    /// Move `source` onto `destination`, replacing an existing file atomically.
+    private nonisolated static func install(_ source: URL, at destination: URL) throws {
+        let fm = FileManager.default
+        if fm.fileExists(atPath: destination.path) {
+            _ = try fm.replaceItemAt(destination, withItemAt: source)
+        } else {
+            try fm.moveItem(at: source, to: destination)
+        }
     }
 
     // MARK: - Helpers
@@ -340,6 +485,26 @@ struct FFTools: Sendable {
     /// Format a time/duration with fixed precision so the argument string itself is stable.
     private nonisolated static func fmt(_ x: Double) -> String {
         String(format: "%.6f", x)
+    }
+
+    /// Stream timing after any container edit list has been applied.
+    nonisolated static func streamTiming(
+        _ stream: [String: Any]
+    ) -> (start: Double, duration: Double, end: Double)? {
+        guard let duration = finiteDouble(stream["duration"]), duration >= 0 else { return nil }
+        let start = finiteDouble(stream["start_time"]) ?? 0
+        return (start, duration, start + duration)
+    }
+
+    nonisolated static func finiteDouble(_ value: Any?) -> Double? {
+        let parsed: Double?
+        switch value {
+        case let text as String: parsed = Double(text)
+        case let number as NSNumber: parsed = number.doubleValue
+        default: parsed = nil
+        }
+        guard let parsed, parsed.isFinite else { return nil }
+        return parsed
     }
 
     private nonisolated static func parseRational(_ s: String?) -> Double? {

@@ -10,8 +10,25 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
+private enum TimelineLaneMetrics {
+    static let spacing: CGFloat = 2
+    static let audioHeight: CGFloat = 28
+    /// Below this a to-scale band carries no information — it is thinner than
+    /// the seam between two clips. Under the threshold the tail is a mark, and
+    /// the chip's zoom action is how you get to see its real length.
+    static let tailBandThreshold: CGFloat = 12
+    static let tailBandHeight: CGFloat = 16
+    /// A band may never swallow the clip it spills onto.
+    static let tailBandCoverage: CGFloat = 0.7
+    static let tailChipHeight: CGFloat = 19
+}
+
 struct TimelineView: View {
     let model: EditorModel
+
+    /// Air between the toolbar row and the ruler under it. The pane's top inset
+    /// matches this, so the row is evenly spaced above and below.
+    static let headerSpacing: CGFloat = 7
 
     private let rulerHeight: CGFloat = 24
     private let baseTrackHeight: CGFloat = 100
@@ -106,11 +123,12 @@ struct TimelineView: View {
                 return rect.minX <= maxX && rect.maxX >= minX
             }.map(\.id))
         }
+
     }
 
     var body: some View {
         let layout = TimelineLayout(items: model.items)
-        VStack(alignment: .leading, spacing: 7) {
+        VStack(alignment: .leading, spacing: Self.headerSpacing) {
             header(layout: layout)
 
             GeometryReader { geo in
@@ -123,9 +141,17 @@ struct TimelineView: View {
                 let trackHeight = max(baseTrackHeight, geo.size.height - rulerHeight)
 
                 ScrollView(.horizontal, showsIndicators: true) {
-                    canvas(layout: layout, width: contentWidth,
-                           clipsWidth: clipsWidth, scale: scale,
-                           viewportWidth: geo.size.width, trackHeight: trackHeight)
+                    // The chips sit outside the canvas rather than inside it: as
+                    // a sibling drawn on top they absorb their own clicks, so
+                    // pressing one no longer also runs the canvas-wide tap that
+                    // would seek the playhead out from under you.
+                    ZStack(alignment: .topLeading) {
+                        canvas(layout: layout, width: contentWidth,
+                               clipsWidth: clipsWidth, scale: scale,
+                               viewportWidth: geo.size.width, trackHeight: trackHeight)
+                        tailChips(layout: layout, width: contentWidth,
+                                  scale: scale, trackHeight: trackHeight)
+                    }
                 }
                 .scrollPosition($scrollPosition)
                 .onScrollGeometryChange(for: CGFloat.self,
@@ -138,6 +164,16 @@ struct TimelineView: View {
                 }
                 .onChange(of: geo.size.width) { _, w in
                     updateViewportWidth(w, totalDuration: layout.totalDuration)
+                }
+                .onChange(of: model.timelineZoomRequest) { _, request in
+                    guard let request else { return }
+                    // The scale is already applied; scroll after the content has
+                    // been re-laid out at it, or the target is clamped against
+                    // the old width.
+                    let x = CGFloat(request.time) * CGFloat(model.timelinePointsPerSecond)
+                    DispatchQueue.main.async {
+                        scrollPosition.scrollTo(x: max(0, x - geo.size.width / 3))
+                    }
                 }
             }
             .frame(minHeight: baseTrackHeight + rulerHeight, maxHeight: .infinity, alignment: .top)
@@ -183,6 +219,27 @@ struct TimelineView: View {
                 }
                 .disabled(!model.canDeleteAfterPlayhead)
                 .help("刪除播放頭至下一個分割點之間的內容（W）")
+
+                if let item = model.activeItem, item.trailingOverhangDuration > 1e-9 {
+                    Button { model.dismissTrailingOverhang(for: item.id) } label: {
+                        Label("忽略尾端", systemImage: "checkmark.circle")
+                    }
+                    .help("輸出本來就會切齊影像尾端，這只會讓提示消失")
+                    if model.canExtendVideoToAudioTail {
+                        Button { model.extendVideoToAudioTail(for: item.id) } label: {
+                            Label("延長影像", systemImage: "rectangle.portrait.arrowtriangle.2.outward")
+                        }
+                        .help("在尾端補上真正的黑畫面，讓這段原音留在成品裡")
+                    }
+                }
+            }
+
+            if model.clipsWithTrailingOverhang > 1 {
+                Button { model.dismissAllTrailingOverhangs() } label: {
+                    Label("忽略全部尾端（\(model.clipsWithTrailingOverhang)）",
+                          systemImage: "checkmark.circle.badge.questionmark")
+                }
+                .help("一次確認所有片段的尾端差異；不會改變輸出")
             }
 
             if !model.selectedIDs.isEmpty {
@@ -311,6 +368,8 @@ struct TimelineView: View {
             .frame(width: clipsWidth, height: baseTrackHeight, alignment: .leading)
             .offset(y: rulerHeight + (trackHeight - baseTrackHeight) / 2)
 
+            tailMarks(layout: layout, width: width, scale: scale, trackHeight: trackHeight)
+
             trailingDropZone(width: max(1, width - clipsWidth), trackHeight: trackHeight)
                 .offset(x: clipsWidth, y: rulerHeight)
 
@@ -372,6 +431,11 @@ struct TimelineView: View {
         .simultaneousGesture(
             SpatialTapGesture(coordinateSpace: .named("outputTimelineCanvas"))
                 .onEnded { value in
+                    model.focusedPane = .timeline
+                    // ⌘-click never seeks, so it would otherwise skip the
+                    // focus hand-back that every seek performs — and a search
+                    // field still holding focus swallows ⌘A.
+                    model.endTextEditing()
                     let clipRowTop = rulerHeight + (trackHeight - baseTrackHeight) / 2
                     let time = Double(value.location.x / scale)
                     let beforeTimelineEnd = value.location.x < clipsWidth
@@ -423,6 +487,8 @@ struct TimelineView: View {
                         guard !onRuler, !onClip else { return }
                         marqueeStart = s
                         model.selectedLibraryIDs = []
+                        model.focusedPane = .timeline
+                        model.endTextEditing()
                     }
                     guard let start = marqueeStart else { return }
                     let rect = CGRect(x: min(start.x, value.location.x),
@@ -522,6 +588,89 @@ struct TimelineView: View {
         .frame(width: width, height: trackHeight)
     }
 
+    /// The tail's non-interactive half: a persistent 2pt mark on the boundary,
+    /// plus a to-scale band once the tail is actually long enough to read as a
+    /// length. Neither is hit-testable, so clicking a tail still seeks to the
+    /// output time underneath it.
+    private func tailMarks(layout: TimelineLayout, width: CGFloat,
+                           scale: CGFloat, trackHeight: CGFloat) -> some View {
+        let laneTop = laneTop(trackHeight: trackHeight)
+        return ZStack(alignment: .topLeading) {
+            ForEach(Array(layout.entries.enumerated()), id: \.element.id) { index, entry in
+                let tail = entry.item.trailingOverhangDuration
+                if tail > 1e-9 {
+                    let boundaryX = CGFloat(entry.end) * scale
+                    let tailWidth = CGFloat(tail) * scale
+
+                    // Only draw a length once a length is what it is. Below the
+                    // threshold the mark carries the whole message.
+                    if tailWidth >= TimelineLaneMetrics.tailBandThreshold {
+                        Rectangle()
+                            .fill(Color.orange.opacity(0.5))
+                            .frame(width: min(tailWidth,
+                                              bandLimit(after: index, layout: layout, scale: scale)),
+                                   height: TimelineLaneMetrics.tailBandHeight)
+                            .offset(x: boundaryX, y: laneTop)
+                    }
+
+                    Rectangle()
+                        .fill(Color.orange)
+                        .frame(width: 2, height: TimelineLaneMetrics.audioHeight)
+                        .offset(x: max(0, boundaryX - 2), y: laneTop)
+                }
+            }
+        }
+        .frame(width: width, height: rulerHeight + trackHeight, alignment: .topLeading)
+        .allowsHitTesting(false)
+    }
+
+    /// The tail's interactive half. Anchored to the boundary and expanding left
+    /// at its intrinsic size; because it only appears on hover or selection it
+    /// may overlap its own clip freely — which is what keeps the action reachable
+    /// on a clip of any length.
+    private func tailChips(layout: TimelineLayout, width: CGFloat,
+                           scale: CGFloat, trackHeight: CGFloat) -> some View {
+        let chipTop = laneTop(trackHeight: trackHeight)
+            - TimelineLaneMetrics.tailChipHeight - 3
+        return ZStack(alignment: .topLeading) {
+            ForEach(layout.entries) { entry in
+                if entry.item.trailingOverhangDuration > 1e-9, showsTailChip(entry.id) {
+                    HStack(spacing: 0) {
+                        Spacer(minLength: 0)
+                        TailChip(model: model, item: entry.item)
+                    }
+                    .frame(width: max(1, CGFloat(entry.end) * scale),
+                           height: TimelineLaneMetrics.tailChipHeight,
+                           alignment: .trailing)
+                    .offset(y: chipTop)
+                }
+            }
+        }
+        .frame(width: width, height: rulerHeight + trackHeight, alignment: .topLeading)
+    }
+
+    /// Top of the audio lane in canvas coordinates.
+    private func laneTop(trackHeight: CGFloat) -> CGFloat {
+        rulerHeight + (trackHeight - baseTrackHeight) / 2
+            + baseTrackHeight - TimelineLaneMetrics.audioHeight
+    }
+
+    /// A band spills onto the next clip, so it must never swallow it. The final
+    /// clip spills into the empty trailing workspace, where nothing needs
+    /// protecting.
+    private func bandLimit(after index: Int, layout: TimelineLayout,
+                           scale: CGFloat) -> CGFloat {
+        guard index + 1 < layout.entries.count else { return .greatestFiniteMagnitude }
+        let next = layout.entries[index + 1]
+        return CGFloat(next.end - next.start) * scale * TimelineLaneMetrics.tailBandCoverage
+    }
+
+    private func showsTailChip(_ id: ClipItem.ID) -> Bool {
+        model.timelinePreview?.itemID == id
+            || model.activeItemID == id
+            || model.selectedIDs.contains(id)
+    }
+
     private func playhead(scale: CGFloat, width: CGFloat,
                           trackHeight: CGFloat) -> some View {
         let x = CGFloat(model.timelineTime) * scale
@@ -571,6 +720,9 @@ private struct TimelineClipView: View {
         return "timeline:" + draggedItems.map { $0.id.uuidString }.joined(separator: ",")
     }
     private var width: CGFloat { CGFloat(item.displayDuration) * pointsPerSecond }
+    /// The part of the clip that has real frames behind it. Anything past this
+    /// is the black pad, which the filmstrip must not try to fill.
+    private var contentWidth: CGFloat { CGFloat(item.contentDuration) * pointsPerSecond }
     /// Horizontal breathing room so every cut reads as a visible seam between
     /// clips. Shrinks on sliver-thin clips so they never mask themselves away.
     /// Only the drawn content is inset — the clip still owns its full time span
@@ -578,14 +730,93 @@ private struct TimelineClipView: View {
     private var edgeInset: CGFloat { min(2, width / 6) }
     private var visibleLocalRange: ClosedRange<Double>? {
         let lower = max(0, visibleTimelineRange.lowerBound - timelineStart)
-        let upper = min(item.displayDuration, visibleTimelineRange.upperBound - timelineStart)
-        guard upper >= lower, upper >= 0, lower <= item.displayDuration else { return nil }
+        let upper = min(item.contentDuration, visibleTimelineRange.upperBound - timelineStart)
+        guard upper >= lower, upper >= 0, lower <= item.contentDuration else { return nil }
         return lower...upper
     }
 
+    private var videoLaneHeight: CGFloat {
+        height - TimelineLaneMetrics.audioHeight - TimelineLaneMetrics.spacing
+    }
+
+    @ViewBuilder
     var body: some View {
+        Group {
+            if item.isImage {
+                videoLane(height: height)
+            } else {
+                VStack(spacing: TimelineLaneMetrics.spacing) {
+                    videoLane(height: videoLaneHeight)
+                    originalAudioLane
+                        .frame(width: width, height: TimelineLaneMetrics.audioHeight)
+                }
+                .frame(width: width, height: height)
+            }
+        }
+        .frame(width: width, height: height)
+        .clipped()
+        .mask(Rectangle().padding(.horizontal, edgeInset))
+        .contentShape(Rectangle())
+        .overlay {
+            Rectangle()
+                .stroke(selected ? Color.accentColor : Color.white.opacity(0.22),
+                        lineWidth: selected ? 2.5 : 1)
+                .padding(.horizontal, edgeInset)
+        }
+        .accessibilityLabel(item.url.lastPathComponent)
+        .accessibilityValue("\(String(format: "%.2f", item.displayDuration)) 秒")
+        .contextMenu {
+            if item.trailingOverhangDuration > 1e-9 {
+                Button("忽略尾端差異") {
+                    model.dismissTrailingOverhang(for: item.id)
+                }
+                if item.videoPadCandidate >= EditorModel.minimumWorthwhilePad {
+                    Button("延長影像以保留這段原音") {
+                        model.extendVideoToAudioTail(for: item.id)
+                    }
+                }
+                Button("放大到尾端") { model.zoomToTail(for: item.id) }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func mediaStrip(height laneHeight: CGFloat) -> some View {
+        if item.isImage {
+            TimelineImageStrip(url: item.url)
+        } else {
+            TimelineVideoStrip(
+                itemID: item.id,
+                sourceRevision: model.videoSourceRevision(for: item.url),
+                thumbnailer: model.thumbnailer(for: item.url),
+                grid: item.grid,
+                start: item.inPoint,
+                end: item.outPoint,
+                fps: item.effectiveFps,
+                pointsPerSecond: pointsPerSecond,
+                width: contentWidth,
+                height: laneHeight,
+                visibleLocalRange: visibleLocalRange,
+                preferredFrame: model.activeItemID == item.id ? model.currentFrameIndex : nil
+            )
+        }
+    }
+
+    private func videoLane(height laneHeight: CGFloat) -> some View {
         ZStack(alignment: .topLeading) {
-            mediaStrip
+            // The pad is black in the exported file, so it is black here. The
+            // filmstrip covers only the frames that exist.
+            Color.black
+            mediaStrip(height: laneHeight)
+                .frame(width: max(0.01, contentWidth), height: laneHeight, alignment: .leading)
+                .clipped()
+
+            if item.hasVideoPad {
+                Rectangle()
+                    .fill(Color.white.opacity(0.3))
+                    .frame(width: 1, height: laneHeight)
+                    .offset(x: contentWidth)
+            }
 
             LinearGradient(colors: [.black.opacity(0.48), .clear, .black.opacity(0.38)],
                            startPoint: .top, endPoint: .bottom)
@@ -613,44 +844,114 @@ private struct TimelineClipView: View {
 
             Rectangle()
                 .fill(Color.black.opacity(0.001))
-                .frame(width: max(0.01, width), height: height)
+                .frame(width: max(0.01, width), height: laneHeight)
                 .contentShape(Rectangle())
                 .draggable(dragPayload)
         }
-        .frame(width: width, height: height)
+        .frame(width: width, height: laneHeight)
         .clipped()
-        .mask(Rectangle().padding(.horizontal, edgeInset))
-        .contentShape(Rectangle())
-        .overlay {
-            Rectangle()
-                .stroke(selected ? Color.accentColor : Color.white.opacity(0.22),
-                        lineWidth: selected ? 2.5 : 1)
-                .padding(.horizontal, edgeInset)
-        }
-        .accessibilityLabel(item.url.lastPathComponent)
-        .accessibilityValue("\(String(format: "%.2f", item.displayDuration)) 秒")
     }
 
-    @ViewBuilder
-    private var mediaStrip: some View {
-        if item.isImage {
-            TimelineImageStrip(url: item.url)
-        } else {
-            TimelineVideoStrip(
-                itemID: item.id,
-                sourceRevision: model.videoSourceRevision(for: item.url),
-                thumbnailer: model.thumbnailer(for: item.url),
-                grid: item.grid,
-                start: item.inPoint,
-                end: item.outPoint,
-                fps: item.effectiveFps,
-                pointsPerSecond: pointsPerSecond,
-                width: width,
-                height: height,
-                visibleLocalRange: visibleLocalRange,
-                preferredFrame: model.activeItemID == item.id ? model.currentFrameIndex : nil
-            )
+    private var originalAudioLane: some View {
+        let start = max(item.inPoint, item.audioStartTime)
+        // A padded clip keeps its audio across the black: that is the entire
+        // reason the black is there, and it is why the cyan visibly outruns the
+        // picture on an extended clip.
+        let end = min(item.paddedOutPoint, item.effectiveAudioOutPoint)
+        let activeWidth = max(0, CGFloat(end - start) * pointsPerSecond)
+        let activeOffset = max(0, CGFloat(start - item.inPoint) * pointsPerSecond)
+        return ZStack(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 3)
+                .fill(Color.black.opacity(0.58))
+            if item.hasAudio, activeWidth > 0 {
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(Color.cyan.opacity(0.34))
+                    .frame(width: activeWidth)
+                    .offset(x: activeOffset)
+            }
+            HStack(spacing: 4) {
+                Image(systemName: item.hasAudio ? "waveform" : "speaker.slash")
+                Text(item.hasAudio ? "原音" : "無原音")
+                Spacer(minLength: 0)
+            }
+            .font(.system(size: 9, weight: .medium))
+            .foregroundStyle(item.hasAudio ? Color.white.opacity(0.82) : Color.secondary)
+            .padding(.horizontal, 6)
+
+            // Keep the full clip draggable from either lane. The warning button
+            // is layered after this surface, so its click remains independent.
+            Rectangle()
+                .fill(Color.black.opacity(0.001))
+                .frame(width: max(0.01, width), height: TimelineLaneMetrics.audioHeight)
+                .contentShape(Rectangle())
+                .draggable(dragPayload)
+
+            if item.hasVideoPad {
+                Rectangle()
+                    .fill(Color.white.opacity(0.3))
+                    .frame(width: 1, height: TimelineLaneMetrics.audioHeight)
+                    .offset(x: contentWidth)
+                    .allowsHitTesting(false)
+            }
         }
+        .accessibilityLabel(item.hasAudio ? "原始音訊" : "沒有原始音訊")
+        .accessibilityValue(item.hasVideoPad
+            ? "延長 \(String(format: "%.2f", item.videoPadDuration)) 秒黑畫面以保留原音"
+            : "")
+    }
+}
+
+/// The tail's interactive half. Fixed size and transient by design: it appears
+/// on hover or selection, so it can overlap its own clip and stay usable no
+/// matter how short that clip is — which the old in-lane button could not do.
+private struct TailChip: View {
+    let model: EditorModel
+    let item: ClipItem
+
+    private var sourceName: String { item.tailSource == .container ? "容器" : "原音" }
+    private var canExtend: Bool {
+        item.videoPadCandidate >= EditorModel.minimumWorthwhilePad
+    }
+    private var amount: String {
+        let ms = item.trailingOverhangDuration * 1_000
+        return ms >= 100 ? String(format: "%.0f ms", ms) : String(format: "%.1f ms", ms)
+    }
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Button { model.zoomToTail(for: item.id) } label: {
+                HStack(spacing: 3) {
+                    Image(systemName: "waveform.badge.exclamationmark")
+                    Text("\(sourceName) +\(amount)")
+                }
+                .foregroundStyle(Color.orange)
+            }
+            .help("放大時間軸，直到這個尾端有真實長度可看")
+
+            Divider().frame(height: 10)
+
+            Button("忽略") { model.dismissTrailingOverhang(for: item.id) }
+                .help("輸出本來就會切齊影像尾端，這只會讓提示消失")
+
+            if canExtend {
+                Button("延長影像") { model.extendVideoToAudioTail(for: item.id) }
+                    .help("在尾端補上真正的黑畫面，讓這段原音留在成品裡")
+            }
+        }
+        .buttonStyle(.plain)
+        .font(.system(size: 10, weight: .medium))
+        .foregroundStyle(.primary)
+        .lineLimit(1)
+        .padding(.horizontal, 7)
+        .frame(height: TimelineLaneMetrics.tailChipHeight)
+        .background(.thickMaterial, in: RoundedRectangle(cornerRadius: 5))
+        .overlay {
+            RoundedRectangle(cornerRadius: 5)
+                .stroke(Color.secondary.opacity(0.28), lineWidth: 0.5)
+        }
+        .fixedSize()
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(sourceName)比最後真實影格多出 \(amount)")
     }
 }
 

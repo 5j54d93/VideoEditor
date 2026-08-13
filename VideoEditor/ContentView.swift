@@ -12,13 +12,26 @@ import Synchronization
 struct ContentView: View {
     let model: EditorModel
     @State private var exportSheet = false
+    @State private var selectAllKey = SelectAllKeyMonitor()
 
     var body: some View {
         VStack(spacing: 0) {
             if model.ffMissing { ffmpegBanner }
+            // The error sheet hangs off `editor` rather than the outer stack so it
+            // never contends with the export sheet's own presentation anchor.
             editor
+                .sheet(isPresented: errorPresented) {
+                    ErrorSheet(message: model.errorMessage ?? "") { model.errorMessage = nil }
+                }
         }
         .frame(minWidth: 1120, minHeight: 760)
+        .onAppear {
+            selectAllKey.install {
+                guard !model.isTextEditing else { return false }
+                return model.selectAllInFocusedPane()
+            }
+        }
+        .onDisappear { selectAllKey.remove() }
         .toolbar {
             if model.hasProject {
                 ToolbarItem(placement: .primaryAction) {
@@ -36,13 +49,13 @@ struct ContentView: View {
         .onDrop(of: [.fileURL], isTargeted: nil) { loadDropped($0) }
         .sheet(isPresented: $exportSheet) { exportSheetContent }
         .onChange(of: model.errorMessage) { _, msg in
-            if msg != nil { exportSheet = false }   // let the error alert stand alone
+            if msg != nil { exportSheet = false }   // let the error sheet stand alone
         }
-        .alert("發生錯誤", isPresented: Binding(
-            get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } }
-        )) {
-            Button("好") { model.errorMessage = nil }
-        } message: { Text(model.errorMessage ?? "") }
+    }
+
+    private var errorPresented: Binding<Bool> {
+        Binding(get: { model.errorMessage != nil },
+                set: { if !$0 { model.errorMessage = nil } })
     }
 
     private func startExport() {
@@ -92,7 +105,11 @@ struct ContentView: View {
                 Divider()
             }
             TimelineView(model: model)
-                .padding(12)
+                // The toolbar row is the first thing in the timeline, and the
+                // pane's inset is the air above it — match it to the 7pt the
+                // timeline itself leaves underneath so the row sits centred.
+                .padding(.top, TimelineView.headerSpacing)
+                .padding([.horizontal, .bottom], 12)
         }
     }
 
@@ -100,6 +117,15 @@ struct ContentView: View {
     private var preview: some View {
         ZStack(alignment: .bottomLeading) {
             committedPreview
+
+            // A padded clip's tail is genuinely black in the exported file, so
+            // neither the frozen final frame nor a stale scrub frame may stand
+            // in for it.
+            if model.isPlayheadInVideoPad || model.timelinePreview?.isBlackPad == true {
+                Color.black
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .allowsHitTesting(false)
+            }
 
             // Stays mounted so the scrub player's layer keeps its last frame and
             // never re-fades between hovers; only visible while scrubbing a video
@@ -225,7 +251,7 @@ struct ContentView: View {
             Button("") { model.splitAtPlayhead() }.keyboardShortcut("s", modifiers: [])
             Button("") { model.requestTimelineAutoFit() }.keyboardShortcut("z", modifiers: .shift)
             Button("") {
-                if model.selectedLibraryIDs.isEmpty {
+                if model.timelineHasFocus {
                     model.removeSelectedItems()
                 } else {
                     model.removeSelectedLibraryAssets()
@@ -256,6 +282,34 @@ struct ContentView: View {
             if !urls.isEmpty { model.importAssets(urls) }
         }
         return true
+    }
+}
+
+/// ⌘A has to be taken before the main menu sees it: AppKit's stock "全部選取"
+/// item sits ahead of anything the app adds and claims the key equivalent, so a
+/// menu command of our own never fires while the timeline is what the user is
+/// aiming at. A local key monitor runs before `sendEvent:` reaches the menu,
+/// giving the timeline first claim — and it declines the key whenever a text
+/// field is being typed into, leaving select-all to the text.
+@MainActor
+final class SelectAllKeyMonitor {
+    private var monitor: Any?
+
+    /// `handle` returns true when it consumed ⌘A, false to let it pass through.
+    func install(_ handle: @escaping @MainActor () -> Bool) {
+        guard monitor == nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            guard modifiers == .command,
+                  event.charactersIgnoringModifiers?.lowercased() == "a",
+                  MainActor.assumeIsolated({ handle() }) else { return event }
+            return nil
+        }
+    }
+
+    func remove() {
+        if let monitor { NSEvent.removeMonitor(monitor) }
+        monitor = nil
     }
 }
 
@@ -374,7 +428,11 @@ private struct ExportSetupSheet: View {
                 .background(RoundedRectangle(cornerRadius: 7).fill(Color.gray.opacity(0.08)))
             }
 
-            if destinationExists {
+            if destinationIsSource {
+                Label("這個檔案也是本專案的素材，輸出後原始檔會被成品取代",
+                      systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption).foregroundStyle(.orange)
+            } else if destinationExists {
                 Label("同名檔案已存在，輸出時會覆蓋", systemImage: "exclamationmark.triangle")
                     .font(.caption).foregroundStyle(.orange)
             }
@@ -424,6 +482,10 @@ private struct ExportSetupSheet: View {
 
     private var destinationExists: Bool {
         !cleanName.isEmpty && FileManager.default.fileExists(atPath: destinationURL.path)
+    }
+
+    private var destinationIsSource: Bool {
+        destinationExists && model.isSourceMedia(destinationURL)
     }
 
     private func startExport() {
@@ -500,15 +562,21 @@ private struct ExportProgressSheet: View {
                 HStack(alignment: .firstTextBaseline) {
                     Text("正在輸出成品…").font(.callout).foregroundStyle(.secondary)
                     Spacer()
-                    Text("\(Int((model.exportProgress * 100).rounded()))%")
+                    Text("\(percent)%")
                         .font(.title3.weight(.medium)).monospacedDigit()
+                        .contentTransition(.numericText(value: Double(percent)))
+                        .animation(.default, value: percent)
                 }
                 ProgressView(value: model.exportProgress)
                     .progressViewStyle(.linear)
                 HStack {
                     Text("已用 \(shortClock(elapsed))")
+                        .contentTransition(.numericText(value: elapsed.rounded()))
+                        .animation(.default, value: elapsed.rounded())
                     Spacer()
                     Text(remainingText)
+                        .contentTransition(.numericText(countsDown: true))
+                        .animation(.default, value: remainingText)
                 }
                 .font(.caption).foregroundStyle(.tertiary).monospacedDigit()
             }
@@ -532,6 +600,8 @@ private struct ExportProgressSheet: View {
         .onReceive(timer) { now = $0 }
         .task { (videoThumb, imageThumb) = await loadFirstItemThumbnail(model) }
     }
+
+    private var percent: Int { Int((model.exportProgress * 100).rounded()) }
 
     private var elapsed: Double {
         guard let start = model.exportStartDate else { return 0 }
@@ -622,6 +692,90 @@ private struct ExportDoneSheet: View {
     private var fileSize: Int64? {
         let attrs = try? FileManager.default.attributesOfItem(atPath: result.outputURL.path)
         return (attrs?[.size] as? NSNumber)?.int64Value
+    }
+}
+
+/// Errors carry a whole ffmpeg log, which an alert would render as one unbounded
+/// run of text — the window grows past the screen and takes its buttons with it.
+/// A fixed-size sheet keeps the dismiss button reachable and the log scrollable.
+private struct ErrorSheet: View {
+    let message: String
+    let dismiss: () -> Void
+
+    /// Enough of the tail to diagnose with, without asking Text to lay out a
+    /// pathological log in one pass.
+    private static let detailLineLimit = 600
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("發生錯誤").font(.headline)
+                    Text(summary)
+                        .font(.callout).foregroundStyle(.secondary)
+                        .lineLimit(3).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            if !detail.isEmpty {
+                ScrollView {
+                    Text(displayDetail)
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(8)
+                }
+                .defaultScrollAnchor(.bottom)   // the failure is at the tail
+                .frame(height: 240)
+                .background(RoundedRectangle(cornerRadius: 7).fill(Color.gray.opacity(0.08)))
+            }
+
+            HStack(spacing: 10) {
+                if !detail.isEmpty {
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(message, forType: .string)
+                    } label: {
+                        Label("複製完整訊息", systemImage: "doc.on.doc")
+                    }
+                }
+                Spacer()
+                Button { dismiss() } label: {
+                    HStack(spacing: 5) {
+                        Text("好")
+                        KeyCapHint("↩", prominent: true, font: .body)
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+            }
+            .padding(.top, 2)
+        }
+        .padding(24)
+        .frame(width: 560)
+    }
+
+    private var summary: String {
+        message.split(separator: "\n", omittingEmptySubsequences: false).first.map(String.init) ?? message
+    }
+
+    /// The remainder below the first line — or, when a long error arrives as a
+    /// single line, the whole thing, so the truncated headline loses nothing.
+    private var detail: String {
+        let rest = message.split(separator: "\n", omittingEmptySubsequences: false)
+            .dropFirst().joined(separator: "\n")
+        if !rest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return rest }
+        return summary.count > 160 ? summary : ""
+    }
+
+    private var displayDetail: String {
+        let lines = detail.split(separator: "\n", omittingEmptySubsequences: false)
+        guard lines.count > Self.detailLineLimit else { return detail }
+        let dropped = lines.count - Self.detailLineLimit
+        return "…（前 \(dropped) 行已略過，可用「複製完整訊息」取得全文）\n"
+            + lines.suffix(Self.detailLineLimit).joined(separator: "\n")
     }
 }
 

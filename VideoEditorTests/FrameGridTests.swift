@@ -54,6 +54,21 @@ final class FrameGridTests: XCTestCase {
         XCTAssertEqual(grid.nearestBoundary(to: grid.endTime), grid.frameCount)
     }
 
+    func testObservedPacketEndWinsWithoutBecomingAnotherFrame() {
+        let grid = FrameGrid(
+            times: [0, 0.08, 0.20],
+            nominalFps: 10,
+            fallbackDuration: 0.35,
+            observedEndTime: 0.27
+        )
+
+        XCTAssertEqual(grid.frameCount, 3)
+        XCTAssertEqual(grid.endTime, 0.27, accuracy: 1e-12)
+        XCTAssertEqual(grid.boundary(3), 0.27, accuracy: 1e-12)
+        XCTAssertEqual(grid.time(ofFrame: 99), 0.20, accuracy: 1e-12,
+                       "The exclusive packet end must not masquerade as a frame PTS")
+    }
+
     func testSingleObservedFrameUsesNominalDurationForEndBoundary() {
         let grid = FrameGrid(times: [0.25], nominalFps: 25, fallbackDuration: 1)
 
@@ -74,6 +89,21 @@ final class FrameGridTests: XCTestCase {
         XCTAssertEqual(grid.nearestBoundary(to: 0.3125), 2, "A nominal-grid tie must prefer the earlier boundary")
         XCTAssertEqual(grid.endTime, 0.5, accuracy: 1e-12)
         XCTAssertEqual(grid.boundary(grid.frameCount), 0.5, accuracy: 1e-12)
+    }
+
+    func testNominalFallbackUsesTrackDurationAtNonzeroStartTime() {
+        let grid = FrameGrid(times: [], nominalFps: 25,
+                             fallbackDuration: 2,
+                             fallbackStartTime: 10,
+                             observedEndTime: 12)
+
+        XCTAssertEqual(grid.frameCount, 50,
+                       "An absolute end timestamp must not be multiplied by fps")
+        XCTAssertEqual(grid.time(ofFrame: 0), 10, accuracy: 1e-12)
+        XCTAssertEqual(grid.time(ofFrame: 49), 11.96, accuracy: 1e-12)
+        XCTAssertEqual(grid.endTime, 12, accuracy: 1e-12)
+        XCTAssertEqual(grid.frameIndex(containing: 10.5), 12)
+        XCTAssertEqual(grid.nearestBoundary(to: 12), 50)
     }
 
     func testNominalFallbackAlwaysContainsAtLeastOneFrame() {
