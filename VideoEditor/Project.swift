@@ -184,35 +184,27 @@ nonisolated struct PixelRect: Equatable, Sendable {
     var height: Int
     var size: PixelSize { PixelSize(width: width, height: height) }
 
-    /// Snap onto the chroma grid and clamp inside `source`.
+    /// Clamped to something the exporter can render: at least 2px on each side
+    /// so a scale never divides by zero, and never so far outside the source
+    /// that no picture survives.
     ///
-    /// ffmpeg's `crop` rounds an odd offset down to the subsampling grid without
-    /// saying so — on yuv420p, `crop=…:3:3` and `crop=…:2:2` produce identical
-    /// bytes. A rect the editor displays therefore has to already sit on that
-    /// grid, or the numbers would describe a frame the export never makes.
-    /// Returns `nil` when the source is too small to crop meaningfully.
-    func snappedToChromaGrid(in source: PixelSize) -> PixelRect? {
-        guard source.isUsable else { return nil }
-        let limitWidth = source.width - source.width % 2
-        let limitHeight = source.height - source.height % 2
-        guard limitWidth >= 2, limitHeight >= 2 else { return nil }
-
-        let snappedWidth = min(max(2, width - width % 2), limitWidth)
-        let snappedHeight = min(max(2, height - height % 2), limitHeight)
-        var snappedX = max(0, x)
-        var snappedY = max(0, y)
-        snappedX -= snappedX % 2
-        snappedY -= snappedY % 2
-
-        return PixelRect(x: min(snappedX, limitWidth - snappedWidth),
-                         y: min(snappedY, limitHeight - snappedHeight),
-                         width: snappedWidth, height: snappedHeight)
+    /// There is deliberately no chroma-grid snapping here any more. Odd
+    /// coordinates used to be rounded away by crop/pad on a 4:2:0 frame, so the
+    /// editor pre-rounded to stay honest; now that the chain composes through
+    /// yuv444p whenever a coordinate is odd, snapping would only make the
+    /// editor refuse precision the exporter can deliver.
+    func clampedWindow(in source: PixelSize) -> PixelRect {
+        guard source.isUsable else { return self }
+        let w = max(2, width)
+        let h = max(2, height)
+        // Keep at least this much of the source inside the window, so a drag
+        // that overshoots cannot produce an all-black segment.
+        let margin = 8
+        return PixelRect(x: min(max(x, -w + margin), source.width - margin),
+                         y: min(max(y, -h + margin), source.height - margin),
+                         width: w, height: h)
     }
 
-    /// True when this rect keeps every source pixel, in which case the editor
-    /// stores no crop at all. Deliberately compared against the real source
-    /// size, not the even-snapped one: an odd-sized image cropped to its even
-    /// limit is a genuine crop and must stay one.
     func coversWholeFrame(of source: PixelSize) -> Bool {
         x == 0 && y == 0 && width == source.width && height == source.height
     }
@@ -226,37 +218,92 @@ nonisolated struct PixelOffset: Equatable, Sendable {
 
 /// How a clip's picture is sized against the canvas, before `scale` and
 /// `offset` move it.
-nonisolated enum FitMode: Equatable, Sendable {
-    case contain   // 完整放進畫布，四周留黑
-    case cover     // 填滿畫布，超出的裁掉
-    case actual    // 來源像素 1:1
+/// A framing the canvas derives for itself, rather than one the user placed.
+/// Kept live rather than materialised into a rectangle so that changing the
+/// canvas reframes the clip instead of stranding a window shaped for the old
+/// aspect ratio.
+nonisolated enum AutoFraming: Equatable, Sendable {
+    case fit    // 完整放入：整張畫面進畫布，四周留黑
+    case fill   // 填滿：畫布被填滿，超出的裁掉
+}
+
+/// Which region of the source frame the canvas shows.
+///
+/// One rectangle in place of what used to be four fields — a crop, a fit mode,
+/// a magnification and an offset. They were all describing this rectangle's
+/// position and size: cropping moves and shrinks it, "fill" is a particular
+/// choice of it, magnifying makes it smaller, nudging slides it. Collapsing
+/// them also collapses the two editing stages, because the rectangle *is* the
+/// output frame — there is no longer a second picture to check the result in.
+nonisolated enum ClipFraming: Equatable, Sendable {
+    case automatic(AutoFraming)
+    /// A rectangle the user placed, in source pixels. Deliberately allowed to
+    /// extend past the source frame; outside it the picture is black, which is
+    /// what "fit the whole picture" and any intentional letterbox amount to.
+    case window(PixelRect)
+}
+
+/// How the crop rectangle's aspect ratio is constrained while dragging.
+/// Locked to the canvas by default: a vertical edit wants "this part, filling
+/// the frame", and under that lock the rectangle on screen is exactly what the
+/// viewer will see.
+nonisolated enum AspectLock: Hashable, Sendable {
+    case canvas
+    case ratio(width: Int, height: Int)
+    case source
+    case free
 }
 
 /// Where one clip's pixels land on the shared canvas. The default value is the
 /// editor's only historical behaviour — whole source frame, contained, centred
 /// — and `isIdentity` is how export proves nothing has moved.
 nonisolated struct ClipGeometry: Equatable, Sendable {
-    /// Source-pixel rect kept from the decoded frame. `nil` keeps all of it.
-    var sourceCrop: PixelRect? = nil
-    var fit: FitMode = .contain
-    /// Extra magnification on top of `fit`. Deliberately not called `zoom`:
-    /// that word belongs to the editor's view zoom, which is a different thing
-    /// entirely and never reaches the output.
-    var scale: Double = 1
-    /// Canvas-pixel nudge away from centred, +x right / +y down.
-    var offset: PixelOffset = .zero
+    var framing: ClipFraming = .automatic(.fit)
+    /// Not part of the output: it only constrains dragging. Stored per clip so
+    /// switching between clips does not silently change what a drag will do.
+    var aspectLock: AspectLock = .canvas
 
-    var isIdentity: Bool {
-        sourceCrop == nil && fit == .contain && scale == 1 && offset == .zero
+    var isIdentity: Bool { framing == .automatic(.fit) }
+
+    /// The rectangle the user is working with, materialising an automatic
+    /// framing when they first take hold of it.
+    func window(source: PixelSize, canvas: PixelSize) -> PixelRect {
+        switch framing {
+        case .window(let rect):
+            return rect
+        case .automatic(let mode):
+            return ClipGeometry.automaticWindow(mode, source: source, canvas: canvas)
+        }
     }
-}
 
-/// Which half of the framing the preview is handing to the pointer. The two
-/// need different pictures: adjusting a crop means seeing the pixels being cut
-/// away, which the canvas composition has already thrown out.
-nonisolated enum GeometryEditMode: Equatable, Sendable {
-    case crop       // 裁剪來源：整張來源畫格，框外壓暗
-    case position   // 畫布位置：畫布合成，拖曳整張畫面
+    /// `fit` is the smallest canvas-shaped rectangle containing the whole
+    /// source; `fill` is the largest one inside it. Both centred.
+    ///
+    /// Only ever used to seed a drag or to draw the rectangle — never to build
+    /// export arguments. Deriving the exported size from this would round
+    /// differently from `av_rescale`, and untouched projects have to keep
+    /// exporting the bytes they always did.
+    static func automaticWindow(_ mode: AutoFraming,
+                                source: PixelSize, canvas: PixelSize) -> PixelRect {
+        guard source.isUsable, canvas.isUsable else {
+            return PixelRect(x: 0, y: 0, width: max(1, source.width), height: max(1, source.height))
+        }
+        let byWidth = PixelSize(
+            width: source.width,
+            height: max(1, Int((Double(source.width) * Double(canvas.height)
+                                / Double(canvas.width)).rounded())))
+        let byHeight = PixelSize(
+            width: max(1, Int((Double(source.height) * Double(canvas.width)
+                               / Double(canvas.height)).rounded())),
+            height: source.height)
+        // Containing the source means taking the taller/wider of the two.
+        let size = mode == .fit
+            ? (byWidth.height >= source.height ? byWidth : byHeight)
+            : (byWidth.height <= source.height ? byWidth : byHeight)
+        return PixelRect(x: (source.width - size.width) / 2,
+                         y: (source.height - size.height) / 2,
+                         width: size.width, height: size.height)
+    }
 }
 
 /// The output canvas size. `automatic` reproduces the size derived from the

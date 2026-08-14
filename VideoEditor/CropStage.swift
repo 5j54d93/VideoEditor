@@ -2,9 +2,14 @@
 //  CropStage.swift
 //  VideoEditor
 //
-//  裁剪來源 mode. Unlike the canvas stage, this shows the *whole* source frame:
-//  choosing what to cut away is impossible against a picture the canvas has
-//  already cut. The crop rect is drawn over it, everything outside dimmed.
+//  The reframing stage. It shows the *whole* source frame with the window over
+//  it — choosing what to cut away is impossible against a picture the canvas has
+//  already cut — and everything outside the window dimmed.
+//
+//  The window is the output frame. Under the default canvas-aspect lock what
+//  sits inside it is exactly what the viewer gets, which is why the second
+//  stage this replaced is no longer needed. When the window is deliberately a
+//  different shape from the canvas, a dashed outline shows the letterbox.
 //
 //  Zoom lives here rather than in an NSScrollView. The handles have to stay a
 //  fixed size on screen and a handle dragged to the edge has to pull the view
@@ -58,7 +63,12 @@ struct StageViewport: Equatable {
 
 struct CropStage<Content: View>: View {
     let source: PixelSize
-    let crop: PixelRect
+    /// In source pixels, and allowed to extend beyond the frame — outside it the
+    /// output is black, which is what "fit the whole picture" amounts to.
+    let window: PixelRect
+    let canvasAspect: Double
+    /// `nil` when the ratio is unconstrained.
+    let lockedAspect: Double?
     @Binding var viewport: StageViewport
     let onChange: (PixelRect) -> Void
     let onGestureBegin: () -> Void
@@ -82,7 +92,7 @@ struct CropStage<Content: View>: View {
             let fit = fitScale(in: geo.size)
             let scale = fit * viewport.zoom
             let picture = pictureRect(in: geo.size, scale: scale)
-            let cropRect = rect(for: crop, picture: picture, scale: scale)
+            let windowRect = rect(for: window, picture: picture, scale: scale)
 
             ZStack(alignment: .topLeading) {
                 Color.clear.contentShape(Rectangle())
@@ -93,25 +103,28 @@ struct CropStage<Content: View>: View {
                     .placed(at: picture.origin, in: geo.size)
                     .allowsHitTesting(false)
 
-                dimming(picture: picture, cropRect: cropRect)
+                dimming(picture: picture, cropRect: windowRect)
                 if scale >= StageViewport.pixelGridThreshold {
                     pixelGrid(picture: picture, scale: scale, size: geo.size)
                 }
-                outline(cropRect)
-                if isDragging { thirds(cropRect) }
+                if let letterbox = letterboxRect(around: windowRect) {
+                    canvasOutline(letterbox)
+                }
+                outline(windowRect)
+                if isDragging { thirds(windowRect) }
 
                 // Dragging the rect's interior moves the whole crop. Sits under
                 // the handles so a grab on a corner still resizes.
                 Color.clear
                     .contentShape(Rectangle())
-                    .frame(width: cropRect.width, height: cropRect.height)
-                    .placed(at: cropRect.origin, in: geo.size)
+                    .frame(width: windowRect.width, height: windowRect.height)
+                    .placed(at: windowRect.origin, in: geo.size)
                     .gesture(dragGesture(scale: scale, pane: geo.size) { origin, dx, dy in
                         PixelRect(x: origin.x + dx, y: origin.y + dy,
                                   width: origin.width, height: origin.height)
                     })
 
-                handles(cropRect: cropRect, scale: scale, pane: geo.size)
+                handles(windowRect: windowRect, scale: scale, pane: geo.size)
             }
             .frame(width: geo.size.width, height: geo.size.height)
             .clipped()
@@ -140,16 +153,44 @@ struct CropStage<Content: View>: View {
     /// the handles on the outer edge are still reachable.
     private func fitScale(in pane: CGSize) -> CGFloat {
         guard source.isUsable, pane.width > 0, pane.height > 0 else { return 1 }
-        return min((pane.width - 40) / CGFloat(source.width),
-                   (pane.height - 40) / CGFloat(source.height))
+        // The window can be larger than the source — "完整放入" always is — so
+        // fitting only the source would push its handles off screen.
+        let extentWidth = max(source.width, window.x + window.width) - min(0, window.x)
+        let extentHeight = max(source.height, window.y + window.height) - min(0, window.y)
+        return min((pane.width - 40) / CGFloat(max(1, extentWidth)),
+                   (pane.height - 40) / CGFloat(max(1, extentHeight)))
     }
 
+    /// The source picture's rect. Centred on the *window*, not on the source, so
+    /// the thing being adjusted stays put while the picture moves under it.
     private func pictureRect(in pane: CGSize, scale: CGFloat) -> CGRect {
         let size = CGSize(width: CGFloat(source.width) * scale,
                           height: CGFloat(source.height) * scale)
-        return CGRect(x: (pane.width - size.width) / 2 + viewport.pan.width,
-                      y: (pane.height - size.height) / 2 + viewport.pan.height,
+        let windowCentreX = (CGFloat(window.x) + CGFloat(window.width) / 2) * scale
+        let windowCentreY = (CGFloat(window.y) + CGFloat(window.height) / 2) * scale
+        return CGRect(x: pane.width / 2 - windowCentreX + viewport.pan.width,
+                      y: pane.height / 2 - windowCentreY + viewport.pan.height,
                       width: size.width, height: size.height)
+    }
+
+    /// The canvas the window is fitted into, when the two are different shapes.
+    /// The gap between them is the letterbox the export will add.
+    private func letterboxRect(around windowRect: CGRect) -> CGRect? {
+        guard canvasAspect > 0, windowRect.width > 0, windowRect.height > 0 else { return nil }
+        let windowAspect = windowRect.width / windowRect.height
+        guard abs(windowAspect - canvasAspect) > 0.001 else { return nil }
+        let size = windowAspect > canvasAspect
+            ? CGSize(width: windowRect.width, height: windowRect.width / canvasAspect)
+            : CGSize(width: windowRect.height * canvasAspect, height: windowRect.height)
+        return CGRect(x: windowRect.midX - size.width / 2,
+                      y: windowRect.midY - size.height / 2,
+                      width: size.width, height: size.height)
+    }
+
+    private func canvasOutline(_ rect: CGRect) -> some View {
+        Path(rect)
+            .stroke(.white.opacity(0.4), style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
+            .allowsHitTesting(false)
     }
 
     private func rect(for crop: PixelRect, picture: CGRect, scale: CGFloat) -> CGRect {
@@ -193,26 +234,20 @@ struct CropStage<Content: View>: View {
         .allowsHitTesting(false)
     }
 
-    /// Fine lines are source pixels; heavy lines are the chroma grid the crop
-    /// actually snaps to. Without the heavy ones the handles look like they are
-    /// sticking, rather than landing where ffmpeg can reproduce them.
+    /// One line per source pixel. The heavier every-second line this used to
+    /// draw existed only to explain the chroma-grid snapping; with the chain
+    /// composing through yuv444p there is no coarser grid to land on.
     private func pixelGrid(picture: CGRect, scale: CGFloat, size: CGSize) -> some View {
         Canvas { context, _ in
             var fine = Path()
-            var chroma = Path()
             let firstColumn = max(0, Int(floor((0 - picture.minX) / scale)))
             let lastColumn = min(source.width, Int(ceil((size.width - picture.minX) / scale)))
             if firstColumn <= lastColumn {
                 for column in firstColumn...lastColumn {
                     let x = picture.minX + CGFloat(column) * scale
                     let top = max(0, picture.minY), bottom = min(size.height, picture.maxY)
-                    if column % 2 == 0 {
-                        chroma.move(to: CGPoint(x: x, y: top))
-                        chroma.addLine(to: CGPoint(x: x, y: bottom))
-                    } else {
-                        fine.move(to: CGPoint(x: x, y: top))
-                        fine.addLine(to: CGPoint(x: x, y: bottom))
-                    }
+                    fine.move(to: CGPoint(x: x, y: top))
+                    fine.addLine(to: CGPoint(x: x, y: bottom))
                 }
             }
             let firstRow = max(0, Int(floor((0 - picture.minY) / scale)))
@@ -221,28 +256,22 @@ struct CropStage<Content: View>: View {
                 for row in firstRow...lastRow {
                     let y = picture.minY + CGFloat(row) * scale
                     let left = max(0, picture.minX), right = min(size.width, picture.maxX)
-                    if row % 2 == 0 {
-                        chroma.move(to: CGPoint(x: left, y: y))
-                        chroma.addLine(to: CGPoint(x: right, y: y))
-                    } else {
-                        fine.move(to: CGPoint(x: left, y: y))
-                        fine.addLine(to: CGPoint(x: right, y: y))
-                    }
+                    fine.move(to: CGPoint(x: left, y: y))
+                    fine.addLine(to: CGPoint(x: right, y: y))
                 }
             }
             // Difference blend rather than a fixed tint: at 1600% the picture
             // under the grid is one flat colour, and a translucent white line
             // disappears entirely on anything pale.
             context.blendMode = .difference
-            context.stroke(fine, with: .color(.white.opacity(0.22)), lineWidth: 0.5)
-            context.stroke(chroma, with: .color(.white.opacity(0.55)), lineWidth: 0.5)
+            context.stroke(fine, with: .color(.white.opacity(0.4)), lineWidth: 0.5)
         }
         .allowsHitTesting(false)
     }
 
     private var readout: some View {
         // verbatim: SwiftUI's own interpolation would render 1920 as "1,920".
-        Text(verbatim: "\(crop.width)×\(crop.height) @ \(crop.x),\(crop.y)")
+        Text(verbatim: "\(window.width)×\(window.height) @ \(window.x),\(window.y)")
             .font(.system(.caption, design: .monospaced))
             .foregroundStyle(.white.opacity(0.85))
             .padding(.horizontal, 8).padding(.vertical, 4)
@@ -278,17 +307,23 @@ struct CropStage<Content: View>: View {
 
     // MARK: Gestures
 
-    private func handles(cropRect: CGRect, scale: CGFloat, pane: CGSize) -> some View {
-        ForEach(CropHandle.allCases, id: \.self) { handle in
+    /// Corners only while the ratio is locked: an edge handle can only change one
+    /// axis, which is precisely what a locked ratio forbids.
+    private var activeHandles: [CropHandle] {
+        lockedAspect == nil ? CropHandle.allCases : CropHandle.corners
+    }
+
+    private func handles(windowRect: CGRect, scale: CGFloat, pane: CGSize) -> some View {
+        ForEach(activeHandles, id: \.self) { handle in
             Rectangle()
                 .fill(.white)
                 .frame(width: handleSize, height: handleSize)
                 .placed(at: CGPoint(
-                    x: cropRect.minX + cropRect.width * handle.unit.x - handleSize / 2,
-                    y: cropRect.minY + cropRect.height * handle.unit.y - handleSize / 2),
+                    x: windowRect.minX + windowRect.width * handle.unit.x - handleSize / 2,
+                    y: windowRect.minY + windowRect.height * handle.unit.y - handleSize / 2),
                         in: pane)
                 .gesture(dragGesture(scale: scale, pane: pane) { origin, dx, dy in
-                    handle.resize(origin, dx: dx, dy: dy)
+                    handle.resize(origin, dx: dx, dy: dy, lockedAspect: lockedAspect)
                 })
         }
     }
@@ -313,7 +348,7 @@ struct CropStage<Content: View>: View {
         DragGesture(minimumDistance: 0)
             .onChanged { value in
                 if dragOrigin == nil {
-                    dragOrigin = crop
+                    dragOrigin = window
                     isDragging = true
                     onGestureBegin()
                 }
@@ -370,16 +405,41 @@ enum CropHandle: CaseIterable {
         }
     }
 
-    /// The rect this drag asks for, in source pixels. Snapping to the chroma
-    /// grid and clamping into the frame belong to the model, which owns what a
-    /// legal crop is.
-    func resize(_ rect: PixelRect, dx: Int, dy: Int) -> PixelRect {
+    static var corners: [CropHandle] { [.topLeft, .topRight, .bottomLeft, .bottomRight] }
+
+    /// The rect this drag asks for, in source pixels. Clamping into something
+    /// the exporter can render belongs to the model, which owns what a legal
+    /// window is.
+    ///
+    /// With a locked ratio the horizontal drag leads and the other axis follows,
+    /// anchored at the corner opposite the one being held — so the corner under
+    /// the pointer tracks it and the rest of the rectangle grows away from it.
+    func resize(_ rect: PixelRect, dx: Int, dy: Int, lockedAspect: Double?) -> PixelRect {
         var result = rect
         if movesLeftEdge { result.x += dx; result.width -= dx }
         if movesRightEdge { result.width += dx }
         if movesTopEdge { result.y += dy; result.height -= dy }
         if movesBottomEdge { result.height += dy }
-        return result
+
+        guard let aspect = lockedAspect, aspect > 0 else { return result }
+
+        // Take whichever axis the pointer moved further on, so a diagonal drag
+        // feels like it is following the hand rather than one chosen axis.
+        let width: Int
+        let height: Int
+        if abs(dx) >= abs(dy) {
+            width = max(2, result.width)
+            height = max(2, Int((Double(width) / aspect).rounded()))
+        } else {
+            height = max(2, result.height)
+            width = max(2, Int((Double(height) * aspect).rounded()))
+        }
+        // Re-anchor: the far edges stay where they were.
+        let anchorX = movesLeftEdge ? rect.x + rect.width : rect.x
+        let anchorY = movesTopEdge ? rect.y + rect.height : rect.y
+        return PixelRect(x: movesLeftEdge ? anchorX - width : anchorX,
+                         y: movesTopEdge ? anchorY - height : anchorY,
+                         width: width, height: height)
     }
 
     private var movesLeftEdge: Bool { self == .topLeft || self == .left || self == .bottomLeft }

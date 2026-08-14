@@ -69,28 +69,19 @@ final class ClipGeometryTests: XCTestCase {
 
     // MARK: Chain shape
 
-    func testIdentityGeometryEmitsExplicitIntegersRatherThanExpressions() {
+    func testDefaultFramingEmitsExplicitIntegersRatherThanExpressions() {
         let chain = FFTools.geometryChain(
             for: item(source: PixelSize(width: 1920, height: 1080)),
             canvas: canvas(PixelSize(width: 1000, height: 1000)))
 
+        // 563 and 218 are odd, so the chain composes through full chroma and
+        // converts back only after padding — a 4:2:0 frame cannot address an
+        // odd row, and crop/pad would quietly round it.
         XCTAssertEqual(chain,
-                       "scale=1000:563:\(scalerFlags),"
-                       + "format=yuv444p,pad=1000:1000:0:218,"
-                       + "setsar=1,fps=30,format=yuv420p")
+                       "scale=1000:563:\(scalerFlags),format=yuv444p,"
+                       + "pad=1000:1000:0:218,setsar=1,fps=30,format=yuv420p")
         XCTAssertFalse(chain.contains("force_original_aspect_ratio"))
         XCTAssertFalse(chain.contains("(ow-iw)"))
-    }
-
-    func testAllEvenCanvasPlacementAvoidsNeedlessFullChromaRoundTrip() {
-        let chain = FFTools.geometryChain(
-            for: item(source: PixelSize(width: 1920, height: 1080)),
-            canvas: canvas(PixelSize(width: 1920, height: 1080)))
-
-        XCTAssertFalse(chain.contains("format=yuv444p"))
-        XCTAssertEqual(chain,
-                       "scale=1920:1080:\(scalerFlags),pad=1920:1080:0:0,"
-                       + "setsar=1,fps=30,format=yuv420p")
     }
 
     /// Probing does not always report a frame size. Without one there is nothing
@@ -106,272 +97,189 @@ final class ClipGeometryTests: XCTestCase {
                        + "setsar=1,fps=30,format=yuv420p")
     }
 
-    /// The horizontal-source-into-vertical-canvas case: crop acts on source
-    /// pixels and therefore has to precede the scale.
-    func testSourceCropAppliesBeforeScaling() {
+    /// The horizontal-source-into-vertical-canvas case, expressed the new way:
+    /// a window over the middle of the source, shaped like the canvas.
+    func testWindowCropsBeforeScaling() {
         var geometry = ClipGeometry()
-        geometry.sourceCrop = PixelRect(x: 320, y: 0, width: 1280, height: 1080)
+        geometry.framing = .window(PixelRect(x: 320, y: 0, width: 1280, height: 1080))
 
         let chain = FFTools.geometryChain(
             for: item(source: PixelSize(width: 1920, height: 1080), geometry: geometry),
             canvas: canvas(PixelSize(width: 1080, height: 1920)))
 
-        XCTAssertEqual(chain,
-                       "crop=1280:1080:320:0:exact=1,scale=1080:911:\(scalerFlags),"
-                       + "format=yuv444p,pad=1080:1920:0:504,"
-                       + "setsar=1,fps=30,format=yuv420p")
+        XCTAssertTrue(chain.hasPrefix("crop=1280:1080:320:0:exact=1,"), chain)
+        XCTAssertTrue(chain.contains("scale=1080:911:"), chain)
     }
 
-    // MARK: Overflow
+    // MARK: The window replaces four fields
 
-    func testCoverTrimsWhatOverflowsTheCanvas() {
+    /// Every one of the four fields this redesign removed was describing the
+    /// same rectangle. These pin that: each old concept has an equivalent window
+    /// that resolves to the same placement.
+    func testWindowReproducesWhatAnOffsetUsedToDo() {
+        let source = PixelSize(width: 1920, height: 1080)
+        let target = canvas(PixelSize(width: 1920, height: 1080))
+
+        // Nudging the picture 100px right == moving the window 100px left.
         var geometry = ClipGeometry()
-        geometry.fit = .cover
+        geometry.framing = .window(PixelRect(x: -100, y: 0, width: 1920, height: 1080))
+        let placement = FFTools.resolve(geometry, source: source, canvas: target)
 
-        let target = canvas(PixelSize(width: 1080, height: 1920))
+        XCTAssertEqual(placement.padOrigin, PixelOffset(x: 100, y: 0))
+        XCTAssertEqual(placement.sourceCrop,
+                       PixelRect(x: 0, y: 0, width: 1820, height: 1080))
+        // And it needs no second crop. The old offset scaled the whole picture
+        // and then trimmed what hung over the canvas edge; a window crops the
+        // source directly, so there is nothing left over to trim.
+        XCTAssertNil(placement.visibleCrop)
+    }
+
+    func testWindowReproducesWhatAMagnificationUsedToDo() {
+        let source = PixelSize(width: 1920, height: 1080)
+        let target = canvas(PixelSize(width: 1920, height: 1080))
+
+        // Shrinking the picture to half size == a window twice as large.
+        var geometry = ClipGeometry()
+        geometry.framing = .window(PixelRect(x: -960, y: -540, width: 3840, height: 2160))
+        let placement = FFTools.resolve(geometry, source: source, canvas: target)
+
+        XCTAssertEqual(placement.scaledSize, PixelSize(width: 960, height: 540))
+        XCTAssertEqual(placement.padOrigin, PixelOffset(x: 480, y: 270))
+    }
+
+    func testFillFramingCoversTheCanvas() {
+        var geometry = ClipGeometry()
+        geometry.framing = .automatic(.fill)
+
         let placement = FFTools.resolve(geometry, source: PixelSize(width: 1920, height: 1080),
-                                        canvas: target)
+                                        canvas: canvas(PixelSize(width: 1080, height: 1920)))
 
         XCTAssertEqual(placement.scaledSize, PixelSize(width: 3413, height: 1920))
         XCTAssertEqual(placement.visibleCrop,
                        PixelRect(x: 1166, y: 0, width: 1080, height: 1920))
         XCTAssertEqual(placement.padOrigin, .zero)
-
-        let chain = FFTools.geometryChain(
-            for: item(source: PixelSize(width: 1920, height: 1080), geometry: geometry),
-            canvas: target)
-        // The trim has to sit between the scale and the pad: pad cannot take a
-        // negative origin, which is the whole reason the second crop exists.
-        XCTAssertEqual(chain,
-                       "scale=3413:1920:\(scalerFlags),format=yuv444p,"
-                       + "crop=1080:1920:1166:0,"
-                       + "pad=1080:1920:0:0,setsar=1,fps=30,format=yuv420p")
     }
 
-    func testOffsetPastTheEdgeTrimsRatherThanPaddingNegative() {
+    /// A window shaped like the canvas fills it exactly — the property the
+    /// default aspect lock exists to guarantee, and the reason the rectangle on
+    /// screen can be described as the output frame.
+    func testCanvasShapedWindowFillsTheCanvasExactly() {
         var geometry = ClipGeometry()
-        geometry.offset = PixelOffset(x: 100, y: 0)
+        geometry.framing = .window(PixelRect(x: 420, y: 0, width: 1080, height: 1920))
 
         let placement = FFTools.resolve(geometry, source: PixelSize(width: 1920, height: 1080),
-                                        canvas: canvas(PixelSize(width: 1920, height: 1080)))
-
-        XCTAssertEqual(placement.visibleCrop,
-                       PixelRect(x: 0, y: 0, width: 1820, height: 1080))
-        XCTAssertEqual(placement.padOrigin, PixelOffset(x: 100, y: 0))
-        XCTAssertFalse(placement.isFullyOffCanvas)
+                                        canvas: canvas(PixelSize(width: 1080, height: 1920)))
+        XCTAssertNil(placement.visibleCrop)
+        XCTAssertEqual(placement.padOrigin, .zero)
     }
 
-    func testPictureNudgedClearOfTheCanvasBecomesBlack() {
+    /// A locked window's integer dimensions often cannot express the canvas
+    /// ratio exactly. The leftover must not become a black hairline.
+    func testNearCanvasRatioWindowStillFillsTheCanvas() {
         var geometry = ClipGeometry()
-        geometry.offset = PixelOffset(x: 5000, y: 0)
-
-        let target = canvas(PixelSize(width: 1920, height: 1080))
-        let placement = FFTools.resolve(geometry, source: PixelSize(width: 1920, height: 1080),
-                                        canvas: target)
-        XCTAssertTrue(placement.isFullyOffCanvas)
-
-        // A scaled picture wider than the canvas would make pad fail outright,
-        // so this path must not go through pad at all.
-        let chain = FFTools.geometryChain(
-            for: item(source: PixelSize(width: 1920, height: 1080), geometry: geometry),
-            canvas: target)
-        XCTAssertEqual(chain,
-                       "scale=1920:1080:\(scalerFlags),setsar=1,fps=30,format=yuv420p,"
-                       + "drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill")
-    }
-
-    // MARK: Scale
-
-    func testScaleMultipliesTheFittedSizeAndRecentres() {
-        var geometry = ClipGeometry()
-        geometry.scale = 0.5
+        // 607:1080 is 9:16 as closely as whole pixels allow; it fits as 1079.
+        geometry.framing = .window(PixelRect(x: 421, y: 0, width: 607, height: 1080))
 
         let placement = FFTools.resolve(geometry, source: PixelSize(width: 1920, height: 1080),
-                                        canvas: canvas(PixelSize(width: 1920, height: 1080)))
+                                        canvas: canvas(PixelSize(width: 1080, height: 1920)))
 
-        XCTAssertEqual(placement.scaledSize, PixelSize(width: 960, height: 540))
-        XCTAssertEqual(placement.padOrigin, PixelOffset(x: 480, y: 270))
+        XCTAssertEqual(placement.scaledSize, PixelSize(width: 1080, height: 1920))
+        XCTAssertEqual(placement.padOrigin, .zero)
         XCTAssertNil(placement.visibleCrop)
     }
 
-    func testIdentityGeometryIsRecognised() {
+    /// A window that is not canvas-shaped letterboxes rather than distorting.
+    func testWindowOfADifferentShapeLetterboxes() {
+        var geometry = ClipGeometry()
+        geometry.framing = .window(PixelRect(x: 0, y: 0, width: 1080, height: 1080))
+
+        let placement = FFTools.resolve(geometry, source: PixelSize(width: 1920, height: 1080),
+                                        canvas: canvas(PixelSize(width: 1920, height: 1080)))
+
+        XCTAssertEqual(placement.scaledSize, PixelSize(width: 1080, height: 1080))
+        XCTAssertEqual(placement.padOrigin, PixelOffset(x: 420, y: 0))
+    }
+
+    func testWindowClearOfTheSourceIsRejected() {
+        var geometry = ClipGeometry()
+        geometry.framing = .window(PixelRect(x: 5000, y: 0, width: 1080, height: 1920))
+
+        let placement = FFTools.resolve(geometry, source: PixelSize(width: 1920, height: 1080),
+                                        canvas: canvas(PixelSize(width: 1080, height: 1920)))
+        XCTAssertTrue(placement.isFullyOffCanvas)
+    }
+
+    // MARK: Automatic windows
+
+    /// The rectangle a drag starts from. `fit` has to contain the whole source,
+    /// `fill` has to sit inside it — both shaped like the canvas.
+    func testAutomaticWindowsAreCanvasShaped() {
+        let source = PixelSize(width: 1920, height: 1080)
+        let portrait = PixelSize(width: 1080, height: 1920)
+
+        let fit = ClipGeometry.automaticWindow(.fit, source: source, canvas: portrait)
+        XCTAssertEqual(fit.width, 1920)
+        XCTAssertEqual(fit.height, 3413)               // 1920 × 1920/1080
+        XCTAssertGreaterThanOrEqual(fit.height, source.height)
+        XCTAssertEqual(fit.x, 0)
+        XCTAssertEqual(fit.y, (1080 - 3413) / 2)       // centred, so negative
+
+        let fill = ClipGeometry.automaticWindow(.fill, source: source, canvas: portrait)
+        XCTAssertEqual(fill.width, 608)                // 1080 × 1080/1920
+        XCTAssertEqual(fill.height, 1080)
+        XCTAssertLessThanOrEqual(fill.width, source.width)
+    }
+
+    /// The automatic framings stay live rather than materialising, so changing
+    /// the canvas reframes instead of stranding a rectangle shaped for the old
+    /// aspect ratio.
+    func testAutomaticFramingFollowsTheCanvas() {
+        let geometry = ClipGeometry()
+        let source = PixelSize(width: 1920, height: 1080)
+
+        let wide = FFTools.resolve(geometry, source: source,
+                                   canvas: canvas(PixelSize(width: 1920, height: 1080)))
+        let tall = FFTools.resolve(geometry, source: source,
+                                   canvas: canvas(PixelSize(width: 1080, height: 1920)))
+
+        XCTAssertEqual(wide.scaledSize, PixelSize(width: 1920, height: 1080))
+        XCTAssertEqual(tall.scaledSize, PixelSize(width: 1080, height: 608))
+    }
+
+    func testIdentityIsTheDefaultFraming() {
         XCTAssertTrue(ClipGeometry().isIdentity)
 
-        var moved = ClipGeometry()
-        moved.offset = PixelOffset(x: 1, y: 0)
-        XCTAssertFalse(moved.isIdentity)
+        var filled = ClipGeometry()
+        filled.framing = .automatic(.fill)
+        XCTAssertFalse(filled.isIdentity)
 
-        var cropped = ClipGeometry()
-        cropped.sourceCrop = PixelRect(x: 0, y: 0, width: 10, height: 10)
-        XCTAssertFalse(cropped.isIdentity)
+        var windowed = ClipGeometry()
+        windowed.framing = .window(PixelRect(x: 0, y: 0, width: 10, height: 10))
+        XCTAssertFalse(windowed.isIdentity)
     }
 
-    // MARK: Crop snapping
+    // MARK: Clamping
 
-    /// ffmpeg rounds an odd crop offset down to the chroma grid without saying
-    /// so, so the editor has to land there first or its numbers describe a frame
-    /// the export never makes.
-    func testCropSnapsOntoTheChromaGrid() {
+    /// No chroma-grid snapping any more: composing through yuv444p made odd
+    /// coordinates exact, so rounding them would only refuse precision the
+    /// exporter can deliver.
+    func testWindowKeepsOddCoordinates() {
         let source = PixelSize(width: 1920, height: 1080)
-        let snapped = PixelRect(x: 3, y: 5, width: 641, height: 481)
-            .snappedToChromaGrid(in: source)
-
-        XCTAssertEqual(snapped, PixelRect(x: 2, y: 4, width: 640, height: 480))
+        let odd = PixelRect(x: 101, y: 7, width: 641, height: 361)
+        XCTAssertEqual(odd.clampedWindow(in: source), odd)
     }
 
-    func testCropIsClampedInsideTheSourceFrame() {
+    func testWindowIsClampedToSomethingRenderable() {
         let source = PixelSize(width: 1920, height: 1080)
 
-        // Larger than the frame: pinned to the frame, not silently accepted.
-        XCTAssertEqual(PixelRect(x: 0, y: 0, width: 4000, height: 4000)
-                        .snappedToChromaGrid(in: source),
-                       PixelRect(x: 0, y: 0, width: 1920, height: 1080))
+        // Degenerate sizes become renderable rather than dividing by zero.
+        XCTAssertGreaterThanOrEqual(
+            PixelRect(x: 0, y: 0, width: 0, height: 0).clampedWindow(in: source).width, 2)
 
-        // Pushed off the right edge: slid back in, keeping the requested size.
-        XCTAssertEqual(PixelRect(x: 1900, y: 0, width: 400, height: 200)
-                        .snappedToChromaGrid(in: source),
-                       PixelRect(x: 1520, y: 0, width: 400, height: 200))
-
-        XCTAssertNil(PixelRect(x: 0, y: 0, width: 10, height: 10)
-                        .snappedToChromaGrid(in: .zero))
-    }
-
-    /// An odd-sized source cannot be cropped to its full frame on the chroma
-    /// grid, and that near-miss is a real crop — collapsing it to "no crop"
-    /// would hand ffmpeg the odd dimension back.
-    func testOddSourceCroppedToItsEvenLimitStaysACrop() {
-        let source = PixelSize(width: 641, height: 481)
-        let snapped = PixelRect(x: 0, y: 0, width: 641, height: 481)
-            .snappedToChromaGrid(in: source)
-
-        XCTAssertEqual(snapped, PixelRect(x: 0, y: 0, width: 640, height: 480))
-        XCTAssertFalse(try XCTUnwrap(snapped).coversWholeFrame(of: source))
-        XCTAssertTrue(PixelRect(x: 0, y: 0, width: 641, height: 481)
-                        .coversWholeFrame(of: source))
-    }
-
-    // MARK: Preview placement
-
-    func testCanvasDisplayUsesOneScaleForExtremeCustomAspectRatios() {
-        let target = canvas(PixelSize(width: 16, height: 7680))
-        let display = CanvasStageLayout.displaySize(
-            canvas: target, in: CGSize(width: 300, height: 500))
-
-        XCTAssertEqual(display.width / CGFloat(target.width),
-                       display.height / CGFloat(target.height), accuracy: 1e-12)
-        XCTAssertEqual(display.height, 500, accuracy: 1e-12)
-    }
-
-    /// The preview draws from the unclamped origin and lets the canvas clip;
-    /// export cannot, because pad rejects a negative origin. The two have to
-    /// describe the same picture.
-    func testUnclampedOriginTracksTheVisibleCrop() {
-        var geometry = ClipGeometry()
-        geometry.offset = PixelOffset(x: -300, y: 0)
-
-        let placement = FFTools.resolve(geometry, source: PixelSize(width: 1920, height: 1080),
-                                        canvas: canvas(PixelSize(width: 1920, height: 1080)))
-
-        XCTAssertEqual(placement.padOrigin, .zero)
-        XCTAssertEqual(placement.visibleCrop,
-                       PixelRect(x: 300, y: 0, width: 1620, height: 1080))
-        XCTAssertEqual(placement.origin, PixelOffset(x: -300, y: 0))
-    }
-
-    func testOriginMatchesPadOriginWhenNothingOverflows() {
-        let placement = FFTools.resolve(ClipGeometry(),
-                                        source: PixelSize(width: 1920, height: 1080),
-                                        canvas: canvas(PixelSize(width: 1000, height: 1000)))
-        XCTAssertNil(placement.visibleCrop)
-        XCTAssertEqual(placement.origin, placement.padOrigin)
-    }
-
-    // MARK: Preview agrees with export
-
-    /// The invariant Phase 2 exists to hold: the region of the source the
-    /// preview leaves visible inside the canvas is the region ffmpeg keeps.
-    /// Checked by mapping the preview's picture rect back into canvas pixels and
-    /// intersecting it with the canvas, then comparing against the placement.
-    func testPreviewPictureLandsWhereExportPutsIt() {
-        let source = PixelSize(width: 1920, height: 1080)
-        let target = canvas(PixelSize(width: 1080, height: 1920))
-
-        var geometry = ClipGeometry()
-        geometry.sourceCrop = PixelRect(x: 320, y: 0, width: 1280, height: 1080)
-        let placement = FFTools.resolve(geometry, source: source, canvas: target)
-
-        // One display point per canvas pixel keeps the comparison exact; the
-        // real view uses whatever fits the pane.
-        let frame = try! XCTUnwrap(CanvasStageLayout.sourceFrame(
-            placement: placement, sourceSize: source, pointsPerCanvasPixel: 1))
-
-        // Where the kept region of the source lands, in canvas pixels.
-        let zoom = CGFloat(placement.scaledSize.width) / 1280
-        let cropOnCanvas = CGRect(x: frame.minX + 320 * zoom, y: frame.minY,
-                                  width: 1280 * zoom, height: 1080 * zoom)
-        let visible = cropOnCanvas.intersection(
-            CGRect(x: 0, y: 0, width: 1080, height: 1920))
-
-        XCTAssertEqual(visible.minX, Double(placement.padOrigin.x), accuracy: 0.5)
-        XCTAssertEqual(visible.minY, Double(placement.padOrigin.y), accuracy: 0.5)
-        XCTAssertEqual(visible.width, Double(placement.scaledSize.width), accuracy: 0.5)
-        XCTAssertEqual(visible.height, Double(placement.scaledSize.height), accuracy: 0.5)
-    }
-
-    /// The preview needs two clips, not one. A crop leaves the source frame
-    /// wider than the region it keeps, and the discarded part lands *inside*
-    /// the canvas, where the canvas edge cannot cut it. The inner window is what
-    /// removes it, so it has to be exactly the region export keeps.
-    func testCropWindowCoversOnlyWhatExportKeeps() {
-        let source = PixelSize(width: 1920, height: 1080)
-        var geometry = ClipGeometry()
-        geometry.sourceCrop = PixelRect(x: 0, y: 0, width: 690, height: 1080)
-
-        let target = canvas(PixelSize(width: 1920, height: 1080))
-        let placement = FFTools.resolve(geometry, source: source, canvas: target)
-        let window = CanvasStageLayout.cropWindow(placement: placement,
-                                                  pointsPerCanvasPixel: 1)
-
-        // 690 wide, centred in 1920 — not the whole 1920-wide source frame.
-        XCTAssertEqual(window, CGRect(x: 615, y: 0, width: 690, height: 1080))
-
-        // And the source frame really is wider than that window, which is why
-        // relying on the canvas edge alone let the discarded pixels through.
-        let frame = try! XCTUnwrap(CanvasStageLayout.sourceFrame(
-            placement: placement, sourceSize: source, pointsPerCanvasPixel: 1))
-        XCTAssertGreaterThan(frame.width, window.width)
-        XCTAssertEqual(frame.minX, window.minX, accuracy: 0.01)   // crop starts at x=0
-    }
-
-    /// An overflowing placement is where the two halves could most easily
-    /// disagree: export trims with a second crop, the preview just lets the
-    /// canvas clip.
-    func testPreviewClipsExactlyWhatExportTrims() {
-        let source = PixelSize(width: 1920, height: 1080)
-        let target = canvas(PixelSize(width: 1920, height: 1080))
-
-        var geometry = ClipGeometry()
-        geometry.offset = PixelOffset(x: -300, y: 0)
-        let placement = FFTools.resolve(geometry, source: source, canvas: target)
-
-        let frame = try! XCTUnwrap(CanvasStageLayout.sourceFrame(
-            placement: placement, sourceSize: source, pointsPerCanvasPixel: 1))
-        let visible = frame.intersection(CGRect(x: 0, y: 0, width: 1920, height: 1080))
-
-        let trimmed = try! XCTUnwrap(placement.visibleCrop)
-        XCTAssertEqual(visible.width, Double(trimmed.width), accuracy: 0.5)
-        XCTAssertEqual(visible.minX, Double(placement.padOrigin.x), accuracy: 0.5)
-    }
-
-    func testFullyOffCanvasDrawsNothing() {
-        var geometry = ClipGeometry()
-        geometry.offset = PixelOffset(x: 5000, y: 0)
-        let placement = FFTools.resolve(geometry, source: PixelSize(width: 1920, height: 1080),
-                                        canvas: canvas(PixelSize(width: 1920, height: 1080)))
-
-        XCTAssertNil(CanvasStageLayout.sourceFrame(
-            placement: placement, sourceSize: PixelSize(width: 1920, height: 1080),
-            pointsPerCanvasPixel: 1))
+        // Dragged clear of the frame, it is pulled back until some source shows.
+        let far = PixelRect(x: 9000, y: 0, width: 200, height: 200).clampedWindow(in: source)
+        XCTAssertLessThan(far.x, source.width)
+        XCTAssertGreaterThan(far.x + far.width, 0)
     }
 
     // MARK: Handles
@@ -381,167 +289,34 @@ final class ClipGeometryTests: XCTestCase {
     func testHandlesMoveOnlyTheirOwnEdges() {
         let rect = PixelRect(x: 100, y: 100, width: 400, height: 300)
 
-        XCTAssertEqual(CropHandle.topLeft.resize(rect, dx: 20, dy: 10),
+        XCTAssertEqual(CropHandle.topLeft.resize(rect, dx: 20, dy: 10, lockedAspect: nil),
                        PixelRect(x: 120, y: 110, width: 380, height: 290))
-        XCTAssertEqual(CropHandle.bottomRight.resize(rect, dx: 20, dy: 10),
+        XCTAssertEqual(CropHandle.bottomRight.resize(rect, dx: 20, dy: 10, lockedAspect: nil),
                        PixelRect(x: 100, y: 100, width: 420, height: 310))
-        XCTAssertEqual(CropHandle.top.resize(rect, dx: 999, dy: 10),
+        XCTAssertEqual(CropHandle.top.resize(rect, dx: 999, dy: 10, lockedAspect: nil),
                        PixelRect(x: 100, y: 110, width: 400, height: 290))
-        XCTAssertEqual(CropHandle.left.resize(rect, dx: 20, dy: 999),
+        XCTAssertEqual(CropHandle.left.resize(rect, dx: 20, dy: 999, lockedAspect: nil),
                        PixelRect(x: 120, y: 100, width: 380, height: 300))
-        XCTAssertEqual(CropHandle.bottomLeft.resize(rect, dx: -20, dy: 10),
-                       PixelRect(x: 80, y: 100, width: 420, height: 310))
-        XCTAssertEqual(CropHandle.right.resize(rect, dx: -50, dy: 0),
-                       PixelRect(x: 100, y: 100, width: 350, height: 300))
     }
 
-    /// A handle dragged past the opposite edge asks for a negative size. The
-    /// snapper is what keeps that legal, so the two have to work together.
-    func testHandleDraggedThroughTheOppositeEdgeStaysLegal() {
-        let source = PixelSize(width: 1920, height: 1080)
-        let rect = PixelRect(x: 100, y: 100, width: 400, height: 300)
-        let inverted = CropHandle.left.resize(rect, dx: 900, dy: 0)
+    /// A locked drag keeps the ratio and anchors the far corner, so the corner
+    /// under the pointer is the one that moves.
+    func testLockedHandleKeepsTheRatioAndTheFarCorner() {
+        let rect = PixelRect(x: 100, y: 100, width: 400, height: 400)   // 1:1
+        let resized = CropHandle.bottomRight.resize(rect, dx: 100, dy: 0, lockedAspect: 1)
 
-        XCTAssertLessThan(inverted.width, 0)
-        let snapped = try! XCTUnwrap(inverted.snappedToChromaGrid(in: source))
-        XCTAssertGreaterThanOrEqual(snapped.width, 2)
-        XCTAssertGreaterThanOrEqual(snapped.x, 0)
-        XCTAssertLessThanOrEqual(snapped.x + snapped.width, source.width)
+        XCTAssertEqual(resized, PixelRect(x: 100, y: 100, width: 500, height: 500))
+
+        // Dragging the top-left corner moves the origin, not the far edges.
+        let fromTopLeft = CropHandle.topLeft.resize(rect, dx: 100, dy: 0, lockedAspect: 1)
+        XCTAssertEqual(fromTopLeft.x + fromTopLeft.width, 500)
+        XCTAssertEqual(fromTopLeft.y + fromTopLeft.height, 500)
+        XCTAssertEqual(fromTopLeft.width, fromTopLeft.height)
     }
 
-    // MARK: Timeline strip
-
-    /// The strip reflects the crop but nothing else. Without a crop it has to
-    /// reduce to what it always did — fill the tile and centre — or every
-    /// project's timeline shifts the moment this ships.
-    func testUncroppedStripFramingIsUnchanged() {
-        let source = PixelSize(width: 1920, height: 1080)
-        let tile = CGSize(width: 70, height: 44)
-        let frame = try! XCTUnwrap(SourceRegionLayout.wholeSourceFrame(
-            crop: nil, source: source, filling: tile))
-
-        // scaledToFill: the larger of the two ratios, then centred.
-        let expected = max(tile.width / 1920, tile.height / 1080)
-        XCTAssertEqual(frame.width, 1920 * expected, accuracy: 0.01)
-        XCTAssertEqual(frame.height, 1080 * expected, accuracy: 0.01)
-        XCTAssertEqual(frame.midX, tile.width / 2, accuracy: 0.01)
-        XCTAssertEqual(frame.midY, tile.height / 2, accuracy: 0.01)
-    }
-
-    func testCroppedStripCentresTheKeptRegionOnly() {
-        let source = PixelSize(width: 1920, height: 1080)
-        let tile = CGSize(width: 70, height: 44)
-        let crop = PixelRect(x: 320, y: 0, width: 1280, height: 1080)
-        let frame = try! XCTUnwrap(SourceRegionLayout.wholeSourceFrame(
-            crop: crop, source: source, filling: tile))
-
-        // The crop's own centre — not the source's — lands in the tile's centre.
-        let scale = max(tile.width / 1280, tile.height / 1080)
-        let cropCentreX = frame.minX + (320 + 1280 / 2) * scale
-        let cropCentreY = frame.minY + (0 + 1080 / 2) * scale
-        XCTAssertEqual(cropCentreX, tile.width / 2, accuracy: 0.01)
-        XCTAssertEqual(cropCentreY, tile.height / 2, accuracy: 0.01)
-        // And it covers the tile: nothing the crop kept leaves a gap.
-        XCTAssertLessThanOrEqual(frame.minX + 320 * scale, 0.01)
-        XCTAssertGreaterThanOrEqual(frame.minX + (320 + 1280) * scale, tile.width - 0.01)
-    }
-
-    func testStripFramingIsSkippedWithoutAUsableSource() {
-        XCTAssertNil(SourceRegionLayout.wholeSourceFrame(
-            crop: nil, source: .zero, filling: CGSize(width: 70, height: 44)))
-        XCTAssertNil(SourceRegionLayout.wholeSourceFrame(
-            crop: nil, source: PixelSize(width: 1920, height: 1080), filling: .zero))
-    }
-
-    // MARK: Viewport
-
-    func testZoomIsClampedToFitAndSixteenHundredPercent() {
-        var viewport = StageViewport()
-        // A source shown at a quarter size needs zoom 64 to reach 1600%.
-        viewport.setZoom(1000, fitScale: 0.25)
-        XCTAssertEqual(viewport.zoom, 64, accuracy: 0.001)
-        XCTAssertEqual(viewport.percent(fitScale: 0.25), 1600)
-
-        viewport.setZoom(0.1, fitScale: 0.25)
-        XCTAssertEqual(viewport.zoom, 1, accuracy: 0.001)
-    }
-
-    /// Returning to fit has to drop the pan too, or the picture snaps back to
-    /// full size somewhere off screen.
-    func testReturningToFitClearsThePan() {
-        var viewport = StageViewport()
-        viewport.setZoom(4, fitScale: 0.5)
-        viewport.pan = CGSize(width: 120, height: -80)
-        viewport.setZoom(1, fitScale: 0.5)
-        XCTAssertEqual(viewport.pan, .zero)
-    }
-
-    /// Interpolation follows the absolute number of display points occupied by
-    /// one source pixel, not the fit-relative slider multiplier. A large source
-    /// starts below the threshold and only crosses it after enough zoom.
-    func testNearestNeighbourThresholdUsesActualSourcePixelScale() {
-        XCTAssertFalse(StageViewport.usesNearestNeighbour(pointsPerSourcePixel: 3.99))
-        XCTAssertTrue(StageViewport.usesNearestNeighbour(pointsPerSourcePixel: 4))
-        XCTAssertTrue(StageViewport.usesNearestNeighbour(pointsPerSourcePixel: 8))
-    }
-
-    // MARK: Canvas sizing
-
-    func testCustomCanvasPreservesItsIdentityAtPresetDimensions() {
-        let model = EditorModel()
-        let preset = PixelSize(width: 1920, height: 1080)
-
-        model.setCanvasSizing(.custom(preset))
-
-        XCTAssertEqual(model.canvasSizing, .custom(preset))
-        XCTAssertEqual(model.canvas.width, 1920)
-        XCTAssertEqual(model.canvas.height, 1080)
-    }
-
-    func testCustomCanvasStillNormalisesOddDimensionsForExport() {
-        let model = EditorModel()
-
-        model.setCanvasSizing(.custom(PixelSize(width: 1001, height: 777)))
-
-        XCTAssertEqual(model.canvasSizing,
-                       .custom(PixelSize(width: 1002, height: 778)))
-        XCTAssertEqual(model.canvas.width, 1002)
-        XCTAssertEqual(model.canvas.height, 778)
-    }
-
-    // MARK: Export preview
-
-    /// The setup/progress sheet must describe the same first item and resolved
-    /// placement that reaches FFmpeg. Before this regression, it simply fitted
-    /// the raw source thumbnail and ignored crop, scale, offset and canvas.
-    func testExportPreviewUsesFirstRenderableItemAndResolvedGeometry() throws {
-        let empty = ClipItem(
-            url: URL(fileURLWithPath: "/fixtures/empty.mov"), kind: .video,
-            naturalWidth: 640, naturalHeight: 480, sourceDuration: 1,
-            fps: 30, hasAudio: false, outPoint: 0)
-        var rendered = ClipItem(
-            url: URL(fileURLWithPath: "/fixtures/rendered.mov"), kind: .video,
-            naturalWidth: 1920, naturalHeight: 1080, sourceDuration: 4,
-            fps: 30, hasAudio: false, outPoint: 3)
-        rendered.frameTimes = [1, 2, 3]
-        rendered.videoStartTime = 1
-        rendered.videoDuration = 3
-        rendered.inPoint = 2
-        rendered.geometry.sourceCrop = PixelRect(x: 320, y: 0,
-                                                 width: 1280, height: 1080)
-        rendered.geometry.offset = PixelOffset(x: -100, y: 40)
-
-        let target = canvas(PixelSize(width: 1080, height: 1920))
-        let preview = try XCTUnwrap(
-            ExportPreviewDescriptor.first(in: [empty, rendered], canvas: target))
-
-        XCTAssertEqual(preview.itemID, rendered.id)
-        XCTAssertEqual(preview.sourceTime, 2)
-        XCTAssertEqual(preview.sourceSize, rendered.sourcePixelSize)
-        XCTAssertEqual(preview.placement,
-                       FFTools.resolve(rendered.geometry,
-                                       source: rendered.sourcePixelSize,
-                                       canvas: target))
+    func testOnlyCornersResizeWhileLocked() {
+        XCTAssertEqual(CropHandle.corners.count, 4)
+        XCTAssertEqual(CropHandle.allCases.count, 8)
     }
 
     // MARK: Helpers

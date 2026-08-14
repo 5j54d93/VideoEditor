@@ -19,8 +19,6 @@ struct ContentView: View {
     @AppStorage("showsGeometryInspector") private var showsInspector = false
     @State private var selectAllKey = SelectAllKeyMonitor()
     @State private var viewport = StageViewport()
-    /// Offset at the start of a position drag, in canvas pixels.
-    @State private var positionDragOrigin: PixelOffset?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -138,8 +136,8 @@ struct ContentView: View {
 
     @ViewBuilder
     private var preview: some View {
-        if let mode = model.geometryEditing, let item = model.activeItem {
-            reframingStage(mode, item: item)
+        if model.isGeometryEditing, let item = model.activeItem {
+            reframingStage(item)
         } else {
             playbackPreview
         }
@@ -187,40 +185,39 @@ struct ContentView: View {
 
     // MARK: Reframing
 
-    /// The preview becomes an editing surface. 裁剪來源 shows the whole source
-    /// frame with the crop over it; 畫布位置 shows the canvas composition and
-    /// drags the picture inside it.
+    /// One stage. There used to be two — one showing the source with a crop box,
+    /// one showing the canvas composition — because a crop and a placement were
+    /// separate things. They are one rectangle now, and under the default
+    /// canvas-aspect lock that rectangle *is* the output frame, so there is
+    /// nothing left for a second picture to tell you.
     @ViewBuilder
-    private func reframingStage(_ mode: GeometryEditMode, item: ClipItem) -> some View {
+    private func reframingStage(_ item: ClipItem) -> some View {
         VStack(spacing: 0) {
-            reframingBar(mode, item: item)
+            reframingBar(item)
             Divider().opacity(0.4)
-            Group {
-                switch mode {
-                case .crop:   cropStage(item)
-                case .position: positionStage(item)
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            cropStage(item)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .onChange(of: mode) { _, _ in viewport = StageViewport() }
-        // Deliberately does not reveal the inspector. The stage already carries
-        // the crop readout, the mode switch and the zoom, and forcing the pane
-        // open would write over a stored preference the user set on purpose.
+        // Deliberately does not reveal the inspector. The stage carries the
+        // readout, the presets and the zoom, and forcing the pane open would
+        // write over a stored preference the user set on purpose.
         .onAppear { viewport = StageViewport() }
     }
 
-    private func reframingBar(_ mode: GeometryEditMode, item: ClipItem) -> some View {
-        HStack(spacing: 12) {
-            Picker("", selection: Binding(
-                get: { mode }, set: { model.beginGeometryEditing($0) }
-            )) {
-                Text("裁剪來源").tag(GeometryEditMode.crop)
-                Text("畫布位置").tag(GeometryEditMode.position)
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .frame(width: 180)
+    private func reframingBar(_ item: ClipItem) -> some View {
+        HStack(spacing: 10) {
+            // Presets set the rectangle; they are not modes that stay switched
+            // on. Only fit and fill survive as live framings, because only they
+            // have something worth re-deriving when the canvas changes.
+            Button("完整放入") { model.setFraming(.automatic(.fit), for: item.id) }
+            Button("填滿") { model.setFraming(.automatic(.fill), for: item.id) }
+            Button("原尺寸") { model.setActualSizeFraming(for: item.id) }
+            Button("重設") { model.resetGeometry(for: item.id) }
+                .disabled(item.geometry.isIdentity)
+
+            Divider().frame(height: 16)
+
+            aspectLockMenu(item)
 
             Spacer(minLength: 8)
 
@@ -238,18 +235,55 @@ struct ContentView: View {
             .keyboardShortcut(.defaultAction)
             .fixedSize()                // the way out never gets clipped
         }
+        .font(.callout)
+        .buttonStyle(.link)
         .padding(.horizontal, 12).padding(.vertical, 8)
         .background(Color(white: 0.17))
     }
 
+    private func aspectLockMenu(_ item: ClipItem) -> some View {
+        Menu {
+            Picker("比例", selection: Binding(
+                get: { item.geometry.aspectLock },
+                set: { model.setAspectLock($0, for: item.id) }
+            )) {
+                Text("畫布比例").tag(AspectLock.canvas)
+                Text("9:16").tag(AspectLock.ratio(width: 9, height: 16))
+                Text("1:1").tag(AspectLock.ratio(width: 1, height: 1))
+                Text("4:3").tag(AspectLock.ratio(width: 4, height: 3))
+                Text("16:9").tag(AspectLock.ratio(width: 16, height: 9))
+                Text("原始比例").tag(AspectLock.source)
+                Text("自由").tag(AspectLock.free)
+            }
+            .pickerStyle(.inline)
+            .labelsHidden()
+        } label: {
+            Label(aspectLockLabel(item.geometry.aspectLock),
+                  systemImage: item.geometry.aspectLock == .free ? "lock.open" : "lock")
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("裁剪框的比例限制")
+    }
+
+    private func aspectLockLabel(_ lock: AspectLock) -> String {
+        switch lock {
+        case .canvas: return "畫布比例"
+        case .ratio(let w, let h): return "\(w):\(h)"
+        case .source: return "原始比例"
+        case .free: return "自由"
+        }
+    }
+
     private func cropStage(_ item: ClipItem) -> some View {
-        let source = item.sourcePixelSize
-        let crop = item.geometry.sourceCrop
-            ?? PixelRect(x: 0, y: 0, width: source.width, height: source.height)
-        return CropStage(source: source, crop: crop, viewport: $viewport,
-                         onChange: { model.setSourceCrop($0, for: item.id) },
-                         onGestureBegin: { model.beginGeometryGesture(for: item.id) },
-                         onGestureEnd: { model.endGeometryGesture() }) { scale in
+        CropStage(source: item.sourcePixelSize,
+                  window: model.window(for: item),
+                  canvasAspect: Double(model.canvas.width) / Double(max(1, model.canvas.height)),
+                  lockedAspect: model.lockedAspect(for: item),
+                  viewport: $viewport,
+                  onChange: { model.setFraming(.window($0), for: item.id) },
+                  onGestureBegin: { model.beginGeometryGesture(for: item.id) },
+                  onGestureEnd: { model.endGeometryGesture() }) { scale in
             let usesNearestNeighbour = StageViewport.usesNearestNeighbour(
                 pointsPerSourcePixel: scale)
             if item.isImage {
@@ -268,49 +302,6 @@ struct ContentView: View {
                     interpolation: usesNearestNeighbour ? .none : .high)
             }
         }
-    }
-
-    /// Dragging the picture moves it on the canvas. The dashed outline shows the
-    /// part being pushed off the edge, which is the part you cannot otherwise see.
-    private func positionStage(_ item: ClipItem) -> some View {
-        GeometryReader { geo in
-            // The drag has to undo exactly the mapping the stage drew with, or
-            // the picture lags behind the pointer at anything but 1:1.
-            let scale = CanvasStageLayout.pointsPerCanvasPixel(canvas: model.canvas,
-                                                               in: geo.size)
-            CanvasStage(canvas: model.canvas,
-                        placement: model.placement(for: item),
-                        sourceSize: item.sourcePixelSize,
-                        showsPictureBounds: true) {
-                if item.isImage {
-                    ImagePreview(url: item.url)
-                } else if let player = model.player {
-                    RawPlayerSurface(player: player)
-                }
-            }
-            .contentShape(Rectangle())
-            .gesture(positionDrag(item, pointsPerCanvasPixel: scale))
-        }
-    }
-
-    private func positionDrag(_ item: ClipItem,
-                              pointsPerCanvasPixel scale: CGFloat) -> some Gesture {
-        DragGesture(minimumDistance: 1)
-            .onChanged { value in
-                if positionDragOrigin == nil {
-                    positionDragOrigin = item.geometry.offset
-                    model.beginGeometryGesture(for: item.id)
-                }
-                guard let origin = positionDragOrigin, scale > 0 else { return }
-                model.setGeometryOffset(
-                    PixelOffset(x: origin.x + Int((value.translation.width / scale).rounded()),
-                                y: origin.y + Int((value.translation.height / scale).rounded())),
-                    for: item.id)
-            }
-            .onEnded { _ in
-                positionDragOrigin = nil
-                model.endGeometryGesture()
-            }
     }
 
     /// Stays mounted so the scrub player's layer keeps its last frame and never

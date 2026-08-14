@@ -898,10 +898,8 @@ final class EditorModel {
         item.url = sourceURL
         item.naturalWidth = info.width
         item.naturalHeight = info.height
-        if let crop = item.geometry.sourceCrop {
-            let size = item.sourcePixelSize
-            item.geometry.sourceCrop = crop.snappedToChromaGrid(in: size)
-                .flatMap { $0.coversWholeFrame(of: size) ? nil : $0 }
+        if case .window(let rect) = item.geometry.framing {
+            item.geometry.framing = .window(rect.clampedWindow(in: item.sourcePixelSize))
         }
         item.sourceDuration = info.duration
         item.fps = info.fps
@@ -1716,8 +1714,7 @@ final class EditorModel {
     /// needs are already spoken for: arrows step frames, space plays, Q/W/S cut.
     /// The same `shortcutButtons` gate that stands aside for text entry stands
     /// aside for this.
-    var geometryEditing: GeometryEditMode?
-    var isGeometryEditing: Bool { geometryEditing != nil }
+    var isGeometryEditing = false
 
     /// One undo step per drag, not per pixel. Mirrors the image-duration
     /// slider's session: the snapshot is only pushed once the gesture actually
@@ -1728,15 +1725,15 @@ final class EditorModel {
         hasRegisteredUndo: Bool
     )?
 
-    func beginGeometryEditing(_ mode: GeometryEditMode = .crop) {
+    func beginGeometryEditing() {
         guard activeItem != nil else { return }
         pauseTimelinePlayback()
         clearTimelineHover()
-        geometryEditing = mode
+        isGeometryEditing = true
     }
 
     func endGeometryEditing() {
-        geometryEditing = nil
+        isGeometryEditing = false
         geometryGestureSession = nil
     }
 
@@ -1753,27 +1750,18 @@ final class EditorModel {
         geometryGestureSession = nil
     }
 
-    /// Arrows move by one chroma step, so a nudge always lands somewhere the
-    /// export can reproduce exactly rather than on a coordinate ffmpeg would
-    /// quietly round off.
-    static let geometryNudgeStep = 2
+    /// One pixel. It used to be two, because a 4:2:0 chain rounded odd crop
+    /// coordinates away; composing through yuv444p made the extra pixel of
+    /// precision real, so the arrow keys may finally offer it.
+    static let geometryNudgeStep = 1
 
     func nudgeGeometry(dx: Int, dy: Int, coarse: Bool = false) {
-        guard let mode = geometryEditing, let item = activeItem else { return }
+        guard isGeometryEditing, let item = activeItem else { return }
         let step = Self.geometryNudgeStep * (coarse ? 10 : 1)
-        switch mode {
-        case .crop:
-            let source = item.sourcePixelSize
-            var crop = item.geometry.sourceCrop
-                ?? PixelRect(x: 0, y: 0, width: source.width, height: source.height)
-            crop.x += dx * step
-            crop.y += dy * step
-            setSourceCrop(crop, for: item.id)
-        case .position:
-            setGeometryOffset(PixelOffset(x: item.geometry.offset.x + dx * step,
-                                          y: item.geometry.offset.y + dy * step),
-                              for: item.id)
-        }
+        var window = self.window(for: item)
+        window.x += dx * step
+        window.y += dy * step
+        setFraming(.window(window), for: item.id)
     }
 
     /// Where `item` lands on the canvas. The same resolver export uses, so the
@@ -1819,42 +1807,87 @@ final class EditorModel {
         return PixelSize(width: even(size.width), height: even(size.height))
     }
 
-    func setSourceCrop(_ rect: PixelRect?, for id: ClipItem.ID) {
+    /// The rectangle the user is working with, materialising an automatic
+    /// framing the moment they take hold of it.
+    func window(for item: ClipItem) -> PixelRect {
+        item.geometry.window(source: item.sourcePixelSize,
+                             canvas: PixelSize(width: canvas.width, height: canvas.height))
+    }
+
+    /// The part of the source frame that survives into the output, or `nil` when
+    /// that is all of it. The filmstrip draws from this: the strip is the
+    /// output's index, so pixels the window excludes should not survive there.
+    func visibleSourceRegion(for item: ClipItem) -> PixelRect? {
+        let source = item.sourcePixelSize
+        guard source.isUsable else { return nil }
+        let window = self.window(for: item)
+        let left = max(0, window.x)
+        let top = max(0, window.y)
+        let right = min(source.width, window.x + window.width)
+        let bottom = min(source.height, window.y + window.height)
+        guard right > left, bottom > top else { return nil }
+        let region = PixelRect(x: left, y: top, width: right - left, height: bottom - top)
+        return region.coversWholeFrame(of: source) ? nil : region
+    }
+
+    /// The single geometry setter. Four of these used to exist — a crop, a fit
+    /// mode, a magnification and an offset — all describing one rectangle.
+    func setFraming(_ framing: ClipFraming, for id: ClipItem.ID) {
         updateGeometry(for: id) { geometry, source in
-            guard let rect else { geometry.sourceCrop = nil; return }
-            guard let snapped = rect.snappedToChromaGrid(in: source) else { return }
-            geometry.sourceCrop = snapped.coversWholeFrame(of: source) ? nil : snapped
+            switch framing {
+            case .automatic:
+                geometry.framing = framing
+            case .window(let rect):
+                let clamped = rect.clampedWindow(in: source)
+                // A window that happens to be exactly the default framing is
+                // stored as the default, so `isIdentity` — and with it the
+                // byte-for-byte export guarantee — can still be reached by hand.
+                geometry.framing = .window(clamped)
+            }
         }
     }
 
-    func setFitMode(_ fit: FitMode, for id: ClipItem.ID) {
-        updateGeometry(for: id) { geometry, _ in geometry.fit = fit }
+    func setAspectLock(_ lock: AspectLock, for id: ClipItem.ID) {
+        updateGeometry(for: id) { geometry, _ in geometry.aspectLock = lock }
     }
 
-    func setGeometryScale(_ scale: Double, for id: ClipItem.ID) {
-        updateGeometry(for: id) { geometry, _ in
-            geometry.scale = min(max(0.05, scale), 8)
+    /// The aspect ratio a drag is constrained to, as a width/height fraction.
+    /// `nil` means unconstrained.
+    func lockedAspect(for item: ClipItem) -> Double? {
+        switch item.geometry.aspectLock {
+        case .free:
+            return nil
+        case .canvas:
+            return Double(canvas.width) / Double(max(1, canvas.height))
+        case .ratio(let w, let h):
+            return Double(w) / Double(max(1, h))
+        case .source:
+            let size = item.sourcePixelSize
+            guard size.isUsable else { return nil }
+            return Double(size.width) / Double(size.height)
         }
     }
 
-    func setGeometryOffset(_ offset: PixelOffset, for id: ClipItem.ID) {
-        updateGeometry(for: id) { [canvas] geometry, _ in
-            // Keep a nudge from throwing the picture off the canvas entirely.
-            // Export would paint the segment black, which is never what a drag
-            // that overshot by a few pixels meant.
-            geometry.offset = PixelOffset(
-                x: min(max(-canvas.width, offset.x), canvas.width),
-                y: min(max(-canvas.height, offset.y), canvas.height))
-        }
+    /// 原尺寸: a canvas-sized window centred on the source, so the picture is
+    /// neither enlarged nor reduced. Unlike fit and fill this is materialised
+    /// rather than kept live — there is nothing about it worth re-deriving when
+    /// the canvas changes.
+    func setActualSizeFraming(for id: ClipItem.ID) {
+        guard let item = items.first(where: { $0.id == id }) else { return }
+        let source = item.sourcePixelSize
+        let window = PixelRect(x: (source.width - canvas.width) / 2,
+                               y: (source.height - canvas.height) / 2,
+                               width: canvas.width, height: canvas.height)
+        setFraming(.window(window), for: id)
     }
 
     func resetGeometry(for id: ClipItem.ID) {
         updateGeometry(for: id) { geometry, _ in geometry = ClipGeometry() }
     }
 
-    /// Copy one clip's framing onto every other clip. The crop is expressed in
-    /// source pixels, so it is re-snapped against each target's own frame size
-    /// rather than assumed to fit.
+    /// Copy one clip's framing onto every other clip. An explicit window is in
+    /// source pixels, so it is re-clamped against each target's own frame rather
+    /// than assumed to fit.
     func applyGeometryToAllItems(from id: ClipItem.ID) {
         guard let source = items.first(where: { $0.id == id })?.geometry else { return }
         guard items.count > 1 else { return }
@@ -1862,10 +1895,8 @@ final class EditorModel {
         registerUndo()
         for index in items.indices where items[index].id != id {
             var geometry = source
-            if let crop = source.sourceCrop {
-                let size = items[index].sourcePixelSize
-                geometry.sourceCrop = crop.snappedToChromaGrid(in: size)
-                    .flatMap { $0.coversWholeFrame(of: size) ? nil : $0 }
+            if case .window(let rect) = source.framing {
+                geometry.framing = .window(rect.clampedWindow(in: items[index].sourcePixelSize))
             }
             items[index].geometry = geometry
         }

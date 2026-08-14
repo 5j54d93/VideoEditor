@@ -3,8 +3,10 @@
 //  VideoEditor
 //
 //  The 版面 pane: canvas size for the project, framing for the selected clip.
-//  Numeric entry only — dragging the picture around in the preview comes later,
-//  and the numbers stay the way to commit an exact value regardless.
+//  The framing is one rectangle — which part of the source the canvas shows —
+//  so this is four numbers rather than the four separate concepts it replaced.
+//  Dragging happens in the preview; the numbers remain how an exact value gets
+//  committed.
 //
 
 import SwiftUI
@@ -25,9 +27,8 @@ struct GeometryInspector: View {
                     if let item = model.activeItem {
                         Divider()
                         reframeButton(item)
-                        fitSection(item)
-                        cropSection(item)
-                        placementSection(item)
+                        framingSection(item)
+                        windowSection(item)
                     } else {
                         Divider()
                         Text("選取時間軸上的片段以調整它的裁剪與位置")
@@ -140,102 +141,91 @@ struct GeometryInspector: View {
                 .frame(maxWidth: .infinity)
         }
         .controlSize(.large)
-        .help("在預覽區直接拖曳裁剪框與畫面位置（C）")
+        .help("在預覽區直接拖曳畫面範圍（C）")
     }
 
-    private func fitSection(_ item: ClipItem) -> some View {
+    private func framingSection(_ item: ClipItem) -> some View {
         VStack(alignment: .leading, spacing: 7) {
-            SectionLabel("縮放方式")
-            Picker("縮放方式", selection: Binding(
-                get: { item.geometry.fit },
-                set: { model.setFitMode($0, for: item.id) }
-            )) {
-                Text("完整放入").tag(FitMode.contain)
-                Text("填滿").tag(FitMode.cover)
-                Text("原尺寸").tag(FitMode.actual)
+            SectionLabel("構圖")
+            // Presets set the rectangle rather than switching on a mode. Only
+            // fit and fill stay live, because only they have anything worth
+            // re-deriving when the canvas changes shape.
+            HStack(spacing: 6) {
+                Button("完整放入") { model.setFraming(.automatic(.fit), for: item.id) }
+                Button("填滿") { model.setFraming(.automatic(.fill), for: item.id) }
+                Button("原尺寸") { model.setActualSizeFraming(for: item.id) }
             }
-            .pickerStyle(.segmented)
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+
+            SectionLabel("比例")
+            Picker("比例", selection: Binding(
+                get: { item.geometry.aspectLock },
+                set: { model.setAspectLock($0, for: item.id) }
+            )) {
+                Text("畫布比例").tag(AspectLock.canvas)
+                Text("9:16").tag(AspectLock.ratio(width: 9, height: 16))
+                Text("1:1").tag(AspectLock.ratio(width: 1, height: 1))
+                Text("4:3").tag(AspectLock.ratio(width: 4, height: 3))
+                Text("16:9").tag(AspectLock.ratio(width: 16, height: 9))
+                Text("原始比例").tag(AspectLock.source)
+                Text("自由").tag(AspectLock.free)
+            }
             .labelsHidden()
         }
     }
 
-    private func cropSection(_ item: ClipItem) -> some View {
+    /// One rectangle: which part of the source the canvas shows. It replaced a
+    /// crop, a fit mode, a magnification and an offset, which were all
+    /// describing this rectangle's position and size.
+    private func windowSection(_ item: ClipItem) -> some View {
         let source = item.sourcePixelSize
-        let crop = item.geometry.sourceCrop
-            ?? PixelRect(x: 0, y: 0, width: source.width, height: source.height)
+        let window = model.window(for: item)
         return VStack(alignment: .leading, spacing: 7) {
-            SectionLabel("裁剪來源（像素）")
+            SectionLabel("畫面範圍（來源像素）")
             if source.isUsable {
                 Grid(horizontalSpacing: 6, verticalSpacing: 6) {
                     GridRow {
-                        PixelField(label: "寬", value: crop.width, range: 2...source.width) {
-                            var updated = crop; updated.width = $0
-                            model.setSourceCrop(updated, for: item.id)
-                            return model.items.first { $0.id == item.id }?.geometry.sourceCrop?.width
-                                ?? source.width
+                        PixelField(label: "寬", value: window.width, range: 2...(source.width * 4)) {
+                            var updated = window; updated.width = $0
+                            model.setFraming(.window(updated), for: item.id)
+                            return model.items.first { $0.id == item.id }
+                                .map { model.window(for: $0).width } ?? window.width
                         } onFocusChange: { model.isTextEditing = $0 }
-                        PixelField(label: "高", value: crop.height, range: 2...source.height) {
-                            var updated = crop; updated.height = $0
-                            model.setSourceCrop(updated, for: item.id)
-                            return model.items.first { $0.id == item.id }?.geometry.sourceCrop?.height
-                                ?? source.height
+                        PixelField(label: "高", value: window.height, range: 2...(source.height * 4)) {
+                            var updated = window; updated.height = $0
+                            model.setFraming(.window(updated), for: item.id)
+                            return model.items.first { $0.id == item.id }
+                                .map { model.window(for: $0).height } ?? window.height
                         } onFocusChange: { model.isTextEditing = $0 }
                     }
                     GridRow {
-                        PixelField(label: "X", value: crop.x, range: 0...max(0, source.width - 2)) {
-                            var updated = crop; updated.x = $0
-                            model.setSourceCrop(updated, for: item.id)
-                            return model.items.first { $0.id == item.id }?.geometry.sourceCrop?.x ?? 0
+                        // The window may start outside the frame; that is how a
+                        // deliberate letterbox is expressed.
+                        PixelField(label: "X", value: window.x,
+                                   range: -source.width...source.width) {
+                            var updated = window; updated.x = $0
+                            model.setFraming(.window(updated), for: item.id)
+                            return model.items.first { $0.id == item.id }
+                                .map { model.window(for: $0).x } ?? window.x
                         } onFocusChange: { model.isTextEditing = $0 }
-                        PixelField(label: "Y", value: crop.y, range: 0...max(0, source.height - 2)) {
-                            var updated = crop; updated.y = $0
-                            model.setSourceCrop(updated, for: item.id)
-                            return model.items.first { $0.id == item.id }?.geometry.sourceCrop?.y ?? 0
+                        PixelField(label: "Y", value: window.y,
+                                   range: -source.height...source.height) {
+                            var updated = window; updated.y = $0
+                            model.setFraming(.window(updated), for: item.id)
+                            return model.items.first { $0.id == item.id }
+                                .map { model.window(for: $0).y } ?? window.y
                         } onFocusChange: { model.isTextEditing = $0 }
                     }
                 }
-                Text(verbatim: "來源 \(source.width)×\(source.height)．座標吸附偶數")
+                Text(verbatim: "來源 \(source.width)×\(source.height)")
                     .font(.caption).foregroundStyle(.tertiary).monospacedDigit()
+                if let note = upscaleNote(item) {
+                    Text(note).font(.caption).foregroundStyle(.tertiary)
+                }
             } else {
-                Text("這個素材沒有回報畫面尺寸，無法裁剪")
+                Text("這個素材沒有回報畫面尺寸，無法調整構圖")
                     .font(.caption).foregroundStyle(.tertiary)
-            }
-        }
-    }
-
-    private func placementSection(_ item: ClipItem) -> some View {
-        VStack(alignment: .leading, spacing: 7) {
-            SectionLabel("畫布位置")
-            HStack(spacing: 6) {
-                PixelField(label: "位移 X", value: item.geometry.offset.x,
-                           range: -model.canvas.width...model.canvas.width) {
-                    model.setGeometryOffset(PixelOffset(x: $0, y: item.geometry.offset.y),
-                                            for: item.id)
-                    return model.items.first { $0.id == item.id }?.geometry.offset.x
-                        ?? item.geometry.offset.x
-                } onFocusChange: { model.isTextEditing = $0 }
-                PixelField(label: "位移 Y", value: item.geometry.offset.y,
-                           range: -model.canvas.height...model.canvas.height) {
-                    model.setGeometryOffset(PixelOffset(x: item.geometry.offset.x, y: $0),
-                                            for: item.id)
-                    return model.items.first { $0.id == item.id }?.geometry.offset.y
-                        ?? item.geometry.offset.y
-                } onFocusChange: { model.isTextEditing = $0 }
-            }
-
-            SectionLabel("畫面縮放（輸出，非檢視）")
-            HStack(spacing: 10) {
-                Slider(value: Binding(
-                    get: { item.geometry.scale },
-                    set: { model.setGeometryScale($0, for: item.id) }
-                ), in: 0.05...4)
-                Text(String(format: "%.0f%%", item.geometry.scale * 100))
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 44, alignment: .trailing)
-            }
-            if let note = upscaleNote(item) {
-                Text(note).font(.caption).foregroundStyle(.tertiary)
             }
         }
     }
@@ -244,8 +234,8 @@ struct GeometryInspector: View {
     /// loud — it is the one framing choice that costs picture quality.
     private func upscaleNote(_ item: ClipItem) -> String? {
         guard let placement = model.placement(for: item) else { return nil }
-        let source = item.geometry.sourceCrop?.size ?? item.sourcePixelSize
-        guard source.isUsable, placement.scaledSize.width > source.width else { return nil }
+        let window = model.window(for: item)
+        guard window.width > 0, placement.scaledSize.width > window.width else { return nil }
         return "放大到來源像素之上，畫面會變糊"
     }
 

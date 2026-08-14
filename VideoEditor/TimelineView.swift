@@ -785,12 +785,12 @@ private struct TimelineClipView: View {
         if item.isImage {
             TimelineImageStrip(url: item.url,
                                source: item.sourcePixelSize,
-                               crop: item.geometry.sourceCrop)
+                               crop: model.visibleSourceRegion(for: item))
         } else {
             TimelineVideoStrip(
                 itemID: item.id,
                 source: item.sourcePixelSize,
-                crop: item.geometry.sourceCrop,
+                crop: model.visibleSourceRegion(for: item),
                 sourceRevision: model.videoSourceRevision(for: item.url),
                 thumbnailer: model.thumbnailer(for: item.url),
                 grid: item.grid,

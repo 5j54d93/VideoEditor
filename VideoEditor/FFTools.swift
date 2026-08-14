@@ -365,31 +365,92 @@ struct FFTools: Sendable {
                                     source: PixelSize,
                                     canvas: CanvasSpec) -> Placement {
         let bounds = PixelSize(width: canvas.width, height: canvas.height)
-        let cropped = geometry.sourceCrop?.size ?? source
-        var size = fitted(cropped, in: bounds, mode: geometry.fit)
-        if geometry.scale != 1 {
-            size = PixelSize(
-                width: max(1, roundHalfAwayFromZero(Double(size.width) * geometry.scale)),
-                height: max(1, roundHalfAwayFromZero(Double(size.height) * geometry.scale)))
+        switch geometry.framing {
+        case .automatic(let mode):
+            // Deliberately not routed through the window arithmetic below.
+            // Deriving the scaled size from a rectangle rounds differently from
+            // `av_rescale`, and a project nobody has reframed has to keep
+            // exporting the bytes it always did.
+            return place(sourceCrop: nil,
+                         scaledSize: fitted(source, in: bounds, mode: mode),
+                         in: bounds)
+        case .window(let window):
+            return resolveWindow(window, source: source, bounds: bounds)
         }
+    }
 
+    /// A user-placed window: the region of the source the canvas shows.
+    ///
+    /// The window is *fitted* into the canvas rather than stretched onto it, so
+    /// a window whose aspect ratio differs from the canvas letterboxes instead
+    /// of distorting. Under the default canvas-aspect lock the two match and it
+    /// fills exactly.
+    private nonisolated static func resolveWindow(_ window: PixelRect,
+                                                  source: PixelSize,
+                                                  bounds: PixelSize) -> Placement {
+        // Only the part of the window that has pixels behind it can be cropped;
+        // the rest of the window is the black the user asked for.
+        let left = max(0, window.x)
+        let top = max(0, window.y)
+        let right = min(source.width, window.x + window.width)
+        let bottom = min(source.height, window.y + window.height)
+        guard window.width > 0, window.height > 0, right > left, bottom > top else {
+            return Placement(sourceCrop: nil, scaledSize: bounds,
+                             visibleCrop: nil, padOrigin: .zero, isFullyOffCanvas: true)
+        }
+        let crop = PixelRect(x: left, y: top, width: right - left, height: bottom - top)
+
+        // One factor for both axes: the window keeps its shape, and so does the
+        // picture inside it.
+        var windowOnCanvas = fitted(window.size, in: bounds, mode: .fit)
+        // A window locked to the canvas ratio often cannot express it exactly in
+        // whole pixels — 607×1080 against 9:16 fits as 1079 wide — and the
+        // leftover would be a one-pixel black hairline down one edge. Within a
+        // pixel, take the canvas: 0.1% of aspect error is invisible, a black
+        // line is not.
+        if abs(windowOnCanvas.width - bounds.width) <= 1 {
+            windowOnCanvas.width = bounds.width
+        }
+        if abs(windowOnCanvas.height - bounds.height) <= 1 {
+            windowOnCanvas.height = bounds.height
+        }
+        let cropWidth = rescale(windowOnCanvas.width, crop.width, window.width)
+        let cropHeight = rescale(windowOnCanvas.height, crop.height, window.height)
+        let scaled = PixelSize(width: max(1, cropWidth), height: max(1, cropHeight))
+
+        // Where the window itself sits, then where the cropped part sits in it.
+        let windowOrigin = PixelOffset(x: (bounds.width - windowOnCanvas.width) / 2,
+                                       y: (bounds.height - windowOnCanvas.height) / 2)
+        let origin = PixelOffset(
+            x: windowOrigin.x + rescale(windowOnCanvas.width, crop.x - window.x, window.width),
+            y: windowOrigin.y + rescale(windowOnCanvas.height, crop.y - window.y, window.height))
+
+        return place(sourceCrop: crop, scaledSize: scaled, at: origin, in: bounds)
+    }
+
+    /// Clip a scaled picture against the canvas. `origin` defaults to centred,
+    /// which is what every automatic framing wants.
+    private nonisolated static func place(sourceCrop: PixelRect?,
+                                          scaledSize size: PixelSize,
+                                          at origin: PixelOffset? = nil,
+                                          in bounds: PixelSize) -> Placement {
         // Truncating division matches how pad evaluates `(ow-iw)/2` and casts.
-        let originX = (bounds.width - size.width) / 2 + geometry.offset.x
-        let originY = (bounds.height - size.height) / 2 + geometry.offset.y
+        let originX = origin?.x ?? (bounds.width - size.width) / 2
+        let originY = origin?.y ?? (bounds.height - size.height) / 2
 
         let left = max(0, originX)
         let top = max(0, originY)
         let right = min(bounds.width, originX + size.width)
         let bottom = min(bounds.height, originY + size.height)
         guard right > left, bottom > top else {
-            return Placement(sourceCrop: geometry.sourceCrop, scaledSize: size,
+            return Placement(sourceCrop: sourceCrop, scaledSize: size,
                              visibleCrop: nil, padOrigin: .zero, isFullyOffCanvas: true)
         }
 
         let visible = PixelRect(x: left - originX, y: top - originY,
                                 width: right - left, height: bottom - top)
         let whole = PixelRect(x: 0, y: 0, width: size.width, height: size.height)
-        return Placement(sourceCrop: geometry.sourceCrop,
+        return Placement(sourceCrop: sourceCrop,
                          scaledSize: size,
                          visibleCrop: visible == whole ? nil : visible,
                          padOrigin: PixelOffset(x: left, y: top),
@@ -398,12 +459,11 @@ struct FFTools: Sendable {
 
     /// ffmpeg's own `force_original_aspect_ratio` arithmetic, in integers.
     private nonisolated static func fitted(_ source: PixelSize, in canvas: PixelSize,
-                                           mode: FitMode) -> PixelSize {
+                                           mode: AutoFraming) -> PixelSize {
         guard source.isUsable else { return canvas }
-        if mode == .actual { return source }
         let widthAtCanvasHeight = rescale(canvas.height, source.width, source.height)
         let heightAtCanvasWidth = rescale(canvas.width, source.height, source.width)
-        return mode == .contain
+        return mode == .fit
             ? PixelSize(width: min(widthAtCanvasHeight, canvas.width),
                         height: min(heightAtCanvasWidth, canvas.height))
             : PixelSize(width: max(widthAtCanvasHeight, canvas.width),
