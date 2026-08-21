@@ -232,10 +232,6 @@ struct CropStage<Content: View>: View {
     private let handleHitSize: CGFloat = 24
     /// How wide the grab strip along each edge is, centred on the line.
     private let edgeGrabWidth: CGFloat = 16
-    /// How thick the lit-up edge under the pointer is drawn. Fixed in screen
-    /// space: it answers "this line is grabbable", which is a question about the
-    /// pointer, not about the picture.
-    private let highlightWidth: CGFloat = 3
     /// How close to the pane edge a drag has to get before the view follows.
     private let autoPanMargin: CGFloat = 46
     /// Screen-space distance within which an edge is pulled onto a guide.
@@ -243,8 +239,6 @@ struct CropStage<Content: View>: View {
 
     @State private var dragOrigin: PixelRect?
     @State private var isDragging = false
-    /// Which edge or corner the pointer is over, so it can be lit up.
-    @State private var hoveredHandle: CropHandle?
     /// Dash offset of the selection border, animated forever while the stage is
     /// up. It is the one moving thing on the stage, and what it says is that the
     /// rectangle is a live selection rather than part of the picture.
@@ -299,7 +293,6 @@ struct CropStage<Content: View>: View {
                 }
                 outline(windowRect, scale: scale)
                 grips(windowRect, in: geo.size)
-                hoverHighlight(windowRect, scale: scale)
                 if isDragging {
                     thirds(windowRect)
                     snapGuides(picture: picture, scale: scale, size: geo.size)
@@ -637,7 +630,7 @@ struct CropStage<Content: View>: View {
                     .contentShape(Rectangle())
                     .frame(width: strip.width, height: strip.height)
                     .placed(at: strip.origin, in: pane)
-                    .targeting(handle, cursor: handle.cursor, hovered: $hoveredHandle)
+                    .pointingCursor(handle.cursor)
                     .gesture(resizeGesture(handle, scale: scale, pane: pane))
             }
         }
@@ -648,7 +641,7 @@ struct CropStage<Content: View>: View {
                     .contentShape(Rectangle())
                     .frame(width: box.width, height: box.height)
                     .placed(at: box.origin, in: pane)
-                    .targeting(handle, cursor: handle.cursor, hovered: $hoveredHandle)
+                    .pointingCursor(handle.cursor)
                     .gesture(resizeGesture(handle, scale: scale, pane: pane))
             }
         }
@@ -679,6 +672,12 @@ struct CropStage<Content: View>: View {
     ///
     /// Drawn separately from the hit areas, at the true positions: trimming a
     /// hit area to the pane must not drag its drawing along with it.
+    ///
+    /// These and the resize cursor are the whole of the answer to "can I grab
+    /// this?". A hovered edge also used to light up under a 3pt bar of flat
+    /// white running its full length — which, magnified, is a solid rule from
+    /// one end of the stage to the other, laid down the moment the pointer
+    /// approaches the edge, over the one part of the picture the zoom was for.
     private func grips(_ rect: CGRect, in pane: CGSize) -> some View {
         ForEach(CropHandle.allCases, id: \.self) { handle in
             Rectangle()
@@ -754,31 +753,6 @@ struct CropStage<Content: View>: View {
             handle.resize(origin, dx: dx, dy: dy,
                           lockedAspect: effectiveAspect(origin, modifiers: mods),
                           fromCentre: mods.contains(.option))
-        }
-    }
-
-    /// The edge under the pointer, lit up. Without it the only feedback that an
-    /// edge is live is the cursor, which is a very small thing to notice.
-    @ViewBuilder
-    private func hoverHighlight(_ rect: CGRect, scale: CGFloat) -> some View {
-        if let hoveredHandle, !hoveredHandle.isCorner {
-            let strip = edgeStrip(hoveredHandle, in: rect)
-            let horizontal = hoveredHandle == .top || hoveredHandle == .bottom
-            // Alongside the border, on the discarded side, rather than straddling
-            // the edge. This is the thickest thing on the stage at 3pt, and
-            // centred on the boundary it swallowed a source pixel and more of
-            // them the further in you zoomed — over exactly the edge it was
-            // pointing at.
-            let width = StageViewport.borderWidth(pointsPerSourcePixel: scale)
-            let outward: CGFloat = hoveredHandle == .top || hoveredHandle == .left ? -1 : 1
-            let offset = outward * (highlightWidth / 2 + width)
-            Rectangle()
-                .fill(.white)
-                .frame(width: horizontal ? strip.width : highlightWidth,
-                       height: horizontal ? highlightWidth : strip.height)
-                .position(x: strip.midX + (horizontal ? 0 : offset),
-                          y: strip.midY + (horizontal ? offset : 0))
-                .allowsHitTesting(false)
         }
     }
 
@@ -1098,23 +1072,6 @@ extension View {
     func pointingCursor(_ cursor: NSCursor) -> some View {
         onHover { inside in
             if inside { cursor.set() } else { NSCursor.arrow.set() }
-        }
-    }
-
-    /// Cursor plus a record of which handle is under the pointer, kept together
-    /// so the two can never disagree about what is being aimed at.
-    func targeting(_ handle: CropHandle, cursor: NSCursor,
-                   hovered: Binding<CropHandle?>) -> some View {
-        onHover { inside in
-            if inside {
-                hovered.wrappedValue = handle
-                cursor.set()
-            } else {
-                // Only stand down if nothing else has claimed the pointer in
-                // the meantime — leaving an overlap fires exit after entry.
-                if hovered.wrappedValue == handle { hovered.wrappedValue = nil }
-                NSCursor.arrow.set()
-            }
         }
     }
 }
