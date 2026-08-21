@@ -165,36 +165,47 @@ struct CropWorkspace<Picture: View>: View {
 
     // MARK: Clip rail
 
+    /// The tiles *are* the control. A pair of 上一段／下一段 buttons used to sit at
+    /// the right of this rail, offering a slower way to reach a clip that was
+    /// already on screen and asking the eye to leave the pictures to use it.
     private var clipRail: some View {
-        HStack(spacing: 10) {
+        ScrollViewReader { rail in
             ScrollView(.horizontal) {
                 HStack(spacing: 7) {
                     ForEach(model.items) { clip in
-                        CropClipTile(model: model, clip: clip, isActive: clip.id == item.id)
-                            .onTapGesture { model.retargetGeometryEditing(to: clip.id) }
-                            .id(clip.id)
+                        CropClipTile(model: model, clip: clip, isActive: clip.id == item.id) {
+                            model.retargetGeometryEditing(to: clip.id)
+                        }
+                        .id(clip.id)
                     }
                 }
                 .padding(.vertical, 1)
             }
             .scrollIndicators(.never)
-
-            Divider().frame(height: 22)
-            Button { model.stepGeometryTarget(by: -1) } label: {
-                HStack(spacing: 4) { Text("上一段"); KeyCapHint("[") }
+            // With no buttons to walk the rail, the rail has to walk itself:
+            // the clip being reframed must stay visible whether it was reached
+            // by a key, by the timeline, or by entering the mode part-way in.
+            .onAppear { rail.scrollTo(item.id, anchor: .center) }
+            .onChange(of: item.id) { _, id in
+                withAnimation(.snappy(duration: 0.2)) { rail.scrollTo(id, anchor: .center) }
             }
-            .keyboardShortcut("[", modifiers: [])
-            .disabled(model.geometryNeighbour(-1) == nil)
-            Button { model.stepGeometryTarget(by: 1) } label: {
-                HStack(spacing: 4) { Text("下一段"); KeyCapHint("]") }
-            }
-            .keyboardShortcut("]", modifiers: [])
-            .disabled(model.geometryNeighbour(1) == nil)
         }
-        .font(.caption)
-        .buttonStyle(.link)
         .padding(.horizontal, 14).padding(.vertical, 9)
         .background(Color(white: 0.10))
+        // [ and ] survive the buttons that used to carry them: a key equivalent
+        // costs nothing on screen, and a hand already on the keyboard for ⌥←
+        // should not have to reach for the mouse to change clip.
+        .background {
+            ZStack {
+                Button("上一段") { model.stepGeometryTarget(by: -1) }
+                    .keyboardShortcut("[", modifiers: [])
+                Button("下一段") { model.stepGeometryTarget(by: 1) }
+                    .keyboardShortcut("]", modifiers: [])
+            }
+            .opacity(0)
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+        }
     }
 }
 
@@ -471,28 +482,44 @@ private struct CropClipTile: View {
     let model: EditorModel
     let clip: ClipItem
     let isActive: Bool
+    let select: () -> Void
+
+    @State private var hovering = false
 
     private static let size = CGSize(width: 82, height: 48)
 
     var body: some View {
-        ZStack(alignment: .bottomTrailing) {
-            thumbnail
-                .frame(width: Self.size.width, height: Self.size.height)
-                .clipShape(RoundedRectangle(cornerRadius: 4))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 4)
-                        .stroke(isActive ? .white : .white.opacity(0.12),
-                                lineWidth: isActive ? 1.5 : 1)
+        // A real button rather than a tap gesture: the tile is now the only way
+        // to change clip with the mouse, so it owes the pointer a lit edge on
+        // hover and VoiceOver a control it can actually press.
+        Button(action: select) {
+            ZStack(alignment: .bottomTrailing) {
+                thumbnail
+                    .frame(width: Self.size.width, height: Self.size.height)
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 4)
+                            .stroke(border, lineWidth: isActive ? 1.5 : 1)
+                    }
+                // Which clips have already been reframed is the whole question
+                // when walking a project, and it is exactly what `isIdentity`
+                // answers.
+                if !clip.geometry.isIdentity {
+                    Circle().fill(.white).frame(width: 5, height: 5).padding(5)
                 }
-            // Which clips have already been reframed is the whole question when
-            // walking a project, and it is exactly what `isIdentity` answers.
-            if !clip.geometry.isIdentity {
-                Circle().fill(.white).frame(width: 5, height: 5).padding(5)
             }
+            .contentShape(RoundedRectangle(cornerRadius: 4))
         }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
         .help(clip.url.lastPathComponent)
         .accessibilityLabel("\(clip.url.lastPathComponent)"
                             + (clip.geometry.isIdentity ? "" : "，已調整構圖"))
+        .accessibilityAddTraits(isActive ? [.isButton, .isSelected] : [.isButton])
+    }
+
+    private var border: Color {
+        isActive ? .white : .white.opacity(hovering ? 0.5 : 0.12)
     }
 
     @ViewBuilder

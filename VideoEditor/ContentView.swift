@@ -382,10 +382,11 @@ struct ContentView: View {
             }.keyboardShortcut(.delete, modifiers: [])
 
             Button("") { model.toggleGeometryEditing() }.keyboardShortcut("c", modifiers: [])
-            // Esc, Return, ⌥-arrows and the bracket keys are registered on the
-            // workspace's own visible buttons instead of here. They only mean
-            // anything while it is up, and a real button carries a key
-            // equivalent more reliably than a hidden zero-sized one.
+            // Esc, Return and the ⌥-arrows are registered on the workspace's
+            // own visible buttons instead of here — they only mean anything
+            // while it is up, and a real button carries a key equivalent more
+            // reliably than a hidden one. The bracket keys sit beside its clip
+            // rail, which has tiles to click and no buttons left to hang them on.
         }
         .disabled(model.isTextEditing)   // don't fire single-key shortcuts while typing a time
         .opacity(0).frame(width: 0, height: 0).accessibilityHidden(true)
