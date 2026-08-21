@@ -378,14 +378,12 @@ struct FFTools: Sendable {
                                     canvas: CanvasSpec) -> Placement {
         let bounds = PixelSize(width: canvas.width, height: canvas.height)
         switch geometry.framing {
-        case .automatic(let mode):
+        case .wholeFrame:
             // Deliberately not routed through the window arithmetic below.
             // Deriving the scaled size from a rectangle rounds differently from
             // `av_rescale`, and a project nobody has reframed has to keep
             // exporting the bytes it always did.
-            return place(sourceCrop: nil,
-                         scaledSize: fitted(source, in: bounds, mode: mode),
-                         in: bounds)
+            return place(sourceCrop: nil, scaledSize: contained(source, in: bounds), in: bounds)
         case .window(let window):
             return resolveWindow(window, source: source, bounds: bounds)
         }
@@ -414,7 +412,7 @@ struct FFTools: Sendable {
 
         // One factor for both axes: the window keeps its shape, and so does the
         // picture inside it.
-        var windowOnCanvas = fitted(window.size, in: bounds, mode: .fit)
+        var windowOnCanvas = contained(window.size, in: bounds)
         // A window locked to the canvas ratio often cannot express it exactly in
         // whole pixels — 607×1080 against 9:16 fits as 1079 wide — and the
         // leftover would be a one-pixel black hairline down one edge. Within a
@@ -469,17 +467,15 @@ struct FFTools: Sendable {
                          isFullyOffCanvas: false)
     }
 
-    /// ffmpeg's own `force_original_aspect_ratio` arithmetic, in integers.
-    private nonisolated static func fitted(_ source: PixelSize, in canvas: PixelSize,
-                                           mode: AutoFraming) -> PixelSize {
+    /// ffmpeg's own `force_original_aspect_ratio=decrease` arithmetic, in
+    /// integers. The `increase` half went with the fill mode that used it.
+    private nonisolated static func contained(_ source: PixelSize,
+                                              in canvas: PixelSize) -> PixelSize {
         guard source.isUsable else { return canvas }
         let widthAtCanvasHeight = rescale(canvas.height, source.width, source.height)
         let heightAtCanvasWidth = rescale(canvas.width, source.height, source.width)
-        return mode == .fit
-            ? PixelSize(width: min(widthAtCanvasHeight, canvas.width),
-                        height: min(heightAtCanvasWidth, canvas.height))
-            : PixelSize(width: max(widthAtCanvasHeight, canvas.width),
-                        height: max(heightAtCanvasWidth, canvas.height))
+        return PixelSize(width: min(widthAtCanvasHeight, canvas.width),
+                         height: min(heightAtCanvasWidth, canvas.height))
     }
 
     /// `av_rescale` with `AV_ROUND_NEAR_INF`: `(a·b + c/2) / c`, all integer.

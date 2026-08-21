@@ -30,6 +30,37 @@ final class EditorModelTimelineTests: XCTestCase {
                       "The slider ticks must not displace the preceding insert undo step")
     }
 
+    /// The output frame is the crop, with nothing in between. This is the whole
+    /// point of dropping the canvas: what you frame is what the file is.
+    func testOutputFrameIsTheFirstClipsCrop() throws {
+        let image = LibraryAsset(url: URL(fileURLWithPath: "/fixtures/still.png"),
+                                 kind: .image, width: 1920, height: 1080)
+        let model = EditorModel()
+        model.library = [image]
+        model.insertLibraryAsset(image.id)
+        let itemID = model.items[0].id
+
+        // Untouched, the output is the whole frame.
+        XCTAssertEqual(model.canvas.width, 1920)
+        XCTAssertEqual(model.canvas.height, 1080)
+
+        // Crop to an odd, deliberately awkward rectangle: the file follows it
+        // exactly rather than being rounded to an even size or fitted onto a
+        // canvas of somebody else's choosing.
+        model.setFraming(.window(PixelRect(x: 300, y: 40, width: 615, height: 820)),
+                         for: itemID)
+        XCTAssertEqual(model.canvas.width, 615)
+        XCTAssertEqual(model.canvas.height, 820)
+        XCTAssertTrue(model.canvas.hasOddDimension)
+
+        // And the placement crops without scaling or padding: no black anywhere.
+        let placement = try XCTUnwrap(model.placement(for: model.items[0]))
+        XCTAssertEqual(placement.sourceCrop,
+                       PixelRect(x: 300, y: 40, width: 615, height: 820))
+        XCTAssertEqual(placement.scaledSize, PixelSize(width: 615, height: 820))
+        XCTAssertEqual(placement.padOrigin, .zero)
+    }
+
     func testTimelineIndexStaysCorrectAfterInsertTrimAndReorder() throws {
         let firstImage = LibraryAsset(
             url: URL(fileURLWithPath: "/fixtures/first.png"),

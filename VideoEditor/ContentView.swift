@@ -12,23 +12,23 @@ import Synchronization
 struct ContentView: View {
     let model: EditorModel
     @State private var exportSheet = false
-    /// Reframing is occasional work, so its pane stays out of the way until
-    /// asked for — and the preview, which is the thing being judged, gets the
-    /// width back. Remembered across launches: someone who reframes every
-    /// project should not have to reopen it every time.
-    @AppStorage("showsGeometryInspector") private var showsInspector = false
     @State private var selectAllKey = SelectAllKeyMonitor()
     @State private var viewport = StageViewport()
 
     var body: some View {
         VStack(spacing: 0) {
-            if model.ffMissing { ffmpegBanner }
+            if model.ffMissing && !model.isGeometryEditing { ffmpegBanner }
             // The error sheet hangs off `editor` rather than the outer stack so it
             // never contends with the export sheet's own presentation anchor.
             editor
                 .sheet(isPresented: errorPresented) {
                     ErrorSheet(message: model.errorMessage ?? "") { model.errorMessage = nil }
                 }
+                // Reframing covers the editor rather than replacing it. Swapping
+                // the split views out resets their divider positions and rebuilds
+                // the player layer underneath; laying the workspace over the top
+                // leaves both exactly where they were for the return trip.
+                .overlay { reframingLayer }
         }
         .frame(minWidth: 1120, minHeight: 760)
         .onAppear {
@@ -39,7 +39,27 @@ struct ContentView: View {
         }
         .onDisappear { selectAllKey.remove() }
         .toolbar {
-            if model.hasProject {
+            // The workspace carries its own bar, and every window control here
+            // either duplicates it or acts on a pane nobody can currently see.
+            if model.hasProject && !model.isGeometryEditing {
+                // Editing comes before shipping, and the two are different kinds
+                // of act — one adjusts the project, one produces a file — so the
+                // spacer keeps them in separate groups rather than one cluster.
+                //
+                // A crop icon opens the crop workspace. It used to open a side
+                // pane that merely *contained* a way in, which put a step
+                // between the button and the thing it is a picture of.
+                ToolbarItem(placement: .primaryAction) {
+                    Button { model.beginGeometryEditing() } label: {
+                        Label("裁切", systemImage: "crop")
+                            .labelStyle(.iconOnly)
+                    }
+                    .buttonBorderShape(.circle)
+                    .disabled(model.activeItem == nil)
+                    .help(model.activeItem == nil
+                          ? "先在時間軸上選一段影片" : "裁切選取的片段（C）")
+                }
+                ToolbarSpacer(.fixed, placement: .primaryAction)
                 ToolbarItem(placement: .primaryAction) {
                     Button { startExport() } label: {
                         Label("輸出", systemImage: "square.and.arrow.up")
@@ -49,15 +69,6 @@ struct ContentView: View {
                     .keyboardShortcut("e", modifiers: .command)
                     .disabled(model.isExporting || model.ffMissing)
                     .help("輸出成品（⌘E）")
-                }
-                ToolbarItem(placement: .primaryAction) {
-                    Button { showsInspector.toggle() } label: {
-                        Label("版面", systemImage: showsInspector ? "crop.rotate" : "crop")
-                            .labelStyle(.iconOnly)
-                    }
-                    .buttonBorderShape(.circle)
-                    .keyboardShortcut("i", modifiers: [.command, .option])
-                    .help("畫布尺寸與片段裁剪（⌥⌘I）")
                 }
             }
         }
@@ -104,10 +115,10 @@ struct ContentView: View {
                     // Darker than the canvas is black, so the canvas reads as an
                     // object sitting on the pane rather than as the pane itself.
                     .background(Color(white: 0.13))
-                if model.hasProject && showsInspector {
-                    GeometryInspector(model: model)
-                        .frame(minWidth: 250, idealWidth: 290, maxWidth: 400)
-                }
+                    // That dark holds in both appearances, so anything drawn on
+                    // it — placeholder text, bar labels, materials — has to
+                    // resolve against dark rather than against the window.
+                    .environment(\.colorScheme, .dark)
             }
             .frame(maxWidth: .infinity, minHeight: 200, maxHeight: .infinity)
             bottomPane
@@ -134,14 +145,7 @@ struct ContentView: View {
         }
     }
 
-    @ViewBuilder
-    private var preview: some View {
-        if model.isGeometryEditing, let item = model.activeItem {
-            reframingStage(item)
-        } else {
-            playbackPreview
-        }
-    }
+    private var preview: some View { playbackPreview }
 
     @ViewBuilder
     private var playbackPreview: some View {
@@ -185,122 +189,41 @@ struct ContentView: View {
 
     // MARK: Reframing
 
-    /// One stage. There used to be two — one showing the source with a crop box,
-    /// one showing the canvas composition — because a crop and a placement were
-    /// separate things. They are one rectangle now, and under the default
-    /// canvas-aspect lock that rectangle *is* the output frame, so there is
-    /// nothing left for a second picture to tell you.
+    /// The whole window, for as long as a crop is being placed. It used to be a
+    /// swap inside the preview pane, which left the picture being judged as the
+    /// smallest thing on screen while the panes around it were quietly inert.
     @ViewBuilder
-    private func reframingStage(_ item: ClipItem) -> some View {
-        VStack(spacing: 0) {
-            reframingBar(item)
-            Divider().opacity(0.4)
-            cropStage(item)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-        }
-        // Deliberately does not reveal the inspector. The stage carries the
-        // readout, the presets and the zoom, and forcing the pane open would
-        // write over a stored preference the user set on purpose.
-        .onAppear { viewport = StageViewport() }
-    }
-
-    private func reframingBar(_ item: ClipItem) -> some View {
-        HStack(spacing: 10) {
-            // Presets set the rectangle; they are not modes that stay switched
-            // on. Only fit and fill survive as live framings, because only they
-            // have something worth re-deriving when the canvas changes.
-            Button("完整放入") { model.setFraming(.automatic(.fit), for: item.id) }
-            Button("填滿") { model.setFraming(.automatic(.fill), for: item.id) }
-            Button("原尺寸") { model.setActualSizeFraming(for: item.id) }
-            Button("重設") { model.resetGeometry(for: item.id) }
-                .disabled(item.geometry.isIdentity)
-
-            Divider().frame(height: 16)
-
-            aspectLockMenu(item)
-
-            Spacer(minLength: 8)
-
-            Text(verbatim: "方向鍵微調 \(EditorModel.geometryNudgeStep)px．⇧ ×10")
-                .font(.caption).foregroundStyle(.white.opacity(0.45))
-                .lineLimit(1)
-                .layoutPriority(-1)     // first thing to go when the pane narrows
-
-            Button { model.endGeometryEditing() } label: {
-                HStack(spacing: 5) {
-                    Text("完成")
-                    KeyCapHint("↩", prominent: true)
-                }
+    private var reframingLayer: some View {
+        if model.isGeometryEditing, let item = model.activeItem {
+            CropWorkspace(model: model, item: item, viewport: $viewport) { scale in
+                cropPicture(item, pointsPerSourcePixel: scale)
             }
-            .keyboardShortcut(.defaultAction)
-            .fixedSize()                // the way out never gets clipped
-        }
-        .font(.callout)
-        .buttonStyle(.link)
-        .padding(.horizontal, 12).padding(.vertical, 8)
-        .background(Color(white: 0.17))
-    }
-
-    private func aspectLockMenu(_ item: ClipItem) -> some View {
-        Menu {
-            Picker("比例", selection: Binding(
-                get: { item.geometry.aspectLock },
-                set: { model.setAspectLock($0, for: item.id) }
-            )) {
-                Text("畫布比例").tag(AspectLock.canvas)
-                Text("9:16").tag(AspectLock.ratio(width: 9, height: 16))
-                Text("1:1").tag(AspectLock.ratio(width: 1, height: 1))
-                Text("4:3").tag(AspectLock.ratio(width: 4, height: 3))
-                Text("16:9").tag(AspectLock.ratio(width: 16, height: 9))
-                Text("原始比例").tag(AspectLock.source)
-                Text("自由").tag(AspectLock.free)
-            }
-            .pickerStyle(.inline)
-            .labelsHidden()
-        } label: {
-            Label(aspectLockLabel(item.geometry.aspectLock),
-                  systemImage: item.geometry.aspectLock == .free ? "lock.open" : "lock")
-        }
-        .menuStyle(.borderlessButton)
-        .fixedSize()
-        .help("裁剪框的比例限制")
-    }
-
-    private func aspectLockLabel(_ lock: AspectLock) -> String {
-        switch lock {
-        case .canvas: return "畫布比例"
-        case .ratio(let w, let h): return "\(w):\(h)"
-        case .source: return "原始比例"
-        case .free: return "自由"
+            .transition(.opacity)
+            .onAppear { viewport = StageViewport() }
+            // Retargeting to another clip keeps the session but not the zoom:
+            // a viewport framed for one source means nothing on the next.
+            .onChange(of: item.id) { _, _ in viewport = StageViewport() }
         }
     }
 
-    private func cropStage(_ item: ClipItem) -> some View {
-        CropStage(source: item.sourcePixelSize,
-                  window: model.window(for: item),
-                  canvasAspect: Double(model.canvas.width) / Double(max(1, model.canvas.height)),
-                  lockedAspect: model.lockedAspect(for: item),
-                  viewport: $viewport,
-                  onChange: { model.setFraming(.window($0), for: item.id) },
-                  onGestureBegin: { model.beginGeometryGesture(for: item.id) },
-                  onGestureEnd: { model.endGeometryGesture() }) { scale in
-            let usesNearestNeighbour = StageViewport.usesNearestNeighbour(
-                pointsPerSourcePixel: scale)
-            if item.isImage {
-                ImagePreview(
+    @ViewBuilder
+    private func cropPicture(_ item: ClipItem, pointsPerSourcePixel scale: CGFloat) -> some View {
+        let usesNearestNeighbour = StageViewport.usesNearestNeighbour(
+            pointsPerSourcePixel: scale)
+        if item.isImage {
+            ImagePreview(
+                url: item.url,
+                interpolation: usesNearestNeighbour ? .none : .high)
+        } else if let player = model.player {
+            CropVideoPreview(
+                player: player,
+                thumbnailer: model.thumbnailer(for: item.url),
+                time: item.grid.time(ofFrame: model.currentFrameIndex),
+                request: CropFrameRequest(
                     url: item.url,
-                    interpolation: usesNearestNeighbour ? .none : .high)
-            } else if let player = model.player {
-                CropVideoPreview(
-                    player: player,
-                    thumbnailer: model.thumbnailer(for: item.url),
-                    time: item.grid.time(ofFrame: model.currentFrameIndex),
-                    request: CropFrameRequest(
-                        url: item.url,
-                        frameIndex: model.currentFrameIndex,
-                        sourceRevision: model.videoSourceRevision(for: item.url)),
-                    interpolation: usesNearestNeighbour ? .none : .high)
-            }
+                    frameIndex: model.currentFrameIndex,
+                    sourceRevision: model.videoSourceRevision(for: item.url)),
+                interpolation: usesNearestNeighbour ? .none : .high)
         }
     }
 
@@ -459,10 +382,10 @@ struct ContentView: View {
             }.keyboardShortcut(.delete, modifiers: [])
 
             Button("") { model.toggleGeometryEditing() }.keyboardShortcut("c", modifiers: [])
-            // Esc leaves the mode rather than reverting: every change is already
-            // live and already on the undo stack, and giving Esc two meanings
-            // only makes people afraid to press it.
-            Button("") { model.endGeometryEditing() }.keyboardShortcut(.cancelAction)
+            // Esc, Return, ⌥-arrows and the bracket keys are registered on the
+            // workspace's own visible buttons instead of here. They only mean
+            // anything while it is up, and a real button carries a key
+            // equivalent more reliably than a hidden zero-sized one.
         }
         .disabled(model.isTextEditing)   // don't fire single-key shortcuts while typing a time
         .opacity(0).frame(width: 0, height: 0).accessibilityHidden(true)
@@ -489,6 +412,7 @@ struct ContentView: View {
         guard !model.isGeometryEditing else { return }
         action()
     }
+
 
     // MARK: Helpers
 

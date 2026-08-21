@@ -201,33 +201,49 @@ final class EditorModel {
     }
     // MARK: - Canvas / output
 
-    private func even(_ x: Int) -> Int { x % 2 == 0 ? max(2, x) : x + 1 }
+    /// The output frame no longer needs rounding to an even size. 4:2:0 cannot
+    /// describe an odd picture and x264 refuses the encode, so an odd frame is
+    /// delivered in 4:4:4 instead — a crop 615 pixels wide exports 615 pixels
+    /// wide rather than a 616 nobody asked for.
+    private func usableCanvasExtent(_ x: Int) -> Int { max(2, x) }
 
-    /// User override for the output canvas. Frame rate deliberately stays
-    /// derived: it belongs to the frame lattice, not to the framing, and tying
-    /// the two to one control would let a reframe resample the timeline.
-    var canvasSizing: CanvasSizing = .automatic
-
+    /// The output frame: the region the first clip keeps.
+    ///
+    /// There is no canvas setting any more. A canvas is what you need when the
+    /// output frame and the crop are separate ideas — one to compose into, one
+    /// to cut out — and it brought a whole vocabulary with it: fit, fill,
+    /// letterbox, presets, a custom size, a pane to hold them. Cropping is
+    /// simply taking a region of the picture, so the region is the output.
+    ///
+    /// Frame rate stays derived: it belongs to the frame lattice, not to the
+    /// framing, and tying the two to one control would let a crop resample the
+    /// timeline.
     var canvas: CanvasSpec {
-        let size: PixelSize
-        switch canvasSizing {
-        case .automatic:
-            size = derivedCanvasSize
-        case .fixed(let fixed), .custom(let fixed):
-            size = fixed.isUsable ? fixed : derivedCanvasSize
-        }
+        let size = derivedCanvasSize
         // Use the exact rational of the fastest video so a fractional-fps source
         // (e.g. 24.9713) is never resampled to a rounded integer rate.
         let best = items.filter { !$0.isImage && $0.fps > 0 }.max { $0.fps < $1.fps }
-        return CanvasSpec(width: even(size.width), height: even(size.height),
+        return CanvasSpec(width: usableCanvasExtent(size.width),
+                          height: usableCanvasExtent(size.height),
                           fps: best?.fpsRational ?? "30", fpsValue: best?.fps ?? 30)
     }
 
-    /// The canvas the sources imply: large enough to hold the biggest of them.
+    /// The clip whose crop sets the output size, for anything that needs to say
+    /// so out loud.
+    var itemDefiningOutputSize: ClipItem? {
+        items.first(where: \.isExportable)
+    }
+
+    /// A file has one resolution, so with several clips the first one that
+    /// reaches the output decides it and the rest are fitted into it.
     private var derivedCanvasSize: PixelSize {
-        let w = items.map { $0.naturalWidth }.filter { $0 > 0 }.max() ?? 1280
-        let h = items.map { $0.naturalHeight }.filter { $0 > 0 }.max() ?? 720
-        return PixelSize(width: w, height: h)
+        guard let first = items.first(where: \.isExportable),
+              first.sourcePixelSize.isUsable else {
+            let w = items.map(\.naturalWidth).filter { $0 > 0 }.max() ?? 1280
+            let h = items.map(\.naturalHeight).filter { $0 > 0 }.max() ?? 720
+            return PixelSize(width: w, height: h)
+        }
+        return first.geometry.window(source: first.sourcePixelSize).size
     }
 
     private(set) var totalOutputDuration: Double = 0
@@ -482,7 +498,6 @@ final class EditorModel {
         var selectedLibraryIDs: Set<LibraryAsset.ID>
         var currentTime: Double
         var timelineTime: Double
-        var canvasSizing: CanvasSizing
     }
 
     private var undoStack: [ProjectSnapshot] = []
@@ -505,8 +520,7 @@ final class EditorModel {
                         audioDuration: audioDuration,
                         activeItemID: activeItemID, selectedIDs: selectedIDs,
                         selectedLibraryIDs: selectedLibraryIDs,
-                        currentTime: currentTime, timelineTime: timelineTime,
-                        canvasSizing: canvasSizing)
+                        currentTime: currentTime, timelineTime: timelineTime)
     }
 
     /// Push the current project state as one undo step. Call exactly once per
@@ -523,7 +537,11 @@ final class EditorModel {
 
     func undo() {
         imageDurationEditingSession = nil
-        endGeometryEditing()
+        // Undo used to close the reframing session outright. Inside a workspace
+        // that owns the window that reads as the app throwing you out for
+        // pressing ⌘Z; stepping back one adjustment and staying put is what the
+        // key means everywhere else. Only the in-flight drag is abandoned.
+        geometryGestureSession = nil
         guard let past = undoStack.popLast() else { return }
         redoStack.append(snapshot())
         apply(past)
@@ -531,7 +549,11 @@ final class EditorModel {
 
     func redo() {
         imageDurationEditingSession = nil
-        endGeometryEditing()
+        // Undo used to close the reframing session outright. Inside a workspace
+        // that owns the window that reads as the app throwing you out for
+        // pressing ⌘Z; stepping back one adjustment and staying put is what the
+        // key means everywhere else. Only the in-flight drag is abandoned.
+        geometryGestureSession = nil
         guard let future = redoStack.popLast() else { return }
         undoStack.append(snapshot())
         apply(future)
@@ -543,7 +565,6 @@ final class EditorModel {
         audioDurationRequestID &+= 1
         library = s.library
         items = s.items
-        canvasSizing = s.canvasSizing
         audioURL = s.audioURL
         audioName = s.audioName
         audioDuration = s.audioDuration
@@ -1071,9 +1092,11 @@ final class EditorModel {
                                     sourceTime requestedSourceTime: Double? = nil,
                                     timelinePosition requestedTimelinePosition: Double? = nil) {
         player?.pause()
-        // Reframing targets one clip. Moving to another leaves the mode rather
-        // than silently retargeting the handles at a different picture.
-        if activeItemID != id { endGeometryEditing() }
+        // Reframing targets one clip. Clicking away from it leaves the mode
+        // rather than silently retargeting the handles at a different picture —
+        // unless the workspace itself asked for the move, which is how its
+        // clip rail walks a project without dropping out and back in.
+        if activeItemID != id && !isRetargetingGeometry { endGeometryEditing() }
         activeItemID = id
         guard let item = activeItem else { detachObserver(); player = nil; return }
         let itemTimelineStart = timelineStart(for: item.id) ?? 0
@@ -1725,20 +1748,113 @@ final class EditorModel {
         hasRegisteredUndo: Bool
     )?
 
+    /// The state the whole reframing session started from, and how deep the undo
+    /// stack was then. Cancelling restores the one and truncates to the other,
+    /// so a session that is thrown away leaves no history behind it.
+    ///
+    /// This is what makes Esc mean "cancel". While reframing was a pane swap it
+    /// only meant "leave" — every change was already live and on the stack, and
+    /// a second meaning for Esc would have been a trap. A workspace that takes
+    /// the whole window is a different promise: it shows both exits, and the
+    /// one marked 取消 has to actually undo.
+    @ObservationIgnored private var geometrySession: (
+        undoSnapshot: ProjectSnapshot,
+        undoDepth: Int
+    )?
+
+    /// Set while the reframing target moves to another clip, so the selection
+    /// path knows this is a deliberate retarget rather than someone clicking
+    /// away from the clip being reframed.
+    @ObservationIgnored private var isRetargetingGeometry = false
+
     func beginGeometryEditing() {
         guard activeItem != nil else { return }
         pauseTimelinePlayback()
         clearTimelineHover()
+        if !isGeometryEditing { geometrySession = (snapshot(), undoStack.count) }
         isGeometryEditing = true
     }
 
+    /// Commit and leave. Every change is already applied and already on the undo
+    /// stack; this only closes the session.
     func endGeometryEditing() {
         isGeometryEditing = false
         geometryGestureSession = nil
+        geometrySession = nil
+    }
+
+    /// Leave and put everything back the way it was on the way in.
+    func cancelGeometryEditing() {
+        guard isGeometryEditing else { return }
+        let session = geometrySession
+        isGeometryEditing = false
+        geometryGestureSession = nil
+        geometrySession = nil
+        guard let session else { return }
+        // The 100-step cap can drop entries off the front, which moves every
+        // recorded depth — never remove more than is actually there.
+        let pushed = max(0, undoStack.count - session.undoDepth)
+        if pushed > 0 { undoStack.removeLast(pushed) }
+        apply(session.undoSnapshot)
     }
 
     func toggleGeometryEditing() {
         isGeometryEditing ? endGeometryEditing() : beginGeometryEditing()
+    }
+
+    /// Move the reframing to another clip without closing the session, so a
+    /// twelve-clip project can be reframed in one pass. The session snapshot
+    /// deliberately survives: 取消 undoes the whole pass, not just this clip.
+    func retargetGeometryEditing(to id: ClipItem.ID) {
+        guard isGeometryEditing, id != activeItemID,
+              items.contains(where: { $0.id == id }) else { return }
+        geometryGestureSession = nil
+        isRetargetingGeometry = true
+        selectItem(id)
+        isRetargetingGeometry = false
+    }
+
+    /// The clip `delta` places along from the one being reframed, or `nil` at
+    /// either end of the timeline.
+    func geometryNeighbour(_ delta: Int) -> ClipItem.ID? {
+        guard let current = activeItemID,
+              let index = items.firstIndex(where: { $0.id == current }) else { return nil }
+        let target = index + delta
+        return items.indices.contains(target) ? items[target].id : nil
+    }
+
+    func stepGeometryTarget(by delta: Int) {
+        guard let id = geometryNeighbour(delta) else { return }
+        retargetGeometryEditing(to: id)
+    }
+
+    /// Move the reference frame inside the clip being reframed, clamped to its
+    /// own trimmed range. `stepFrame` deliberately walks onto the neighbouring
+    /// clip at a boundary, which here would silently change what is being
+    /// reframed.
+    func stepGeometryFrame(_ delta: Int) {
+        guard delta != 0, let item = activeItem, !item.isImage else { return }
+        let grid = item.grid
+        let target = grid.frameIndex(containing: currentTime) + delta
+        seekGeometryFrame(toFrame: target, of: item)
+    }
+
+    /// Scrub to a time inside the clip being reframed, snapped onto a real
+    /// frame: the crop is judged against a decoded picture, and a time landing
+    /// between two frames would show whichever of them the decoder rounds to.
+    func seekGeometryFrame(to time: Double) {
+        guard let item = activeItem, !item.isImage else { return }
+        seekGeometryFrame(toFrame: item.grid.nearestFrame(to: time), of: item)
+    }
+
+    private func seekGeometryFrame(toFrame frame: Int, of item: ClipItem) {
+        let first = item.trimStartFrame
+        let last = max(first, item.trimEndFrame - 1)
+        let time = item.grid.time(ofFrame: min(max(first, frame), last))
+        guard time != currentTime else { return }
+        currentTime = time
+        seekPlayer(to: time)
+        syncTimelineTimeFromActive()
     }
 
     func beginGeometryGesture(for id: ClipItem.ID) {
@@ -1775,43 +1891,10 @@ final class EditorModel {
         items.first { $0.id == id }.flatMap(placement(for:))
     }
 
-    /// Canvas presets offered alongside the derived size. 1080-based rather than
-    /// 4K so a reframe never silently upscales a typical source.
-    static let canvasPresets: [(label: String, size: PixelSize)] = [
-        ("橫式 16:9 · 1920×1080", PixelSize(width: 1920, height: 1080)),
-        ("直式 9:16 · 1080×1920", PixelSize(width: 1080, height: 1920)),
-        ("方形 1:1 · 1080×1080", PixelSize(width: 1080, height: 1080)),
-    ]
-
-    func setCanvasSizing(_ sizing: CanvasSizing) {
-        let normalized: CanvasSizing
-        switch sizing {
-        case .automatic:
-            normalized = .automatic
-        case .fixed(let size):
-            normalized = .fixed(normalizedCanvasSize(size))
-        case .custom(let size):
-            normalized = .custom(normalizedCanvasSize(size))
-        }
-        guard normalized != canvasSizing else { return }
-        pauseTimelinePlayback()
-        registerUndo()
-        canvasSizing = normalized
-    }
-
-    /// yuv420p output requires even dimensions. Normalise at the edit boundary
-    /// as well as when resolving `canvas`, so the inspector never claims 1001px
-    /// while the file is actually 1002px wide.
-    private func normalizedCanvasSize(_ size: PixelSize) -> PixelSize {
-        guard size.isUsable else { return size }
-        return PixelSize(width: even(size.width), height: even(size.height))
-    }
-
-    /// The rectangle the user is working with, materialising an automatic
-    /// framing the moment they take hold of it.
+    /// The rectangle the user is working with, materialising the whole frame the
+    /// moment they take hold of it.
     func window(for item: ClipItem) -> PixelRect {
-        item.geometry.window(source: item.sourcePixelSize,
-                             canvas: PixelSize(width: canvas.width, height: canvas.height))
+        item.geometry.window(source: item.sourcePixelSize)
     }
 
     /// The part of the source frame that survives into the output, or `nil` when
@@ -1835,7 +1918,7 @@ final class EditorModel {
     func setFraming(_ framing: ClipFraming, for id: ClipItem.ID) {
         updateGeometry(for: id) { geometry, source in
             switch framing {
-            case .automatic:
+            case .wholeFrame:
                 geometry.framing = framing
             case .window(let rect):
                 let clamped = rect.clampedWindow(in: source)
@@ -1857,8 +1940,6 @@ final class EditorModel {
         switch item.geometry.aspectLock {
         case .free:
             return nil
-        case .canvas:
-            return Double(canvas.width) / Double(max(1, canvas.height))
         case .ratio(let w, let h):
             return Double(w) / Double(max(1, h))
         case .source:
@@ -1866,19 +1947,6 @@ final class EditorModel {
             guard size.isUsable else { return nil }
             return Double(size.width) / Double(size.height)
         }
-    }
-
-    /// 原尺寸: a canvas-sized window centred on the source, so the picture is
-    /// neither enlarged nor reduced. Unlike fit and fill this is materialised
-    /// rather than kept live — there is nothing about it worth re-deriving when
-    /// the canvas changes.
-    func setActualSizeFraming(for id: ClipItem.ID) {
-        guard let item = items.first(where: { $0.id == id }) else { return }
-        let source = item.sourcePixelSize
-        let window = PixelRect(x: (source.width - canvas.width) / 2,
-                               y: (source.height - canvas.height) / 2,
-                               width: canvas.width, height: canvas.height)
-        setFraming(.window(window), for: id)
     }
 
     func resetGeometry(for id: ClipItem.ID) {

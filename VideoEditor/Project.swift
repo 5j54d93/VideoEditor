@@ -184,9 +184,16 @@ nonisolated struct PixelRect: Equatable, Sendable {
     var height: Int
     var size: PixelSize { PixelSize(width: width, height: height) }
 
-    /// Clamped to something the exporter can render: at least 2px on each side
-    /// so a scale never divides by zero, and never so far outside the source
-    /// that no picture survives.
+    /// Confined to the source frame: a crop selects from the picture that
+    /// exists, and never reaches past its edge.
+    ///
+    /// The window used to be allowed outside the frame, on the grounds that the
+    /// area beyond it is black and an intentional letterbox is a legitimate
+    /// thing to ask for. In practice a crop rectangle that keeps going when it
+    /// runs out of picture just produces black nobody wanted — there is no
+    /// visible edge to stop against and no reason to want one. Letterboxing is
+    /// still available, but through the framing that means it（`.fit`）and
+    /// through the canvas, not by dragging a corner into the void.
     ///
     /// There is deliberately no chroma-grid snapping here any more. Odd
     /// coordinates used to be rounded away by crop/pad on a 4:2:0 frame, so the
@@ -195,13 +202,12 @@ nonisolated struct PixelRect: Equatable, Sendable {
     /// editor refuse precision the exporter can deliver.
     func clampedWindow(in source: PixelSize) -> PixelRect {
         guard source.isUsable else { return self }
-        let w = max(2, width)
-        let h = max(2, height)
-        // Keep at least this much of the source inside the window, so a drag
-        // that overshoots cannot produce an all-black segment.
-        let margin = 8
-        return PixelRect(x: min(max(x, -w + margin), source.width - margin),
-                         y: min(max(y, -h + margin), source.height - margin),
+        // At least 2px a side so a scale never divides by zero, and never
+        // larger than the frame it is selecting from.
+        let w = min(max(2, width), max(2, source.width))
+        let h = min(max(2, height), max(2, source.height))
+        return PixelRect(x: min(max(0, x), source.width - w),
+                         y: min(max(0, y), source.height - h),
                          width: w, height: h)
     }
 
@@ -222,102 +228,60 @@ nonisolated struct PixelOffset: Equatable, Sendable {
 /// Kept live rather than materialised into a rectangle so that changing the
 /// canvas reframes the clip instead of stranding a window shaped for the old
 /// aspect ratio.
-nonisolated enum AutoFraming: Equatable, Sendable {
-    case fit    // 完整放入：整張畫面進畫布，四周留黑
-    case fill   // 填滿：畫布被填滿，超出的裁掉
-}
-
-/// Which region of the source frame the canvas shows.
+/// Which region of the source frame survives into the output.
 ///
 /// One rectangle in place of what used to be four fields — a crop, a fit mode,
 /// a magnification and an offset. They were all describing this rectangle's
-/// position and size: cropping moves and shrinks it, "fill" is a particular
-/// choice of it, magnifying makes it smaller, nudging slides it. Collapsing
-/// them also collapses the two editing stages, because the rectangle *is* the
-/// output frame — there is no longer a second picture to check the result in.
+/// position and size: cropping moves and shrinks it, magnifying makes it
+/// smaller, nudging slides it.
+///
+/// The fit/fill modes that used to sit alongside it are gone too. They existed
+/// to answer "how does this clip meet the canvas", a question that no longer
+/// arises: the output frame *is* the first clip's rectangle, so cropping is the
+/// only thing left to decide.
 nonisolated enum ClipFraming: Equatable, Sendable {
-    case automatic(AutoFraming)
-    /// A rectangle the user placed, in source pixels. Deliberately allowed to
-    /// extend past the source frame; outside it the picture is black, which is
-    /// what "fit the whole picture" and any intentional letterbox amount to.
+    /// Everything. The default, and what `isIdentity` reports.
+    case wholeFrame
+    /// A rectangle the user placed, in source pixels, always inside the source
+    /// frame — see `PixelRect.clampedWindow`. Everything it contains is picture.
     case window(PixelRect)
 }
 
 /// How the crop rectangle's aspect ratio is constrained while dragging.
-/// Locked to the canvas by default: a vertical edit wants "this part, filling
-/// the frame", and under that lock the rectangle on screen is exactly what the
-/// viewer will see.
+/// Free by default: a crop tool should let all four edges go where they are
+/// pulled until someone asks otherwise.
 nonisolated enum AspectLock: Hashable, Sendable {
-    case canvas
     case ratio(width: Int, height: Int)
     case source
     case free
 }
 
-/// Where one clip's pixels land on the shared canvas. The default value is the
-/// editor's only historical behaviour — whole source frame, contained, centred
-/// — and `isIdentity` is how export proves nothing has moved.
+/// Which part of one clip's picture is kept. The default value is the editor's
+/// only historical behaviour — the whole frame — and `isIdentity` is how export
+/// proves nothing has moved.
 nonisolated struct ClipGeometry: Equatable, Sendable {
-    var framing: ClipFraming = .automatic(.fit)
+    var framing: ClipFraming = .wholeFrame
     /// Not part of the output: it only constrains dragging. Stored per clip so
     /// switching between clips does not silently change what a drag will do.
-    var aspectLock: AspectLock = .canvas
+    var aspectLock: AspectLock = .free
 
-    var isIdentity: Bool { framing == .automatic(.fit) }
+    var isIdentity: Bool { framing == .wholeFrame }
 
-    /// The rectangle the user is working with, materialising an automatic
-    /// framing when they first take hold of it.
-    func window(source: PixelSize, canvas: PixelSize) -> PixelRect {
+    /// The rectangle the user is working with, materialising the whole frame
+    /// when they first take hold of it.
+    ///
+    /// Deliberately needs nothing but the source. The output size is derived
+    /// from this rectangle, so anything that consulted the canvas here would be
+    /// asking the canvas to help compute itself.
+    func window(source: PixelSize) -> PixelRect {
         switch framing {
         case .window(let rect):
             return rect
-        case .automatic(let mode):
-            return ClipGeometry.automaticWindow(mode, source: source, canvas: canvas)
+        case .wholeFrame:
+            return PixelRect(x: 0, y: 0,
+                             width: max(1, source.width), height: max(1, source.height))
         }
     }
-
-    /// `fit` is the smallest canvas-shaped rectangle containing the whole
-    /// source; `fill` is the largest one inside it. Both centred.
-    ///
-    /// Only ever used to seed a drag or to draw the rectangle — never to build
-    /// export arguments. Deriving the exported size from this would round
-    /// differently from `av_rescale`, and untouched projects have to keep
-    /// exporting the bytes they always did.
-    static func automaticWindow(_ mode: AutoFraming,
-                                source: PixelSize, canvas: PixelSize) -> PixelRect {
-        guard source.isUsable, canvas.isUsable else {
-            return PixelRect(x: 0, y: 0, width: max(1, source.width), height: max(1, source.height))
-        }
-        let byWidth = PixelSize(
-            width: source.width,
-            height: max(1, Int((Double(source.width) * Double(canvas.height)
-                                / Double(canvas.width)).rounded())))
-        let byHeight = PixelSize(
-            width: max(1, Int((Double(source.height) * Double(canvas.width)
-                               / Double(canvas.height)).rounded())),
-            height: source.height)
-        // Containing the source means taking the taller/wider of the two.
-        let size = mode == .fit
-            ? (byWidth.height >= source.height ? byWidth : byHeight)
-            : (byWidth.height <= source.height ? byWidth : byHeight)
-        return PixelRect(x: (source.width - size.width) / 2,
-                         y: (source.height - size.height) / 2,
-                         width: size.width, height: size.height)
-    }
-}
-
-/// The output canvas size. `automatic` reproduces the size derived from the
-/// source clips, so a project nobody has reframed exports exactly as before.
-nonisolated enum CanvasSizing: Equatable, Sendable {
-    case automatic
-    /// A named size from the inspector. Kept as the original `fixed` case so
-    /// existing model callers continue to mean the same thing.
-    case fixed(PixelSize)
-    /// An explicitly editable size. This has to remain distinct even when its
-    /// current numbers happen to equal a preset; otherwise choosing 自訂 from a
-    /// 1920×1080 canvas immediately snaps the picker back to that preset and the
-    /// width/height fields never appear.
-    case custom(PixelSize)
 }
 
 struct ClipItem: Identifiable, Equatable {

@@ -184,17 +184,20 @@ final class ClipGeometryTests: XCTestCase {
         XCTAssertEqual(placement.padOrigin, PixelOffset(x: 480, y: 270))
     }
 
-    func testFillFramingCoversTheCanvas() {
+    /// Cropping to a shape is how you fill a frame now: the output *is* the
+    /// rectangle, so a 9:16 crop of a 16:9 source needs no cover mode to avoid
+    /// black — there is nothing left over to letterbox.
+    func testCroppingToAShapeNeedsNoCoverMode() {
         var geometry = ClipGeometry()
-        geometry.framing = .automatic(.fill)
+        geometry.framing = .window(PixelRect(x: 656, y: 0, width: 608, height: 1080))
 
         let placement = FFTools.resolve(geometry, source: PixelSize(width: 1920, height: 1080),
-                                        canvas: canvas(PixelSize(width: 1080, height: 1920)))
+                                        canvas: canvas(PixelSize(width: 608, height: 1080)))
 
-        XCTAssertEqual(placement.scaledSize, PixelSize(width: 3413, height: 1920))
-        XCTAssertEqual(placement.visibleCrop,
-                       PixelRect(x: 1166, y: 0, width: 1080, height: 1920))
-        XCTAssertEqual(placement.padOrigin, .zero)
+        XCTAssertEqual(placement.sourceCrop,
+                       PixelRect(x: 656, y: 0, width: 608, height: 1080))
+        XCTAssertEqual(placement.scaledSize, PixelSize(width: 608, height: 1080))
+        XCTAssertEqual(placement.padOrigin, .zero)     // nothing to pad
     }
 
     /// A window shaped like the canvas fills it exactly — the property the
@@ -250,21 +253,28 @@ final class ClipGeometryTests: XCTestCase {
 
     /// The rectangle a drag starts from. `fit` has to contain the whole source,
     /// `fill` has to sit inside it — both shaped like the canvas.
-    func testAutomaticWindowsAreCanvasShaped() {
+    /// Both automatic windows stay inside the source frame. `fit` keeps
+    /// everything, so its rectangle is the frame itself — it used to be the
+    /// canvas-shaped rectangle *containing* the frame, which was the one
+    /// rectangle in the app that pointed at pixels the source does not have.
+    func testDefaultWindowIsTheWholeFrame() {
         let source = PixelSize(width: 1920, height: 1080)
-        let portrait = PixelSize(width: 1080, height: 1920)
+        XCTAssertEqual(ClipGeometry().window(source: source),
+                       PixelRect(x: 0, y: 0, width: 1920, height: 1080))
+    }
 
-        let fit = ClipGeometry.automaticWindow(.fit, source: source, canvas: portrait)
-        XCTAssertEqual(fit.width, 1920)
-        XCTAssertEqual(fit.height, 3413)               // 1920 × 1920/1080
-        XCTAssertGreaterThanOrEqual(fit.height, source.height)
-        XCTAssertEqual(fit.x, 0)
-        XCTAssertEqual(fit.y, (1080 - 3413) / 2)       // centred, so negative
+    /// The rectangle drawn for `.fit` changed; the file it produces must not.
+    /// `resolve` handles `.automatic` before any window arithmetic, so the two
+    /// have to be checked separately or a redraw could quietly re-encode every
+    /// untouched project.
+    func testFitFramingResolvesIndependentlyOfItsDrawnRectangle() {
+        let source = PixelSize(width: 1920, height: 1080)
+        let portrait = canvas(PixelSize(width: 1080, height: 1920))
+        let placement = FFTools.resolve(ClipGeometry(), source: source, canvas: portrait)
 
-        let fill = ClipGeometry.automaticWindow(.fill, source: source, canvas: portrait)
-        XCTAssertEqual(fill.width, 608)                // 1080 × 1080/1920
-        XCTAssertEqual(fill.height, 1080)
-        XCTAssertLessThanOrEqual(fill.width, source.width)
+        XCTAssertNil(placement.sourceCrop)             // nothing is cut away
+        XCTAssertEqual(placement.scaledSize, PixelSize(width: 1080, height: 608))
+        XCTAssertEqual(placement.padOrigin, PixelOffset(x: 0, y: 656))
     }
 
     /// The automatic framings stay live rather than materialising, so changing
@@ -286,10 +296,6 @@ final class ClipGeometryTests: XCTestCase {
     func testIdentityIsTheDefaultFraming() {
         XCTAssertTrue(ClipGeometry().isIdentity)
 
-        var filled = ClipGeometry()
-        filled.framing = .automatic(.fill)
-        XCTAssertFalse(filled.isIdentity)
-
         var windowed = ClipGeometry()
         windowed.framing = .window(PixelRect(x: 0, y: 0, width: 10, height: 10))
         XCTAssertFalse(windowed.isIdentity)
@@ -306,17 +312,29 @@ final class ClipGeometryTests: XCTestCase {
         XCTAssertEqual(odd.clampedWindow(in: source), odd)
     }
 
-    func testWindowIsClampedToSomethingRenderable() {
+    /// A crop selects from the picture that exists. The window used to be
+    /// allowed past the frame edge, where the extra area is black — which is
+    /// black nobody asked for, produced by a drag with nothing to stop it.
+    func testWindowIsConfinedToTheSourceFrame() {
         let source = PixelSize(width: 1920, height: 1080)
 
         // Degenerate sizes become renderable rather than dividing by zero.
         XCTAssertGreaterThanOrEqual(
             PixelRect(x: 0, y: 0, width: 0, height: 0).clampedWindow(in: source).width, 2)
 
-        // Dragged clear of the frame, it is pulled back until some source shows.
+        // Dragged clear of the frame, it is pulled fully back inside.
         let far = PixelRect(x: 9000, y: 0, width: 200, height: 200).clampedWindow(in: source)
-        XCTAssertLessThan(far.x, source.width)
-        XCTAssertGreaterThan(far.x + far.width, 0)
+        XCTAssertEqual(far, PixelRect(x: 1720, y: 0, width: 200, height: 200))
+
+        // Negative origins come back to the edge rather than hanging off it.
+        let before = PixelRect(x: -300, y: -50, width: 400, height: 400)
+            .clampedWindow(in: source)
+        XCTAssertEqual(before, PixelRect(x: 0, y: 0, width: 400, height: 400))
+
+        // A window larger than the frame shrinks to it instead of adding black.
+        let huge = PixelRect(x: -500, y: -500, width: 4000, height: 4000)
+            .clampedWindow(in: source)
+        XCTAssertEqual(huge, PixelRect(x: 0, y: 0, width: 1920, height: 1080))
     }
 
     // MARK: Handles
@@ -351,9 +369,40 @@ final class ClipGeometryTests: XCTestCase {
         XCTAssertEqual(fromTopLeft.width, fromTopLeft.height)
     }
 
-    func testOnlyCornersResizeWhileLocked() {
+    func testHandleSetIsComplete() {
         XCTAssertEqual(CropHandle.corners.count, 4)
         XCTAssertEqual(CropHandle.allCases.count, 8)
+        XCTAssertEqual(CropHandle.allCases.filter(\.isCorner).count, 4)
+    }
+
+    /// An edge handle stays live under a locked ratio — the lock decides the
+    /// other axis rather than forbidding the drag. It used to hide these four
+    /// handles entirely, which left the most natural way to grab a rectangle
+    /// dead on the app's default setting.
+    func testLockedEdgeHandleDerivesTheOtherAxisAboutTheCentre() {
+        let rect = PixelRect(x: 100, y: 100, width: 400, height: 400)   // 1:1
+
+        // Widen by 100 from the right: the height follows, and the rectangle
+        // grows evenly above and below rather than hinging off the top edge.
+        let wider = CropHandle.right.resize(rect, dx: 100, dy: 0, lockedAspect: 1)
+        XCTAssertEqual(wider, PixelRect(x: 100, y: 50, width: 500, height: 500))
+
+        // The left edge tracks the pointer while the far edge stays put.
+        let fromLeft = CropHandle.left.resize(rect, dx: -100, dy: 0, lockedAspect: 1)
+        XCTAssertEqual(fromLeft.x, 0)
+        XCTAssertEqual(fromLeft.x + fromLeft.width, 500)
+        XCTAssertEqual(fromLeft.width, fromLeft.height)
+
+        // A vertical edge leads on its own axis.
+        let taller = CropHandle.bottom.resize(rect, dx: 0, dy: 200, lockedAspect: 1)
+        XCTAssertEqual(taller, PixelRect(x: 0, y: 100, width: 600, height: 600))
+    }
+
+    /// Unlocked, an edge moves only its own edge and nothing else.
+    func testFreeEdgeHandleTouchesOneAxisOnly() {
+        let rect = PixelRect(x: 100, y: 100, width: 400, height: 300)
+        let resized = CropHandle.right.resize(rect, dx: 60, dy: 40, lockedAspect: nil)
+        XCTAssertEqual(resized, PixelRect(x: 100, y: 100, width: 460, height: 300))
     }
 
     // MARK: Helpers

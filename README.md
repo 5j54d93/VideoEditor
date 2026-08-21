@@ -47,14 +47,17 @@ The timeline **is** the output：every visible clip is part of the exported movi
 - **No black flash**：the scrub layer stays mounted and only fades in once it has a frame to display, so the committed preview shows through while a freshly loaded source is still decoding.
 - **Exact by construction**：hover positions are quantized onto the source frame grid first, then requested with zero seek tolerance and a one-nanosecond interior bias — so the frame on screen is always the frame the model, the timeline cell and the export all agree on.
 - **Stills get their own control**：selecting an image clip reveals a display-duration slider（0.2–20 s）right above the timeline.
-- **Reframe against source pixels**：double-click the preview or press <kbd>C</kbd> to crop the source and place it on the output canvas. Crop inspection decodes the current video frame at native resolution rather than enlarging a player thumbnail, with fit, 1:1 and up to 1600% zoom for precise boundaries.
-- **Choose the canvas**：the 版面 inspector offers automatic sizing, landscape／portrait／square presets and an explicit custom width and height. Custom yuv420p dimensions are normalised to even pixels in the fields and in the exported file.
+- **Reframe in a workspace, not a corner**：double-click the preview, press <kbd>C</kbd>, or hit the crop button in the toolbar to take a region out of the source. Reframing takes the whole window: the library and the timeline lanes step aside, and the two things a crop actually needs from them come back as purpose-built rails — a filmstrip of the clip's own frames（<kbd>⌥</kbd><kbd>←</kbd>／<kbd>⌥</kbd><kbd>→</kbd>, or drag it）and a strip of every clip in the project（<kbd>[</kbd>／<kbd>]</kbd>）, marked with a dot wherever a clip has already been reframed. Crop inspection decodes the current video frame at native resolution rather than enlarging a player thumbnail, with fit, 1:1 and up to 1600% zoom for precise boundaries. Past 1:1 the picture stops being filtered — magnifying shows the pixels that are there rather than a smoothed version of them — and the selection border never covers more than half a source pixel: it thins toward a hairline as the picture grows and is stroked clear of the boundary rather than across it, so every pixel inside the selection stays visible. The lit-up edge under the pointer sits alongside the border for the same reason.
+- **Draw the selection, don't walk it in**：dragging anywhere on the picture draws a new rectangle from scratch, the way every selection tool on the Mac does, so the framing you want takes one gesture instead of four edges walked in from the whole frame. Dragging inside the current rectangle still moves it, and the eight grips still resize it. Marching ants and small square grips mark the selection; the crosshair says where a new one will start; panning a zoomed picture is on scroll and pinch.
+- **Grab the rectangle anywhere**：every edge is live along its whole length, not just at a marker — the pointer picks up a resize cursor and the line lights up wherever you meet it — and the corners carry a 24 pt target on top of that. The ratio is unconstrained by default, so all four sides simply go where they are pulled; lock it to the source's own shape or a preset from the right-hand panel when you want it held. The rectangle stops at the frame — a crop selects from the picture that exists, and cannot be dragged out into black. Edges snap to the source's own boundaries and centre lines（<kbd>⌘</kbd> suspends it）, <kbd>⌥</kbd> resizes about the centre, <kbd>⇧</kbd> inverts the ratio lock for one drag, and the mask lightens while you drag so the part being thrown away stays judgeable. **A drag always keeps the edge under the pointer**, which is also why the sizes it can reach are spaced by whatever one point covers：at the common half-size fit that is two source pixels, so dragging moves the width in twos and cannot land on an odd one. That is arithmetic, not a setting — a point cannot pick between two pixels. Precision comes from the zoom, where it costs nothing：**實際像素** makes a point a pixel, so the edge still tracks the pointer and every integer is reachable at the same time. The numbers rail takes an exact value at any zoom. <kbd>⌥</kbd> mirrors the drag onto the opposite edge, so a centred resize moves the width in twos even at 100%；an odd size comes from dragging one edge, or from typing it. <kbd>↩</kbd> commits; <kbd>esc</kbd> cancels the whole session and puts the framing back the way it was on the way in.
+- **Everything else is in one panel**：ratio, exact pixel values, the resulting file size, and "套用到全部" sit down the right-hand side, so the stage itself carries nothing but the picture and the rectangle.
+- **The crop is the output**：there is no canvas to set up, no fit／fill／letterbox to choose between. The file comes out exactly the size of the rectangle — crop 615 pixels wide and the file is 615 pixels wide, odd number and all（delivered in 4:4:4, see below）. With several clips the first one sets the size and the rest are fitted into it; "套用到全部" makes them match in one click.
 
 ## Deterministic Export
 
 <kbd>⌘</kbd><kbd>E</kbd> opens a filename／destination sheet（remembering the last folder）, then a live progress sheet with the first frame, percentage, elapsed and estimated remaining — cancellable, and a cancelled export deletes its half-written file instead of leaving a torso behind.
 
-Everything is normalized onto one shared canvas — automatically the largest dimensions among the clips, or a preset/custom size chosen in the 版面 inspector — at the exact rational frame rate of the fastest video, scaled, letterboxed, concatenated, and encoded with one fixed internal profile：libx264（medium, CRF 18, `yuv420p`）plus native AAC（two-loop coder, stereo 44.1 kHz, 192 kbps）. There is no hidden quality／threading setting that can silently change the file format.
+Everything is normalized onto one output frame — the region the first clip keeps — at the exact rational frame rate of the fastest video, scaled, letterboxed, concatenated, and encoded with one fixed internal profile：libx264（medium, CRF 18, `yuv420p`）plus native AAC（two-loop coder, stereo 44.1 kHz, 192 kbps）. There is no hidden quality／threading setting that can silently change the file format.
 
 The one thing that varies is chroma, and only because it has to：a 4:2:0 plane is half-resolution on both axes and cannot describe an odd-sized picture at all — x264 refuses the encode rather than rounding it. An odd output frame is therefore written in `yuv444p`（High 4:4:4 Predictive）, which costs bitrate and hardware decoding but delivers the size that was asked for. Every even one keeps `yuv420p` and is byte-for-byte what it always was: enabling 4:4:4 in the bundled x264 was verified not to change a single byte of 4:2:0 output.
 
@@ -85,8 +88,17 @@ The guarantee is intentionally scoped to the **same bundled toolchain and CPU ar
 | <kbd>⌘</kbd><kbd>Z</kbd> <kbd>⇧</kbd><kbd>⌘</kbd><kbd>Z</kbd> | Undo／redo |
 | <kbd>⌘</kbd><kbd>I</kbd> | Import media |
 | <kbd>⌘</kbd><kbd>E</kbd> | Export |
-| <kbd>C</kbd> | Enter／leave crop and canvas-position editing |
-| <kbd>⌥</kbd><kbd>⌘</kbd><kbd>I</kbd> | Show／hide the 版面 inspector |
+| <kbd>C</kbd> | Enter／leave cropping |
+
+Inside the reframing workspace:
+
+| Key | Action |
+| --- | --- |
+| <kbd>←</kbd> <kbd>→</kbd> <kbd>↑</kbd> <kbd>↓</kbd> | Nudge the crop 1 px（<kbd>⇧</kbd> for 10） |
+| <kbd>⌥</kbd><kbd>←</kbd> <kbd>⌥</kbd><kbd>→</kbd> | Previous／next frame of this clip |
+| <kbd>[</kbd> <kbd>]</kbd> | Previous／next clip, without leaving |
+| <kbd>↩</kbd> | Done |
+| <kbd>esc</kbd> | Cancel — restores the framing from before the session |
 
 Single-key shortcuts disable themselves while a text field has focus, so typing a filename or a timecode never triggers an edit.
 
