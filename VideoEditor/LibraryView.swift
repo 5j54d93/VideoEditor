@@ -26,7 +26,10 @@ struct LibraryPanel: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
-            Divider()
+            // Only the grid needs a line between it and the header — it
+            // scrolls under it. The empty state is one calm card with air
+            // around it; a rule above it just adds furniture.
+            if !model.library.isEmpty { Divider() }
             if model.library.isEmpty {
                 if model.isImporting {
                     EmptyLibraryLoadingView()
@@ -475,7 +478,7 @@ private struct EmptyLibraryLoadingView: View {
             RoundedRectangle(cornerRadius: 10)
                 .fill(Color.gray.opacity(0.1))
         )
-        .padding(10)
+        .padding([.horizontal, .bottom], 10).padding(.top, 2)
     }
 }
 
@@ -505,7 +508,9 @@ private struct EmptyLibraryButton: View {
                     .fill(Color.gray.opacity(hovering ? 0.17 : 0.1))
             )
             .contentShape(RoundedRectangle(cornerRadius: 10))
-            .padding(10)
+            // No rule under the header any more, so the card hangs directly off
+            // it: keep only enough air to clear the title, not a whole gap.
+            .padding([.horizontal, .bottom], 10).padding(.top, 2)
         }
         .buttonStyle(.plain)
         .keyboardShortcut("i", modifiers: .command)
