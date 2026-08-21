@@ -84,6 +84,43 @@ final class ClipGeometryTests: XCTestCase {
         XCTAssertFalse(chain.contains("(ow-iw)"))
     }
 
+    /// An odd canvas is delivered in 4:4:4, because 4:2:0 has no way to
+    /// represent it — x264 rejects the encode outright rather than rounding.
+    /// The editor used to round the canvas up instead, so a 615 the user typed
+    /// became a 616 in every field and in the file.
+    func testOddCanvasIsDeliveredInFullChroma() {
+        let chain = FFTools.geometryChain(
+            for: item(source: PixelSize(width: 1230, height: 1640)),
+            canvas: canvas(PixelSize(width: 615, height: 820)))
+
+        XCTAssertTrue(chain.hasSuffix("format=yuv444p"), chain)
+        XCTAssertFalse(chain.contains("yuv420p"), chain)
+    }
+
+    /// The odd canvas is what forces full chroma, even when every value the
+    /// chain actually prints happens to be even: `pad`'s target is the canvas
+    /// itself, and a 4:2:0 plane cannot hold an odd one.
+    func testOddCanvasComposesThroughFullChromaWithEvenGridValues() {
+        var geometry = ClipGeometry()
+        geometry.framing = .window(PixelRect(x: 0, y: 0, width: 1230, height: 1640))
+        let chain = FFTools.geometryChain(
+            for: item(source: PixelSize(width: 1230, height: 1640), geometry: geometry),
+            canvas: canvas(PixelSize(width: 616, height: 821)))
+
+        XCTAssertTrue(chain.contains("format=yuv444p,pad=616:821"), chain)
+    }
+
+    /// The all-even path must not start paying for 4:4:4: an existing project's
+    /// bytes depend on this chain staying exactly what it was.
+    func testEvenCanvasStillDeliversFourTwoZero() {
+        let chain = FFTools.geometryChain(
+            for: item(source: PixelSize(width: 1920, height: 1080)),
+            canvas: canvas(PixelSize(width: 1920, height: 1080)))
+
+        XCTAssertEqual(chain, "scale=1920:1080:\(scalerFlags),pad=1920:1080:0:0,"
+                       + "setsar=1,fps=30,format=yuv420p")
+    }
+
     /// Probing does not always report a frame size. Without one there is nothing
     /// to compute a fit from, and the chain has to stay exactly what it was
     /// before geometry existed.

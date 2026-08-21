@@ -103,6 +103,18 @@ struct CanvasSpec: Sendable {
     var height: Int
     var fps: String      // exact frame rate as an ffmpeg rational/number, e.g. "21700/869"
     var fpsValue: Double // numeric value of `fps`, for display and duration math
+
+    /// A 4:2:0 chroma plane is half-resolution on both axes, so it cannot
+    /// describe an odd-sized picture at all — x264 rejects the encode outright
+    /// rather than rounding. 4:4:4 carries full-resolution chroma and has no
+    /// such constraint, so an odd canvas is delivered there instead.
+    nonisolated var hasOddDimension: Bool { width % 2 != 0 || height % 2 != 0 }
+
+    /// The pixel format the finished stream is written in. 4:2:0 stays the
+    /// default for every even canvas: it is the universally hardware-decodable
+    /// format, and switching a canvas that never needed 4:4:4 would change the
+    /// bytes of projects that have already been exported.
+    nonisolated var deliveryPixelFormat: String { hasOddDimension ? "yuv444p" : "yuv420p" }
 }
 
 struct ExportResult: Sendable {
@@ -488,6 +500,7 @@ struct FFTools: Sendable {
                                           canvas: CanvasSpec) -> String {
         let W = canvas.width, H = canvas.height
         let scalerFlags = "flags=bicubic+accurate_rnd+bitexact:sws_dither=none"
+        let delivery = canvas.deliveryPixelFormat
 
         // Without a probed frame size there is nothing to compute a fit from.
         // Hand the job back to ffmpeg's runtime expression — byte for byte what
@@ -495,7 +508,7 @@ struct FFTools: Sendable {
         guard item.sourceSize.isUsable else {
             return "scale=\(W):\(H):force_original_aspect_ratio=decrease:\(scalerFlags)," +
                    "format=yuv444p,pad=\(W):\(H):(ow-iw)/2:(oh-ih)/2," +
-                   "setsar=1,fps=\(canvas.fps),format=yuv420p"
+                   "setsar=1,fps=\(canvas.fps),format=\(delivery)"
         }
 
         let placement = resolve(item.geometry, source: item.sourceSize, canvas: canvas)
@@ -505,7 +518,7 @@ struct FFTools: Sendable {
         // straight to a canvas-sized frame and paint it out, keeping only the
         // segment's timing.
         guard !placement.isFullyOffCanvas else {
-            return "scale=\(W):\(H):\(scalerFlags),setsar=1,fps=\(canvas.fps),format=yuv420p," +
+            return "scale=\(W):\(H):\(scalerFlags),setsar=1,fps=\(canvas.fps),format=\(delivery)," +
                    "drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill"
         }
 
@@ -533,8 +546,11 @@ struct FFTools: Sendable {
         ]
         // Keep the ordinary all-even path free of a needless 4:2:0 → 4:4:4 →
         // 4:2:0 round trip. Full chroma is only required when one of the actual
-        // canvas-grid operations needs to address an odd pixel coordinate.
-        if canvasGridValues.contains(where: { $0 % 2 != 0 }) {
+        // canvas-grid operations needs to address an odd pixel coordinate — or
+        // when the canvas itself is odd, where `pad` has an odd target and every
+        // even-looking grid value would still land on a plane that cannot hold
+        // it.
+        if canvas.hasOddDimension || canvasGridValues.contains(where: { $0 % 2 != 0 }) {
             parts.append("format=yuv444p")
         }
         if let visible {
@@ -543,7 +559,7 @@ struct FFTools: Sendable {
         parts.append("pad=\(W):\(H):\(placement.padOrigin.x):\(placement.padOrigin.y)")
         parts.append("setsar=1")
         parts.append("fps=\(canvas.fps)")
-        parts.append("format=yuv420p")
+        parts.append("format=\(delivery)")
         return parts.joined(separator: ",")
     }
 
@@ -653,8 +669,10 @@ struct FFTools: Sendable {
         }
 
         args += ["-filter_complex", f, "-map", "[vout]", "-map", "[aout]"]
+        // 4:4:4 only for an odd canvas, which 4:2:0 cannot represent. It costs
+        // hardware decoding and bitrate, so an even canvas never pays for it.
         args += ["-c:v", "libx264", "-preset", "medium",
-                 "-crf", "18", "-pix_fmt", "yuv420p",
+                 "-crf", "18", "-pix_fmt", canvas.deliveryPixelFormat,
                  "-x264-params", "threads=1:lookahead-threads=1:deterministic=1:cpu-independent=1"]
         args += ["-c:a", "aac", "-b:a", "192k", "-aac_coder", "twoloop"]
         args += ["-map_metadata", "-1", "-map_chapters", "-1",

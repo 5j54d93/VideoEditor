@@ -40,6 +40,27 @@ final class AssemblyArgumentsTests: XCTestCase {
         XCTAssertLessThan(outputFFlags, args.endIndex - 1)
     }
 
+    /// 4:2:0 cannot describe an odd picture, so an odd canvas is written in
+    /// 4:4:4 rather than rounded to an even size the user never asked for. An
+    /// even canvas must keep 4:2:0: it is the hardware-decodable format, and
+    /// changing it would change the bytes of every project already exported.
+    func testDeliveryPixelFormatFollowsCanvasParity() throws {
+        let input = videoItem(path: "/fixtures/input.mov", hasAudio: true)
+        let output = URL(fileURLWithPath: "/exports/result.mp4")
+
+        let odd = FFTools.assembleArgs(
+            items: [input], audioURL: nil,
+            canvas: CanvasSpec(width: 615, height: 820, fps: "30", fpsValue: 30),
+            output: output)
+        XCTAssertEqual(odd.value(after: "-pix_fmt"), "yuv444p")
+
+        let even = FFTools.assembleArgs(
+            items: [input], audioURL: nil,
+            canvas: CanvasSpec(width: 1920, height: 1080, fps: "30", fpsValue: 30),
+            output: output)
+        XCTAssertEqual(even.value(after: "-pix_fmt"), "yuv420p")
+    }
+
     func testOriginalAudioAssemblyPreservesInputAndFrameMappings() throws {
         let video = videoItem(
             path: "/fixtures/a.mov",

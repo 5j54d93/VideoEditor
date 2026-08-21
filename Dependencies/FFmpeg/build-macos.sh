@@ -118,7 +118,7 @@ for arch in "${ARCHITECTURES[@]}"; do
         --disable-opencl \
         --disable-interlaced \
         --bit-depth=8 \
-        --chroma-format=420 \
+        --chroma-format=all \
         --extra-asflags="-arch $arch -mmacosx-version-min=$MIN_MACOS_VERSION -isysroot $SDK_PATH" \
         --extra-cflags="-arch $arch -mmacosx-version-min=$MIN_MACOS_VERSION -isysroot $SDK_PATH" \
         --extra-ldflags="-arch $arch -mmacosx-version-min=$MIN_MACOS_VERSION -isysroot $SDK_PATH" \
