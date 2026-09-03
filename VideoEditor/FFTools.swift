@@ -160,10 +160,47 @@ private nonisolated final class ProcessBox: @unchecked Sendable {
     }
 }
 
+/// How a child tool ended, plus everything it printed on stdout+stderr.
+///
+/// The captured text alone cannot describe every failure. A tool the kernel
+/// refuses to exec — an invalid code signature, a missing dependency — is killed
+/// before it writes a single byte, so reporting only its output turns that into
+/// a message with nothing after the colon. The exit status is the part that
+/// always exists, and a signal is not an exit code: `terminationStatus` is the
+/// signal number in that case, so the two have to be told apart.
+private nonisolated struct ToolRun: Sendable {
+    var status: Int32
+    /// Terminated by a signal, making `status` that signal rather than an exit code.
+    var killedBySignal: Bool
+    var output: String
+
+    var succeeded: Bool { status == 0 && !killedBySignal }
+
+    /// e.g. "code 1" or "signal 9（Killed）".
+    var statusLabel: String {
+        guard killedBySignal else { return "code \(status)" }
+        // Darwin's strsignal already appends the number ("Killed: 9"); keep the name.
+        guard let raw = strsignal(status),
+              let name = String(cString: raw).split(separator: ":").first,
+              !name.isEmpty else { return "signal \(status)" }
+        return "signal \(status)（\(name)）"
+    }
+
+    /// Never empty, even when the tool printed nothing at all.
+    var failureDescription: String {
+        let text = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard text.isEmpty else { return "（\(statusLabel)）\(text)" }
+        // Nothing on either pipe and a signal means the tool never ran: the
+        // kernel refused to exec it, which no ffprobe message can explain.
+        return "以 \(statusLabel) 結束，沒有任何輸出。" +
+            (killedBySignal ? "App 內附的工具可能被系統擋下執行（例如簽章無效）。" : "")
+    }
+}
+
 enum FFError: LocalizedError {
     case notFound
     case probeFailed(String)
-    case exportFailed(code: Int32, log: String)
+    case exportFailed(status: String, log: String)
 
     var errorDescription: String? {
         switch self {
@@ -171,8 +208,8 @@ enum FFError: LocalizedError {
             return "App 內附的 ffmpeg / ffprobe 遺失或無法執行。請重新下載或安裝 VideoEditor。"
         case .probeFailed(let msg):
             return "無法讀取影片資訊：\(msg)"
-        case .exportFailed(let code, let log):
-            return "輸出失敗（code \(code)）：\n\(log)"
+        case .exportFailed(let status, let log):
+            return "輸出失敗（\(status)）：\n\(log)"
         }
     }
 }
@@ -198,13 +235,23 @@ struct FFTools: Sendable {
 
     // MARK: Probe
 
+    /// Run ffprobe and decode the JSON report it was asked for. Both failure
+    /// modes name what actually happened: the tool failing or being killed
+    /// (which is the only thing left to report when it printed nothing), and
+    /// output that came back but isn't the JSON we asked for.
+    private nonisolated func probeJSON(_ args: [String]) async throws -> [String: Any] {
+        let outcome = try await Self.run(ffprobe, args)
+        guard outcome.succeeded else { throw FFError.probeFailed(outcome.failureDescription) }
+        guard let data = outcome.output.data(using: .utf8),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw FFError.probeFailed("ffprobe 的輸出無法解析：\(outcome.output)")
+        }
+        return root
+    }
+
     nonisolated func probe(_ url: URL) async throws -> MediaInfo {
         let args = ["-v", "error", "-show_streams", "-show_format", "-of", "json", url.path]
-        let (code, out) = try await Self.run(ffprobe, args)
-        guard code == 0, let data = out.data(using: .utf8),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw FFError.probeFailed(out)
-        }
+        let root = try await probeJSON(args)
 
         let streams = (root["streams"] as? [[String: Any]]) ?? []
         let format = (root["format"] as? [String: Any]) ?? [:]
@@ -290,11 +337,9 @@ struct FFTools: Sendable {
         let args = ["-v", "error", "-select_streams", "v:0",
                     "-read_intervals", "%+#1", "-show_streams", "-show_frames",
                     "-of", "json", url.path]
-        let (code, out) = try await Self.run(ffprobe, args)
-        guard code == 0, let data = out.data(using: .utf8),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let s = (root["streams"] as? [[String: Any]])?.first else {
-            throw FFError.probeFailed(out)
+        let root = try await probeJSON(args)
+        guard let s = (root["streams"] as? [[String: Any]])?.first else {
+            throw FFError.probeFailed("找不到影像串流")
         }
         let codedWidth = (s["width"] as? Int) ?? 0
         let codedHeight = (s["height"] as? Int) ?? 0
@@ -308,11 +353,7 @@ struct FFTools: Sendable {
     /// Container duration in seconds (used for audio files).
     nonisolated func probeDuration(_ url: URL) async throws -> Double {
         let args = ["-v", "error", "-show_entries", "format=duration", "-of", "json", url.path]
-        let (code, out) = try await Self.run(ffprobe, args)
-        guard code == 0, let data = out.data(using: .utf8),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw FFError.probeFailed(out)
-        }
+        let root = try await probeJSON(args)
         return Double((root["format"] as? [String: Any])?["duration"] as? String ?? "") ?? 0
     }
 
@@ -327,9 +368,9 @@ struct FFTools: Sendable {
         guard let timeBase, timeBase.isFinite, timeBase > 0 else { return ([], nil) }
         let args = ["-v", "error", "-select_streams", "v:0",
                     "-show_entries", "packet=pts,duration", "-of", "csv=p=0", url.path]
-        let (code, out) = try await Self.run(ffprobe, args)
-        guard code == 0 else { throw FFError.probeFailed(out) }
-        return Self.parseFramePackets(out, timeBase: timeBase)
+        let outcome = try await Self.run(ffprobe, args)
+        guard outcome.succeeded else { throw FFError.probeFailed(outcome.failureDescription) }
+        return Self.parseFramePackets(outcome.output, timeBase: timeBase)
     }
 
     /// Decode ffprobe's compact packet table while retaining the packet duration
@@ -694,26 +735,28 @@ struct FFTools: Sendable {
 
         var args = Self.assembleArgs(items: items, audioURL: audioURL, canvas: canvas,
                                      output: scratch)
-        let code: Int32, log: String
+        let outcome: ToolRun
         if let onProgress {
             // Stream machine-readable progress on stdout; stderr stays the log.
             args.insert(contentsOf: ["-progress", "pipe:1", "-stats_period", "0.2", "-nostats"], at: 1)
             let total = items.reduce(0) { $0 + $1.duration }
-            (code, log) = try await Self.runReportingProgress(ffmpeg, args, totalDuration: total,
-                                                              onProgress: onProgress)
+            outcome = try await Self.runReportingProgress(ffmpeg, args, totalDuration: total,
+                                                          onProgress: onProgress)
         } else {
-            (code, log) = try await Self.run(ffmpeg, args)
+            outcome = try await Self.run(ffmpeg, args)
         }
         // A terminated ffmpeg exits nonzero; surface the cancellation instead
         // of a bogus export-failed error.
         try Task.checkCancellation()
-        guard code == 0 else { throw FFError.exportFailed(code: code, log: log) }
+        guard outcome.succeeded else {
+            throw FFError.exportFailed(status: outcome.statusLabel, log: outcome.output)
+        }
         try Self.install(scratch, at: output)
         let sha = try Self.sha256(of: output)
         // Report the command the user asked for, not the scratch path it ran under.
         let pretty = ([ffmpeg.lastPathComponent] +
                       args.map { $0 == scratch.path ? output.path : $0 }).joined(separator: " ")
-        return ExportResult(outputURL: output, sha256: sha, command: pretty, log: log)
+        return ExportResult(outputURL: output, sha256: sha, command: pretty, log: outcome.output)
     }
 
     /// A hidden sibling of `output` — same directory, so installing it is a
@@ -826,7 +869,7 @@ struct FFTools: Sendable {
     private nonisolated static func runReportingProgress(
         _ url: URL, _ args: [String], totalDuration: Double,
         onProgress: @escaping @Sendable (Double) -> Void
-    ) async throws -> (Int32, String) {
+    ) async throws -> ToolRun {
         let box = ProcessBox()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { cont in
@@ -869,8 +912,10 @@ struct FFTools: Sendable {
                     proc.waitUntilExit()
                     progressPipe.fileHandleForReading.readabilityHandler = nil
                     if proc.terminationStatus == 0 { onProgress(1) }
-                    let text = String(data: logData, encoding: .utf8) ?? ""
-                    cont.resume(returning: (proc.terminationStatus, text))
+                    cont.resume(returning: ToolRun(
+                        status: proc.terminationStatus,
+                        killedBySignal: proc.terminationReason == .uncaughtSignal,
+                        output: String(data: logData, encoding: .utf8) ?? ""))
                 }
             }
         } onCancel: {
@@ -878,8 +923,9 @@ struct FFTools: Sendable {
         }
     }
 
-    /// Run a binary off the main actor and capture combined stdout+stderr.
-    private nonisolated static func run(_ url: URL, _ args: [String]) async throws -> (Int32, String) {
+    /// Run a binary off the main actor and capture combined stdout+stderr,
+    /// alongside how it ended.
+    private nonisolated static func run(_ url: URL, _ args: [String]) async throws -> ToolRun {
         try await withCheckedThrowingContinuation { cont in
             DispatchQueue.global(qos: .userInitiated).async {
                 let proc = Process()
@@ -896,8 +942,10 @@ struct FFTools: Sendable {
                 }
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()
                 proc.waitUntilExit()
-                let text = String(data: data, encoding: .utf8) ?? ""
-                cont.resume(returning: (proc.terminationStatus, text))
+                cont.resume(returning: ToolRun(
+                    status: proc.terminationStatus,
+                    killedBySignal: proc.terminationReason == .uncaughtSignal,
+                    output: String(data: data, encoding: .utf8) ?? ""))
             }
         }
     }
