@@ -29,6 +29,12 @@ struct ContentView: View {
                 // the player layer underneath; laying the workspace over the top
                 // leaves both exactly where they were for the return trip.
                 .overlay { reframingLayer }
+                // A sheet stops clicks and keys reaching the window beneath it,
+                // but AppKit keeps delivering pointer tracking there, so hover
+                // callbacks under the sheet — the timeline's scrub preview above
+                // all — carry on running. Take the editor out of hit testing for
+                // as long as any sheet stands over it.
+                .allowsHitTesting(!sheetPresented)
         }
         .frame(minWidth: 1120, minHeight: 760)
         .onAppear {
@@ -77,12 +83,20 @@ struct ContentView: View {
         .onChange(of: model.errorMessage) { _, msg in
             if msg != nil { exportSheet = false }   // let the error sheet stand alone
         }
+        .onChange(of: sheetPresented) { _, presented in
+            // A hover already under way when the sheet rises would otherwise
+            // linger until the pointer next moves.
+            if presented { model.clearTimelineHover() }
+        }
     }
 
     private var errorPresented: Binding<Bool> {
         Binding(get: { model.errorMessage != nil },
                 set: { if !$0 { model.errorMessage = nil } })
     }
+
+    /// Any sheet standing over the editor: the export flow's or the error's.
+    private var sheetPresented: Bool { exportSheet || model.errorMessage != nil }
 
     private func startExport() {
         model.exportResult = nil               // reopen in setup state, not last result
