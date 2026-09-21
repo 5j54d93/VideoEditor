@@ -285,7 +285,7 @@ nonisolated struct ClipGeometry: Equatable, Sendable {
 }
 
 struct ClipItem: Identifiable, Equatable {
-    let id = UUID()
+    private(set) var id = UUID()
     var url: URL
     var kind: ClipKind
     var geometry = ClipGeometry()
@@ -405,4 +405,13 @@ struct ClipItem: Identifiable, Equatable {
     /// First dropped frame (exclusive).
     var trimEndFrame: Int { grid.nearestBoundary(to: outPoint) }
 
+    /// The same clip under a new identity, so it can stand beside the original
+    /// on the timeline. A split derives its second half this way: every field
+    /// carries over and only a boundary moves afterwards. Spelling the fields
+    /// out in an initializer call is how the crop went missing from that half.
+    func withNewIdentity() -> ClipItem {
+        var copy = self
+        copy.id = UUID()
+        return copy
+    }
 }

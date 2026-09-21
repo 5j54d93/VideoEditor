@@ -1454,20 +1454,8 @@ final class EditorModel {
         // The pad hangs off the source's final frame, so it belongs to whichever
         // half still ends there.
         var left = seg; left.outPoint = t; left.videoPadDuration = 0
-        let right = ClipItem(url: seg.url, kind: .video, naturalWidth: seg.naturalWidth,
-                            naturalHeight: seg.naturalHeight, sourceDuration: seg.sourceDuration,
-                            fps: seg.fps, fpsRational: seg.fpsRational,
-                            hasAudio: seg.hasAudio, frameTimes: seg.frameTimes,
-                            inPoint: t, outPoint: seg.outPoint,
-                            containerStartTime: seg.containerStartTime,
-                            videoStartTime: seg.videoStartTime,
-                            videoDuration: seg.videoDuration,
-                            frameEndTime: seg.frameEndTime,
-                            audioStartTime: seg.audioStartTime,
-                            audioDuration: seg.audioDuration,
-                            audioOutPoint: seg.audioOutPoint,
-                            containerOutPoint: seg.containerOutPoint,
-                            videoPadDuration: seg.videoPadDuration)
+        // The right half is the same clip from the boundary on, crop and all.
+        var right = seg.withNewIdentity(); right.inPoint = t
         items[i] = left
         items.insert(right, at: i + 1)
         selectItem(right.id)

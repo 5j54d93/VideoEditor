@@ -511,6 +511,37 @@ final class EditorModelTimelineTests: XCTestCase {
         XCTAssertEqual(model.items[1].videoPadDuration, 0, accuracy: 1e-12)
     }
 
+    /// A split is a cut through one clip, not a fresh import: both halves keep
+    /// the framing the whole clip had, and the output size stays with them.
+    func testSplitKeepsTheCropOnBothHalves() {
+        let video = LibraryAsset(
+            url: URL(fileURLWithPath: "/fixtures/split-crop.mp4"),
+            kind: .video, width: 1920, height: 1080,
+            duration: 1, fps: 25, fpsRational: "25",
+            hasAudio: false, frameTimes: [0, 0.5, 0.96], frameEndTime: 1
+        )
+        let model = EditorModel()
+        model.library = [video]
+        model.insertLibraryAsset(video.id)
+        model.setFraming(.window(PixelRect(x: 300, y: 40, width: 615, height: 820)),
+                         for: model.items[0].id)
+        let geometry = model.items[0].geometry
+        XCTAssertFalse(geometry.isIdentity)
+
+        model.seekTimeline(to: 0.5)
+        model.splitAtPlayhead()
+
+        XCTAssertEqual(model.items.count, 2)
+        XCTAssertNotEqual(model.items[0].id, model.items[1].id)
+        XCTAssertEqual(model.items[0].geometry, geometry)
+        XCTAssertEqual(model.items[1].geometry, geometry,
+                       "The second half must not fall back to the whole frame")
+        XCTAssertEqual(model.items[0].outPoint, 0.5, accuracy: 1e-12)
+        XCTAssertEqual(model.items[1].inPoint, 0.5, accuracy: 1e-12)
+        XCTAssertEqual(model.canvas.width, 615)
+        XCTAssertEqual(model.canvas.height, 820)
+    }
+
     func testSelectAllThenDeleteClearsTheTimelineAsOneUndoStep() {
         let image = LibraryAsset(
             url: URL(fileURLWithPath: "/fixtures/still.png"),
