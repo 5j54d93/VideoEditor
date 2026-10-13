@@ -105,28 +105,8 @@ struct CropWorkspace<Picture: View>: View {
     // MARK: Stage
 
     private var stage: some View {
-        CropStage(source: item.sourcePixelSize,
-                  window: model.window(for: item),
-                  canvasAspect: Double(model.canvas.width) / Double(max(1, model.canvas.height)),
-                  lockedAspect: model.lockedAspect(for: item),
-                  viewport: $viewport,
-                  onChange: { model.setFraming(.window($0), for: item.id) },
-                  onGestureBegin: { model.beginGeometryGesture(for: item.id) },
-                  onGestureEnd: { model.endGeometryGesture() },
-                  upscaleNote: upscaleNote,
-                  content: picture)
+        WorkspaceStage(model: model, item: item, viewport: $viewport, picture: picture)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    /// Magnifying past the source's own pixels is allowed but worth saying out
-    /// loud — it is the one framing choice that costs picture quality, and it is
-    /// made during the drag, not afterwards in a pane.
-    private var upscaleNote: String? {
-        guard let placement = model.placement(for: item) else { return nil }
-        let window = model.window(for: item)
-        guard window.width > 0, placement.scaledSize.width > window.width else { return nil }
-        let percent = Int((Double(placement.scaledSize.width) / Double(window.width) * 100).rounded())
-        return "放大 \(percent)%，畫面會糊"
     }
 
     // MARK: Frame scrubber
@@ -209,6 +189,47 @@ struct CropWorkspace<Picture: View>: View {
     }
 }
 
+// MARK: - Stage
+
+/// The stage, kept apart from the workspace around it because it is the part
+/// that redraws for every step of a drag. It reads the draft the drag is
+/// proposing; the title bar, frame strip and clip rail read only what is
+/// stored, and so sit still until the drag lands.
+private struct WorkspaceStage<Picture: View>: View {
+    let model: EditorModel
+    let item: ClipItem
+    @Binding var viewport: StageViewport
+    let picture: (_ pointsPerSourcePixel: CGFloat) -> Picture
+
+    var body: some View {
+        // The live canvas, not the stored one: for the clip that sets the
+        // output size the two are the same rectangle, and a stored canvas
+        // trailing the drag would read as a letterbox opening up mid-gesture.
+        let canvas = model.displayedCanvas
+        CropStage(source: item.sourcePixelSize,
+                  window: model.displayedWindow(for: item),
+                  canvasAspect: Double(canvas.width) / Double(max(1, canvas.height)),
+                  lockedAspect: model.lockedAspect(for: item),
+                  viewport: $viewport,
+                  onChange: { model.previewFraming($0, for: item.id) },
+                  onGestureBegin: { model.beginGeometryGesture(for: item.id) },
+                  onGestureEnd: { model.endGeometryGesture() },
+                  upscaleNote: upscaleNote,
+                  content: picture)
+    }
+
+    /// Magnifying past the source's own pixels is allowed but worth saying out
+    /// loud — it is the one framing choice that costs picture quality, and it is
+    /// made during the drag, not afterwards in a pane.
+    private var upscaleNote: String? {
+        guard let placement = model.displayedPlacement(for: item) else { return nil }
+        let window = model.displayedWindow(for: item)
+        guard window.width > 0, placement.scaledSize.width > window.width else { return nil }
+        let percent = Int((Double(placement.scaledSize.width) / Double(window.width) * 100).rounded())
+        return "放大 \(percent)%，畫面會糊"
+    }
+}
+
 // MARK: - Numbers rail
 
 /// The exact-value half of reframing. It lives here as well as in the 版面
@@ -222,7 +243,7 @@ private struct CropNumbersRail: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                ratioSection
+                CropRatioSection(model: model, item: item)
                 Divider().opacity(0.4)
                 windowSection
                 Divider().opacity(0.4)
@@ -234,34 +255,10 @@ private struct CropNumbersRail: View {
         .background(Color(white: 0.155))
     }
 
-    // MARK: Ratio
-
-    private var ratioSection: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            RailLabel("裁剪比例")
-            Picker("裁剪比例", selection: Binding(
-                get: { item.geometry.aspectLock },
-                set: { model.setAspectLock($0, for: item.id) }
-            )) {
-                Text("自由").tag(AspectLock.free)
-                Text("跟著原片").tag(AspectLock.source)
-                Divider()
-                Text("16:9").tag(AspectLock.ratio(width: 16, height: 9))
-                Text("9:16").tag(AspectLock.ratio(width: 9, height: 16))
-                Text("1:1").tag(AspectLock.ratio(width: 1, height: 1))
-                Text("4:3").tag(AspectLock.ratio(width: 4, height: 3))
-            }
-            .labelsHidden()
-            RailNote(item.geometry.aspectLock == .free
-                     ? "四邊都能自由拉動"
-                     : "拖動時會固定成這個比例")
-        }
-    }
-
-
+    /// The numbers follow a drag as it happens, so these read the draft.
     private var windowSection: some View {
         let source = item.sourcePixelSize
-        let window = model.window(for: item)
+        let window = model.displayedWindow(for: item)
         return VStack(alignment: .leading, spacing: 7) {
             RailLabel("畫面範圍（來源像素）")
             if source.isUsable {
@@ -313,8 +310,8 @@ private struct CropNumbersRail: View {
     /// the rectangle above, restated — which is the point: there is nothing
     /// between the crop and the result to reason about.
     private var outputSection: some View {
-        let output = model.canvas
-        let window = model.window(for: item)
+        let output = model.displayedCanvas
+        let window = model.displayedWindow(for: item)
         let setsOutput = model.itemDefiningOutputSize?.id == item.id
         let size = "\(output.width)×\(output.height)"
         return VStack(alignment: .leading, spacing: 7) {
@@ -348,6 +345,35 @@ private struct CropNumbersRail: View {
                       disabled: item.geometry.isIdentity) {
                 model.resetGeometry(for: item.id)
             }
+        }
+    }
+}
+
+/// Its own view so a drag can leave it alone: the rail around it redraws for
+/// every step of one, and nothing here depends on where the rectangle is.
+private struct CropRatioSection: View {
+    let model: EditorModel
+    let item: ClipItem
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            RailLabel("裁剪比例")
+            Picker("裁剪比例", selection: Binding(
+                get: { item.geometry.aspectLock },
+                set: { model.setAspectLock($0, for: item.id) }
+            )) {
+                Text("自由").tag(AspectLock.free)
+                Text("跟著原片").tag(AspectLock.source)
+                Divider()
+                Text("16:9").tag(AspectLock.ratio(width: 16, height: 9))
+                Text("9:16").tag(AspectLock.ratio(width: 9, height: 16))
+                Text("1:1").tag(AspectLock.ratio(width: 1, height: 1))
+                Text("4:3").tag(AspectLock.ratio(width: 4, height: 3))
+            }
+            .labelsHidden()
+            RailNote(item.geometry.aspectLock == .free
+                     ? "四邊都能自由拉動"
+                     : "拖動時會固定成這個比例")
         }
     }
 }

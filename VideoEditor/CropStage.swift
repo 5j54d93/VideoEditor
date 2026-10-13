@@ -239,10 +239,6 @@ struct CropStage<Content: View>: View {
 
     @State private var dragOrigin: PixelRect?
     @State private var isDragging = false
-    /// Dash offset of the selection border, animated forever while the stage is
-    /// up. It is the one moving thing on the stage, and what it says is that the
-    /// rectangle is a live selection rather than part of the picture.
-    @State private var antPhase: CGFloat = 0
     /// Source-pixel coordinates the current drag landed on, for drawing the
     /// guide that claimed them.
     @State private var snappedX: Int?
@@ -440,18 +436,9 @@ struct CropStage<Content: View>: View {
         // side and its inner edge lands exactly on the boundary. A stroke is
         // centred on its path by default, which means half of it always covers
         // kept picture — at high zoom, half of the very pixel the zoom was for.
-        let path = Path(rect.insetBy(dx: -width / 2, dy: -width / 2))
-        return path
-            .stroke(.white.opacity(0.8),
-                    style: StrokeStyle(lineWidth: width, dash: [4, 4],
-                                       dashPhase: antPhase))
-            .shadow(color: .black.opacity(0.45), radius: 1)
+        return MarchingAnts(border: rect.insetBy(dx: -width / 2, dy: -width / 2),
+                            lineWidth: width)
             .allowsHitTesting(false)
-            .onAppear {
-                withAnimation(.linear(duration: 0.75).repeatForever(autoreverses: false)) {
-                    antPhase = -8
-                }
-            }
     }
 
     private func thirds(_ rect: CGRect) -> some View {
@@ -1138,6 +1125,105 @@ final class TrackpadGestureView: NSView {
     private func removeMonitor() {
         if let monitor { NSEvent.removeMonitor(monitor) }
         monitor = nil
+    }
+}
+
+// MARK: - Selection border
+
+/// The selection border, with the ants marched by Core Animation.
+///
+/// This used to be a SwiftUI stroke whose `dashPhase` was animated with
+/// `repeatForever`, which is a SwiftUI update on every display frame for as
+/// long as the stage is up: the whole window's display list walked sixty times
+/// a second, and for the hairline shadow the entire dashed border re-dashed on
+/// the CPU each frame to rebuild the shadow's path — a border that grows with
+/// the zoom. That took about a quarter of the main thread with nothing moving,
+/// and every pan and drag had to fit into what was left. A layer animation runs
+/// in the render server instead; the app only touches the layer when the
+/// rectangle itself moves.
+struct MarchingAnts: NSViewRepresentable {
+    /// The path the stroke is centred on, in the stage's coordinates.
+    let border: CGRect
+    let lineWidth: CGFloat
+
+    func makeNSView(context: Context) -> MarchingAntsView {
+        MarchingAntsView()
+    }
+
+    func updateNSView(_ view: MarchingAntsView, context: Context) {
+        view.update(border: border, lineWidth: lineWidth)
+    }
+}
+
+final class MarchingAntsView: NSView {
+    private static let marchKey = "march"
+    private let ants = CAShapeLayer()
+    private var border: CGRect?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.masksToBounds = true
+        ants.fillColor = nil
+        ants.strokeColor = NSColor.white.withAlphaComponent(0.8).cgColor
+        ants.lineDashPattern = [4, 4]
+        // A shadow cast by the stroke's own coverage — which already carries
+        // the line's 0.8 — is what the SwiftUI version's `.black.opacity(0.45)`
+        // with a 1pt radius came to on screen.
+        ants.shadowColor = NSColor.black.withAlphaComponent(0.45).cgColor
+        ants.shadowOpacity = 1
+        ants.shadowRadius = 1
+        ants.shadowOffset = .zero
+        layer?.addSublayer(ants)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    /// Downwards, like the SwiftUI coordinates the border arrives in.
+    override var isFlipped: Bool { true }
+
+    /// A drawing only: every pointer event belongs to the layers above it.
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        ants.frame = bounds
+        CATransaction.commit()
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        ants.contentsScale = window?.backingScaleFactor ?? 2
+    }
+
+    /// Started here rather than once in `init`: a layer that leaves the tree
+    /// can come back without its animations, and the border is meant to be
+    /// live for as long as it is on screen.
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard window != nil, ants.animation(forKey: Self.marchKey) == nil else { return }
+        let march = CABasicAnimation(keyPath: "lineDashPhase")
+        march.fromValue = 0
+        march.toValue = -8          // one whole period of the [4, 4] pattern
+        march.duration = 0.75
+        march.repeatCount = .infinity
+        march.timingFunction = CAMediaTimingFunction(name: .linear)
+        march.isRemovedOnCompletion = false
+        ants.add(march, forKey: Self.marchKey)
+    }
+
+    func update(border: CGRect, lineWidth: CGFloat) {
+        guard border != self.border || lineWidth != ants.lineWidth else { return }
+        self.border = border
+        // A drag moves this every frame; an implicit fade between two
+        // rectangles would leave the border trailing the pointer.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        ants.path = CGPath(rect: border, transform: nil)
+        ants.lineWidth = lineWidth
+        CATransaction.commit()
     }
 }
 

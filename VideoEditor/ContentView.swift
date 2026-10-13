@@ -209,8 +209,14 @@ struct ContentView: View {
     @ViewBuilder
     private var reframingLayer: some View {
         if model.isGeometryEditing, let item = model.activeItem {
+            // Looked up out here because the closure runs every time the stage
+            // redraws — each step of a pan or a drag — and both lookups resolve
+            // the source's path on disk to find it.
+            let thumbnailer = model.thumbnailer(for: item.url)
+            let sourceRevision = model.videoSourceRevision(for: item.url)
             CropWorkspace(model: model, item: item, viewport: $viewport) { scale in
-                cropPicture(item, pointsPerSourcePixel: scale)
+                cropPicture(item, thumbnailer: thumbnailer, sourceRevision: sourceRevision,
+                            pointsPerSourcePixel: scale)
             }
             .transition(.opacity)
             .onAppear { viewport = StageViewport() }
@@ -221,7 +227,8 @@ struct ContentView: View {
     }
 
     @ViewBuilder
-    private func cropPicture(_ item: ClipItem, pointsPerSourcePixel scale: CGFloat) -> some View {
+    private func cropPicture(_ item: ClipItem, thumbnailer: Thumbnailer?, sourceRevision: Int,
+                             pointsPerSourcePixel scale: CGFloat) -> some View {
         let usesNearestNeighbour = StageViewport.usesNearestNeighbour(
             pointsPerSourcePixel: scale)
         if item.isImage {
@@ -229,14 +236,15 @@ struct ContentView: View {
                 url: item.url,
                 interpolation: usesNearestNeighbour ? .none : .high)
         } else if let player = model.player {
+            let frameIndex = model.currentFrameIndex
             CropVideoPreview(
                 player: player,
-                thumbnailer: model.thumbnailer(for: item.url),
-                time: item.grid.time(ofFrame: model.currentFrameIndex),
+                thumbnailer: thumbnailer,
+                time: item.grid.time(ofFrame: frameIndex),
                 request: CropFrameRequest(
                     url: item.url,
-                    frameIndex: model.currentFrameIndex,
-                    sourceRevision: model.videoSourceRevision(for: item.url)),
+                    frameIndex: frameIndex,
+                    sourceRevision: sourceRevision),
                 interpolation: usesNearestNeighbour ? .none : .high)
         }
     }

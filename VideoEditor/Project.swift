@@ -245,6 +245,22 @@ nonisolated enum ClipFraming: Equatable, Sendable {
     /// A rectangle the user placed, in source pixels, always inside the source
     /// frame — see `PixelRect.clampedWindow`. Everything it contains is picture.
     case window(PixelRect)
+
+    /// A window someone placed, confined to the frame — and stored as
+    /// `.wholeFrame` when, confined, it turns out to be all of it.
+    ///
+    /// `isIdentity` is read off the framing, so a full-frame rectangle stored
+    /// *as* a rectangle counts as an edit: the clip rail marks the clip
+    /// reframed, 回到整張畫面 offers to undo nothing, and export takes the window
+    /// path, whose rounding is not the whole-frame path's — the one an untouched
+    /// project is promised byte for byte. A click inside the crop rectangle is
+    /// a drag that moves nothing, so this is the rectangle a click proposes.
+    /// The same picture has to be the same value, and every window that is
+    /// stored comes through here to make it so.
+    static func placed(_ rect: PixelRect, in source: PixelSize) -> ClipFraming {
+        let window = rect.clampedWindow(in: source)
+        return window.coversWholeFrame(of: source) ? .wholeFrame : .window(window)
+    }
 }
 
 /// How the crop rectangle's aspect ratio is constrained while dragging.

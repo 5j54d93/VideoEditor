@@ -542,6 +542,7 @@ final class EditorModel {
         // pressing ⌘Z; stepping back one adjustment and staying put is what the
         // key means everywhere else. Only the in-flight drag is abandoned.
         geometryGestureSession = nil
+        geometryDraft = nil
         guard let past = undoStack.popLast() else { return }
         redoStack.append(snapshot())
         apply(past)
@@ -554,6 +555,7 @@ final class EditorModel {
         // pressing ⌘Z; stepping back one adjustment and staying put is what the
         // key means everywhere else. Only the in-flight drag is abandoned.
         geometryGestureSession = nil
+        geometryDraft = nil
         guard let future = redoStack.popLast() else { return }
         undoStack.append(snapshot())
         apply(future)
@@ -1736,6 +1738,24 @@ final class EditorModel {
         hasRegisteredUndo: Bool
     )?
 
+    /// The rectangle a drag in flight is proposing, held apart from `items`
+    /// until the drag lets go.
+    ///
+    /// Every pointer step used to be written straight into `items`, and
+    /// `items` is what nearly everything reads: the timeline and library under
+    /// the workspace, the preview, the toolbar. Each step re-laid out the whole
+    /// window, most of it hidden, and cost about a frame on its own — which is
+    /// what dragging the rectangle felt like, worst of all zoomed in, where the
+    /// hand is slowest and most deliberate. Only the workspace shows a drag, so
+    /// only the workspace reads this, and `endGeometryGesture` lands it as the
+    /// one undo step the drag always was.
+    private(set) var geometryDraft: GeometryDraft?
+
+    struct GeometryDraft: Equatable {
+        let itemID: ClipItem.ID
+        var window: PixelRect
+    }
+
     /// The state the whole reframing session started from, and how deep the undo
     /// stack was then. Cancelling restores the one and truncates to the other,
     /// so a session that is thrown away leaves no history behind it.
@@ -1764,8 +1784,10 @@ final class EditorModel {
     }
 
     /// Commit and leave. Every change is already applied and already on the undo
-    /// stack; this only closes the session.
+    /// stack — bar a drag still in the hand, which lands first — so this only
+    /// closes the session.
     func endGeometryEditing() {
+        commitGeometryDraft()
         isGeometryEditing = false
         geometryGestureSession = nil
         geometrySession = nil
@@ -1775,6 +1797,7 @@ final class EditorModel {
     func cancelGeometryEditing() {
         guard isGeometryEditing else { return }
         let session = geometrySession
+        geometryDraft = nil
         isGeometryEditing = false
         geometryGestureSession = nil
         geometrySession = nil
@@ -1796,6 +1819,9 @@ final class EditorModel {
     func retargetGeometryEditing(to id: ClipItem.ID) {
         guard isGeometryEditing, id != activeItemID,
               items.contains(where: { $0.id == id }) else { return }
+        // ] can arrive mid-drag; what the hand had placed belongs to the clip
+        // being left, and stays with it.
+        commitGeometryDraft()
         geometryGestureSession = nil
         isRetargetingGeometry = true
         selectItem(id)
@@ -1850,8 +1876,33 @@ final class EditorModel {
         geometryGestureSession = (id, snapshot(), false)
     }
 
+    /// A drag's next rectangle. The workspace draws it straight away; `items`
+    /// only hears about it when the drag ends.
+    ///
+    /// Clamped here exactly as `setFraming` clamps, so what the stage shows
+    /// mid-drag is what will be stored. Outside a gesture — including one that
+    /// undo has just abandoned — there is nothing to propose to, and the step
+    /// is dropped rather than committed one undo entry at a time.
+    func previewFraming(_ rect: PixelRect, for id: ClipItem.ID) {
+        guard isGeometryEditing, geometryGestureSession?.itemID == id,
+              let item = items.first(where: { $0.id == id }) else { return }
+        let draft = GeometryDraft(itemID: id,
+                                  window: rect.clampedWindow(in: item.sourcePixelSize))
+        if geometryDraft != draft { geometryDraft = draft }
+    }
+
     func endGeometryGesture() {
+        commitGeometryDraft()
         geometryGestureSession = nil
+    }
+
+    /// Lands a drag's rectangle in `items` through the one geometry setter,
+    /// while its gesture session is still open: the snapshot that session took
+    /// before the drag began is the undo step that gets pushed.
+    private func commitGeometryDraft() {
+        guard let draft = geometryDraft else { return }
+        geometryDraft = nil
+        setFraming(.window(draft.window), for: draft.itemID)
     }
 
     /// One pixel. It used to be two, because a 4:2:0 chain rounded odd crop
@@ -1885,6 +1936,38 @@ final class EditorModel {
         item.geometry.window(source: item.sourcePixelSize)
     }
 
+    /// The crop as the workspace shows it: mid-drag, the rectangle the drag is
+    /// proposing; otherwise the one stored. Reading the draft is what ties a
+    /// view to every step of a drag, so only the views that draw the drag ask
+    /// for this — everything else reads `window(for:)` and waits for the drop.
+    func displayedWindow(for item: ClipItem) -> PixelRect {
+        if let draft = geometryDraft, draft.itemID == item.id { return draft.window }
+        return window(for: item)
+    }
+
+    /// The output frame as it will be once the drag in flight lands. Only the
+    /// clip that sets the output size can move it.
+    var displayedCanvas: CanvasSpec {
+        var spec = canvas
+        if let draft = geometryDraft, let first = itemDefiningOutputSize,
+           first.id == draft.itemID, first.sourcePixelSize.isUsable {
+            spec.width = usableCanvasExtent(draft.window.width)
+            spec.height = usableCanvasExtent(draft.window.height)
+        }
+        return spec
+    }
+
+    /// `placement(for:)` with the drag in flight already landed — stored the
+    /// way `setFraming` will store it, so the note it feeds describes the drop.
+    func displayedPlacement(for item: ClipItem) -> Placement? {
+        guard item.sourcePixelSize.isUsable else { return nil }
+        var geometry = item.geometry
+        if let draft = geometryDraft, draft.itemID == item.id {
+            geometry.framing = .placed(draft.window, in: item.sourcePixelSize)
+        }
+        return FFTools.resolve(geometry, source: item.sourcePixelSize, canvas: displayedCanvas)
+    }
+
     /// The part of the source frame that survives into the output, or `nil` when
     /// that is all of it. The filmstrip draws from this: the strip is the
     /// output's index, so pixels the window excludes should not survive there.
@@ -1907,13 +1990,14 @@ final class EditorModel {
         updateGeometry(for: id) { geometry, source in
             switch framing {
             case .wholeFrame:
-                geometry.framing = framing
+                geometry.framing = .wholeFrame
             case .window(let rect):
-                let clamped = rect.clampedWindow(in: source)
-                // A window that happens to be exactly the default framing is
-                // stored as the default, so `isIdentity` — and with it the
-                // byte-for-byte export guarantee — can still be reached by hand.
-                geometry.framing = .window(clamped)
+                // Clamped, and folded back into the default when it covers
+                // the frame — see `ClipFraming.placed`. Together with the
+                // no-op guard in `updateGeometry`, that is what lets a click
+                // that moves nothing, and a window typed back out to the
+                // edges, leave no edit and no history behind.
+                geometry.framing = .placed(rect, in: source)
             }
         }
     }
@@ -1952,7 +2036,9 @@ final class EditorModel {
         for index in items.indices where items[index].id != id {
             var geometry = source
             if case .window(let rect) = source.framing {
-                geometry.framing = .window(rect.clampedWindow(in: items[index].sourcePixelSize))
+                // A window that covers a smaller clip entirely leaves that
+                // clip untouched, not cropped to its own edges.
+                geometry.framing = .placed(rect, in: items[index].sourcePixelSize)
             }
             items[index].geometry = geometry
         }

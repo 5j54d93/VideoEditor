@@ -542,6 +542,192 @@ final class EditorModelTimelineTests: XCTestCase {
         XCTAssertEqual(model.canvas.height, 820)
     }
 
+    // MARK: A drag in flight
+
+    /// A 1920×1080 still on the timeline with the crop workspace open — the
+    /// state every drag starts from.
+    private func reframingModel() -> (EditorModel, ClipItem.ID) {
+        let image = LibraryAsset(url: URL(fileURLWithPath: "/fixtures/still.png"),
+                                 kind: .image, width: 1920, height: 1080)
+        let model = EditorModel()
+        model.library = [image]
+        model.insertLibraryAsset(image.id)
+        model.beginGeometryEditing()
+        return (model, model.items[0].id)
+    }
+
+    /// A drag is shown as it happens but stored once, when it lets go. Writing
+    /// each step into `items` re-laid out the whole window per pointer event,
+    /// which is what made the rectangle stutter under the hand.
+    func testDragIsShownLiveButStoredOnceWhenItLetsGo() {
+        let (model, id) = reframingModel()
+        let first = PixelRect(x: 100, y: 50, width: 800, height: 600)
+        let last = PixelRect(x: 120, y: 60, width: 801, height: 601)
+
+        model.beginGeometryGesture(for: id)
+        model.previewFraming(first, for: id)
+        model.previewFraming(last, for: id)
+
+        XCTAssertTrue(model.items[0].geometry.isIdentity,
+                      "Nothing reaches the project until the drag ends")
+        XCTAssertEqual(model.displayedWindow(for: model.items[0]), last)
+        XCTAssertEqual(model.displayedCanvas.width, 801,
+                       "The output size follows the drag while it is in flight")
+        XCTAssertEqual(model.displayedCanvas.height, 601)
+        XCTAssertEqual(model.canvas.width, 1920)
+
+        model.endGeometryGesture()
+        XCTAssertNil(model.geometryDraft)
+        XCTAssertEqual(model.window(for: model.items[0]), last)
+        XCTAssertEqual(model.canvas.width, 801)
+
+        model.undo()
+        XCTAssertTrue(model.items[0].geometry.isIdentity,
+                      "The whole drag comes back in one undo step")
+    }
+
+    /// What the stage shows mid-drag has to be what gets stored, so the draft
+    /// is clamped by the same rule as the stored window.
+    func testDraftIsClampedExactlyAsTheStoredWindowIs() {
+        let (model, id) = reframingModel()
+        let overhanging = PixelRect(x: 1700, y: -40, width: 400, height: 300)
+
+        model.beginGeometryGesture(for: id)
+        model.previewFraming(overhanging, for: id)
+        let shown = model.displayedWindow(for: model.items[0])
+        XCTAssertEqual(shown, overhanging.clampedWindow(in: PixelSize(width: 1920, height: 1080)))
+
+        model.endGeometryGesture()
+        XCTAssertEqual(model.window(for: model.items[0]), shown)
+    }
+
+    /// 取消 throws the session away, a drag still in the hand included.
+    func testCancellingMidDragKeepsNothing() {
+        let (model, id) = reframingModel()
+        model.beginGeometryGesture(for: id)
+        model.previewFraming(PixelRect(x: 100, y: 50, width: 800, height: 600), for: id)
+
+        model.cancelGeometryEditing()
+        XCTAssertNil(model.geometryDraft)
+        XCTAssertTrue(model.items[0].geometry.isIdentity)
+
+        model.undo()
+        XCTAssertTrue(model.items.isEmpty,
+                      "The insert must be the only step left behind")
+    }
+
+    /// 完成 keeps what is on screen, even when it is pressed before the drag
+    /// has let go — and it is still one undo step.
+    func testFinishingMidDragKeepsWhatTheHandPlaced() {
+        let (model, id) = reframingModel()
+        let placed = PixelRect(x: 100, y: 50, width: 800, height: 600)
+        model.beginGeometryGesture(for: id)
+        model.previewFraming(placed, for: id)
+
+        model.endGeometryEditing()
+        XCTAssertFalse(model.isGeometryEditing)
+        XCTAssertEqual(model.window(for: model.items[0]), placed)
+
+        model.undo()
+        XCTAssertTrue(model.items[0].geometry.isIdentity)
+    }
+
+    /// ⌘Z mid-drag abandons the drag: the rest of it moves nothing, and
+    /// letting go afterwards stores nothing either.
+    func testUndoMidDragAbandonsTheRestOfIt() {
+        let (model, id) = reframingModel()
+        let earlier = PixelRect(x: 10, y: 10, width: 1000, height: 500)
+        model.setFraming(.window(earlier), for: id)
+
+        model.beginGeometryGesture(for: id)
+        model.previewFraming(PixelRect(x: 100, y: 50, width: 800, height: 600), for: id)
+        model.undo()
+        XCTAssertTrue(model.items[0].geometry.isIdentity)
+
+        model.previewFraming(PixelRect(x: 300, y: 200, width: 640, height: 360), for: id)
+        XCTAssertNil(model.geometryDraft)
+        model.endGeometryGesture()
+        XCTAssertTrue(model.items[0].geometry.isIdentity)
+
+        model.redo()
+        XCTAssertEqual(model.window(for: model.items[0]), earlier,
+                       "The abandoned drag must not have touched the history")
+    }
+
+    // MARK: The whole frame is not an edit
+
+    /// A click inside the crop rectangle is a drag that moves nothing, and what
+    /// it proposes is the frame it started from. That must not count as
+    /// reframing: `isIdentity` is what marks a clip touched in the clip rail,
+    /// what enables 回到整張畫面, and what sends export down the untouched path.
+    func testADragThatProposesTheWholeFrameIsNotAnEdit() {
+        let (model, id) = reframingModel()
+        let whole = PixelRect(x: 0, y: 0, width: 1920, height: 1080)
+
+        model.beginGeometryGesture(for: id)
+        model.previewFraming(whole, for: id)
+        XCTAssertNil(model.displayedPlacement(for: model.items[0])?.sourceCrop,
+                     "Mid-drag, the stage must already resolve it as the whole frame")
+        model.endGeometryGesture()
+
+        XCTAssertTrue(model.items[0].geometry.isIdentity)
+        XCTAssertNil(model.placement(for: model.items[0])?.sourceCrop,
+                     "Export must take the whole-frame path, not crop to the frame")
+        model.undo()
+        XCTAssertTrue(model.items.isEmpty, "A drag that changed nothing costs no history")
+    }
+
+    /// Typing the frame's own numbers back in — or dragging the rectangle out
+    /// past the edges — is the way back to an untouched clip, and has to arrive
+    /// at exactly the default rather than at a rectangle that merely matches it.
+    func testAWindowCoveringTheWholeFrameIsStoredAsTheDefault() {
+        let (model, id) = reframingModel()
+        model.setFraming(.window(PixelRect(x: 100, y: 50, width: 800, height: 600)), for: id)
+        XCTAssertFalse(model.items[0].geometry.isIdentity)
+        XCTAssertEqual(model.canvas.width, 800)
+
+        model.setFraming(.window(PixelRect(x: 0, y: 0, width: 1920, height: 1080)), for: id)
+        XCTAssertTrue(model.items[0].geometry.isIdentity)
+        XCTAssertEqual(model.canvas.width, 1920)
+        XCTAssertEqual(model.canvas.height, 1080)
+
+        // Overhanging every edge, the clamp brings it back to the frame, and
+        // the frame is the default.
+        model.setFraming(.window(PixelRect(x: -20, y: -20, width: 2000, height: 1200)), for: id)
+        XCTAssertTrue(model.items[0].geometry.isIdentity)
+    }
+
+    /// Nudging a window that already covers the frame has nowhere to go.
+    func testNudgingTheWholeFrameChangesNothing() {
+        let (model, _) = reframingModel()
+        model.nudgeGeometry(dx: 1, dy: 0)
+        model.nudgeGeometry(dx: 0, dy: -1, coarse: true)
+        XCTAssertTrue(model.items[0].geometry.isIdentity)
+        model.undo()
+        XCTAssertTrue(model.items.isEmpty, "Nothing moved, so nothing was recorded")
+    }
+
+    /// Copying a crop onto a smaller clip that it covers entirely leaves that
+    /// clip untouched, rather than cropped to its own edges.
+    func testApplyingACropThatCoversASmallerClipLeavesItUntouched() {
+        let large = LibraryAsset(url: URL(fileURLWithPath: "/fixtures/large.png"),
+                                 kind: .image, width: 3840, height: 2160)
+        let small = LibraryAsset(url: URL(fileURLWithPath: "/fixtures/small.png"),
+                                 kind: .image, width: 1280, height: 720)
+        let model = EditorModel()
+        model.library = [large, small]
+        model.insertLibraryAsset(large.id)
+        model.insertLibraryAsset(small.id)
+        model.setFraming(.window(PixelRect(x: 0, y: 0, width: 1920, height: 1080)),
+                         for: model.items[0].id)
+
+        model.applyGeometryToAllItems(from: model.items[0].id)
+
+        XCTAssertFalse(model.items[0].geometry.isIdentity)
+        XCTAssertTrue(model.items[1].geometry.isIdentity,
+                      "A 1920×1080 window clamped to a 1280×720 frame is that frame")
+    }
+
     func testSelectAllThenDeleteClearsTheTimelineAsOneUndoStep() {
         let image = LibraryAsset(
             url: URL(fileURLWithPath: "/fixtures/still.png"),
