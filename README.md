@@ -4,7 +4,7 @@
 ![GitHub repo size](https://img.shields.io/github/repo-size/5j54d93/VideoEditor)
 ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)
 
-A native macOS video editor built with SwiftUI that cuts on **real** frames and writes repeatable MP4s：with the same app build, sources, cut points and CPU architecture, another export produces the same SHA-256, so re-exporting on the same Mac class does not create another upload in Google Photos or iCloud. Trim, split, reorder, mix in stills and background music, then export through the app's own bundled FFmpeg — no Homebrew, no MacPorts, nothing to install.
+A native macOS video editor built with SwiftUI that cuts on **real** frames and writes repeatable MP4s：with the same app build, sources, cut points and CPU architecture, another export produces the same SHA-256, so re-exporting on the same Mac class does not create another upload in Google Photos or iCloud. Trim, split, reorder, mix in stills, lay music and sound over the cut, then export through the app's own bundled FFmpeg — no Homebrew, no MacPorts, nothing to install.
 
 ## Overview
 
@@ -24,7 +24,7 @@ Drop videos, images and audio files anywhere in the window — or press <kbd>⌘
 - **Probed once**：every file is inspected on import（dimensions, exact frame rate, per-frame timestamps）, so dragging the same asset onto the timeline ten times never re-probes it.
 - **Search and filter**：filter by name, or narrow the grid to videos／images／audio only.
 - **Drag or double-click**：drag a card onto the timeline to insert it at the caret, or double-click to append it to the end.
-- **Audio is background music**：an audio asset doesn't become a clip — it becomes the movie's music track（overriding the clips' own audio）, marked with a 背景音樂 badge on its card.
+- **Audio goes on the track**：an audio asset doesn't join the clip order — it lands on the audio track, under the playhead（double-click, or the card's + action）or wherever it is dropped on the timeline, and is mixed *with* the clips' own sound rather than swapped in for it.
 - **Finder-style selection**：click, <kbd>⌘</kbd>-click and marquee-drag all work, and <kbd>⌫</kbd> removes the selected assets together with every timeline clip made from them, in one undo step.
 - **Re-import is a refresh, not a duplicate**：re-importing a path you already have updates that asset in place — metadata, live playback, filmstrips, undo history and the scrub player all move to the new bytes together, so the preview can never describe a file that no longer exists.
 
@@ -33,13 +33,17 @@ Drop videos, images and audio files anywhere in the window — or press <kbd>⌘
 The timeline **is** the output：every visible clip is part of the exported movie, in exactly this order, and trimmed-away source ranges are never drawn. The one exception is the orange source-tail mark: it is an inspection overlay, not movie time.
 
 - **Cuts land on real frames**：trims, splits and export are all expressed as indices into the source's probed per-packet PTS table, not as seconds. Variable-frame-rate sources, fractional rates like 24.9713 fps, and files whose first frame doesn't start at t = 0 all snap to the frame you actually see — no stray frame from the next scene.
-- **Picture and original audio are separate lanes**：every video clip draws its real frames above its embedded audio, including a delayed start or an early end.
+- **Picture and original audio are separate lanes**：every video clip draws its real frames above its embedded audio, including a delayed start or an early end — and says so when that audio has been muted or detached.
+- **An audio track under the clips**：music, effects and detached sound sit on their own track, each piece placed at a moment of its own and heard *with* the clips' sound rather than instead of it. Overlapping pieces take separate lanes automatically — a bed of music with an effect on it is the ordinary case — so there is no lane to manage. Drag a piece to slide it（it snaps to cuts, the playhead and other pieces）, drag either end to trim it（the sound stays where it was）, <kbd>S</kbd> splits the selected piece at the playhead, <kbd>⌫</kbd> removes it, and the row above the timeline carries volume（0–200%）, mute and fade-in／fade-out. Every piece draws its waveform, scaled to its level.
+- **Sound stops where the picture stops**：the track never lengthens the movie. A piece that outruns the last frame is drawn dimmed past it, is not in the file past it, and its fade-out leads into that cut rather than into silence nobody hears.
+- **A clip's own sound is editable too**：with a video clip selected, the same row offers mute, volume and fades for its embedded audio, and **分離原音** moves that audio onto the track as a piece of its own — movable, trimmable, splittable — leaving the picture silent.
+- **Heard in preview**：the track plays along with the picture, each piece on its own player started and stopped as the playhead crosses it, gain and fades included; export places every sample exactly.
 - **Source tails are a diagnostic, not a chore**：when audio or the MP4 container outlives the final video sample by more than half a frame, a 2 pt orange mark sits on that boundary; hovering or selecting the clip floats a chip with the exact millisecond figure. Shorter tails are not reported at all — export already caps original audio at the final video boundary, so they can never reach the output. The chip offers three things. **放大到尾端** zooms until the tail has a real length, at which point it is drawn to scale spilling right past the boundary（capped so it can never swallow the next clip）. **忽略** simply retires the warning: it changes nothing about the exported file, which is why it is also safe to apply to every clip at once from the toolbar. **延長影像** is the one that edits — offered only for tails of 0.25 s or more, it appends real black frames（ffmpeg `tpad`）so the trailing audio survives into the movie, lengthening the clip, the timeline and the output alike. All three are undoable.
 - **Zoom into individual frames**：the zoom slider（or a pinch gesture）spans 8 to 3,600 points per second and always anchors on the playhead. Once a source frame is wide enough, the overview filmstrip is replaced by exact, individually decoded frame cells — each spanning its own real duration, labelled `f1234`, with the current frame outlined in red. <kbd>⇧</kbd><kbd>Z</kbd> fits the whole movie back into the pane.
 - **Split and ripple-trim at the playhead**：<kbd>S</kbd> splits the active clip in two; <kbd>Q</kbd> and <kbd>W</kbd> throw away everything to the left／right of the playhead within that clip. Both refuse to fire on a clip boundary, so a one-sided trim can never turn into an accidental whole-clip delete.
 - **Reorder by dragging**：one drop surface covers the whole pane — clips, ruler, blank space — and a caret shows exactly which gap a release will land in, including the very start. Multi-selected clips travel as one ordered group even when they aren't adjacent, and the view auto-scrolls while you drag past its edge.
 - **Snap-back playhead**：clicking the ruler seeks, clicking a clip seeks and selects, clicking blank space clears the selection, and pausing mid-playback snaps the playhead onto the nearest frame boundary so the next cut is exact.
-- **Undo everything**：<kbd>⌘</kbd><kbd>Z</kbd> and <kbd>⇧</kbd><kbd>⌘</kbd><kbd>Z</kbd> walk a 100-step snapshot history covering the library, the clip list, trims, order, selection and the music track.
+- **Undo everything**：<kbd>⌘</kbd><kbd>Z</kbd> and <kbd>⇧</kbd><kbd>⌘</kbd><kbd>Z</kbd> walk a 100-step snapshot history covering the library, the clip list, trims, order, selection and the audio track. A slider drag — volume, a fade, an image's duration — is one step, however many values it sent.
 
 ## Preview & Scrubbing
 
@@ -58,6 +62,8 @@ The timeline **is** the output：every visible clip is part of the exported movi
 <kbd>⌘</kbd><kbd>E</kbd> opens a filename／destination sheet（remembering the last folder）, then a live progress sheet with the first frame, percentage, elapsed and estimated remaining — cancellable, and a cancelled export deletes its half-written file instead of leaving a torso behind.
 
 Everything is normalized onto one output frame — the region the first clip keeps — at the exact rational frame rate of the fastest video, scaled, letterboxed, concatenated, and encoded with one fixed internal profile：libx264（medium, CRF 18, `yuv420p`）plus native AAC（two-loop coder, stereo 44.1 kHz, 192 kbps）. There is no hidden quality／threading setting that can silently change the file format.
+
+Sound is the clips' own audio concatenated as a bed — each clip's level and fades applied in place — with every piece of the audio track cut to what the movie has room for, shaped（`volume`, `afade`）, delayed to its place in whole samples and summed over the bed by `amix` with normalization off, so the bed stays as loud as it was however many pieces land on it. Pieces are mixed in an order fixed by where they sit, never by how they were arranged, because floats add in order and the order is part of the bytes. Gain and fades are written only when set, which keeps an untouched project's arguments — and its bytes — exactly what they were before the track existed.
 
 The one thing that varies is chroma, and only because it has to：a 4:2:0 plane is half-resolution on both axes and cannot describe an odd-sized picture at all — x264 refuses the encode rather than rounding it. An odd output frame is therefore written in `yuv444p`（High 4:4:4 Predictive）, which costs bitrate and hardware decoding but delivers the size that was asked for. Every even one keeps `yuv420p` and is byte-for-byte what it always was: enabling 4:4:4 in the bundled x264 was verified not to change a single byte of 4:2:0 output.
 
@@ -81,9 +87,9 @@ The guarantee is intentionally scoped to the **same bundled toolchain and CPU ar
 | <kbd>Space</kbd> | Play／pause |
 | <kbd>←</kbd> <kbd>→</kbd> | Step one frame |
 | <kbd>⇧</kbd><kbd>←</kbd> <kbd>⇧</kbd><kbd>→</kbd> | Step ten frames |
-| <kbd>S</kbd> | Split the active clip at the playhead |
+| <kbd>S</kbd> | Split the active clip — or the selected piece of the audio track — at the playhead |
 | <kbd>Q</kbd> <kbd>W</kbd> | Delete left／right of the playhead |
-| <kbd>⌫</kbd> | Remove the selected clips（or library assets） |
+| <kbd>⌫</kbd> | Remove the selected clips and audio pieces（or library assets） |
 | <kbd>⇧</kbd><kbd>Z</kbd> | Zoom the timeline to fit |
 | <kbd>⌘</kbd><kbd>Z</kbd> <kbd>⇧</kbd><kbd>⌘</kbd><kbd>Z</kbd> | Undo／redo |
 | <kbd>⌘</kbd><kbd>I</kbd> | Import media |

@@ -242,7 +242,6 @@ private struct LibraryAssetCard: View {
     @State private var imageThumb: NSImage?
     @State private var hovering = false
 
-    private var isActiveMusic: Bool { asset.kind == .audio && model.audioURL == asset.url }
     private var selected: Bool { model.selectedLibraryIDs.contains(asset.id) }
 
     var body: some View {
@@ -312,9 +311,9 @@ private struct LibraryAssetCard: View {
                     .clipped()
                 }
             case .audio:
-                Image(systemName: isActiveMusic ? "speaker.wave.2.fill" : "waveform")
+                Image(systemName: "waveform")
                     .font(.title3)
-                    .foregroundStyle(isActiveMusic ? Color.orange : Color.secondary)
+                    .foregroundStyle(Color.secondary)
             }
         }
         .aspectRatio(16.0 / 9.0, contentMode: .fit)
@@ -326,17 +325,6 @@ private struct LibraryAssetCard: View {
                     .foregroundStyle(.white)
                     .padding(.horizontal, 4).padding(.vertical, 1.5)
                     .background(Color.black.opacity(0.55),
-                                in: RoundedRectangle(cornerRadius: 4))
-                    .padding(4)
-            }
-        }
-        .overlay(alignment: .topLeading) {
-            if isActiveMusic {
-                Text("背景音樂")
-                    .font(.system(size: 9, weight: .medium))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 4).padding(.vertical, 1.5)
-                    .background(Color.orange.opacity(0.92),
                                 in: RoundedRectangle(cornerRadius: 4))
                     .padding(4)
             }
@@ -372,38 +360,23 @@ private struct LibraryAssetCard: View {
     }
 
     private func primaryAction() {
-        if isActiveMusic {
-            model.clearAudio()
-        } else {
-            model.insertLibraryAsset(asset.id)
-        }
+        model.insertLibraryAsset(asset.id)
     }
 
-    private var primaryActionIcon: String {
-        switch asset.kind {
-        case .audio: return isActiveMusic ? "speaker.slash.fill" : "speaker.wave.2.fill"
-        case .video, .image: return "plus"
-        }
-    }
+    private var primaryActionIcon: String { "plus" }
 
+    /// Sound goes under the playhead, where the ear is; picture goes on the
+    /// end, where the movie grows.
     private var primaryActionHelp: String {
         switch asset.kind {
-        case .audio: return isActiveMusic ? "取消背景音樂" : "設為背景音樂"
+        case .audio: return "放到音訊軌（播放頭位置）"
         case .video, .image: return "加到時間軸結尾"
         }
     }
 
     @ViewBuilder
     private var contextItems: some View {
-        if asset.kind == .audio {
-            if isActiveMusic {
-                Button("取消背景音樂") { model.clearAudio() }
-            } else {
-                Button("設為背景音樂") { model.insertLibraryAsset(asset.id) }
-            }
-        } else {
-            Button("加到時間軸結尾") { model.insertLibraryAsset(asset.id) }
-        }
+        Button(primaryActionHelp) { model.insertLibraryAsset(asset.id) }
         Button("移除素材（含時間軸片段）", role: .destructive) {
             model.removeFromLibrary(asset.id)
         }

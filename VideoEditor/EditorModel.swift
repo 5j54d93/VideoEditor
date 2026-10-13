@@ -106,13 +106,18 @@ final class EditorModel {
     /// Whether ⌘A / Delete address the timeline. A live selection speaks for
     /// itself; the last-clicked pane only breaks the tie when nothing is selected.
     var timelineHasFocus: Bool {
-        if !selectedIDs.isEmpty { return true }
+        if !selectedIDs.isEmpty || !selectedAudioIDs.isEmpty { return true }
         if !selectedLibraryIDs.isEmpty { return false }
         return focusedPane == .timeline
     }
-    var audioURL: URL?
-    var audioName: String?
-    var audioDuration: Double = 0
+    /// The audio track: sound laid over the picture at moments of its own —
+    /// music, effects, and a clip's own audio once it has been detached.
+    var audioClips: [AudioClip] = []
+    /// Selected pieces of the track. Kept apart from `selectedIDs` because the
+    /// two kinds sit on different rows and answer to different controls, but
+    /// a plain click on either clears the other, so ⌫ always has one target.
+    var selectedAudioIDs: Set<AudioClip.ID> = []
+    @ObservationIgnored private let audioPlayback = AudioTrackPlayback()
 
     // Editing state (of the selected item's source)
     var currentTime: Double = 0
@@ -165,7 +170,6 @@ final class EditorModel {
     private var videoSourceRevisions: [URL: Int] = [:]
     private var sourceImportGenerations: [URL: Int] = [:]
     @ObservationIgnored private var activeImportCount = 0
-    @ObservationIgnored private var audioDurationRequestID = 0
     private var timeObserver: Any?
     private var observedPlayer: AVPlayer?
     @ObservationIgnored private var timeObserverGeneration = 0
@@ -359,6 +363,8 @@ final class EditorModel {
     }
 
     private func syncTimelineTimeFromActive() {
+        // The track follows the playhead wherever this moves it mid-playback.
+        defer { if isTimelinePlaying { syncAudioPlayback() } }
         guard let item = activeItem, let start = timelineStart(for: item.id) else {
             timelineTime = min(max(0, timelineTime), totalOutputDuration)
             return
@@ -490,11 +496,10 @@ final class EditorModel {
     private struct ProjectSnapshot {
         var library: [LibraryAsset]
         var items: [ClipItem]
-        var audioURL: URL?
-        var audioName: String?
-        var audioDuration: Double
+        var audioClips: [AudioClip]
         var activeItemID: ClipItem.ID?
         var selectedIDs: Set<ClipItem.ID>
+        var selectedAudioIDs: Set<AudioClip.ID>
         var selectedLibraryIDs: Set<LibraryAsset.ID>
         var currentTime: Double
         var timelineTime: Double
@@ -511,14 +516,20 @@ final class EditorModel {
         undoSnapshot: ProjectSnapshot,
         hasRegisteredUndo: Bool
     )?
+    /// The same session, for every slider that came after the image one: a
+    /// key names the control, so a drag on one cannot ride on another's step.
+    @ObservationIgnored private var continuousEdit: (
+        key: String,
+        undoSnapshot: ProjectSnapshot,
+        hasRegisteredUndo: Bool
+    )?
     var canUndo: Bool { !undoStack.isEmpty }
     var canRedo: Bool { !redoStack.isEmpty }
 
     private func snapshot() -> ProjectSnapshot {
-        ProjectSnapshot(library: library, items: items,
-                        audioURL: audioURL, audioName: audioName,
-                        audioDuration: audioDuration,
+        ProjectSnapshot(library: library, items: items, audioClips: audioClips,
                         activeItemID: activeItemID, selectedIDs: selectedIDs,
+                        selectedAudioIDs: selectedAudioIDs,
                         selectedLibraryIDs: selectedLibraryIDs,
                         currentTime: currentTime, timelineTime: timelineTime)
     }
@@ -543,6 +554,7 @@ final class EditorModel {
         // key means everywhere else. Only the in-flight drag is abandoned.
         geometryGestureSession = nil
         geometryDraft = nil
+        continuousEdit = nil
         guard let past = undoStack.popLast() else { return }
         redoStack.append(snapshot())
         apply(past)
@@ -556,6 +568,7 @@ final class EditorModel {
         // key means everywhere else. Only the in-flight drag is abandoned.
         geometryGestureSession = nil
         geometryDraft = nil
+        continuousEdit = nil
         guard let future = redoStack.popLast() else { return }
         undoStack.append(snapshot())
         apply(future)
@@ -564,13 +577,11 @@ final class EditorModel {
     private func apply(_ s: ProjectSnapshot) {
         pauseTimelinePlayback()
         clearTimelineHover()
-        audioDurationRequestID &+= 1
         library = s.library
         items = s.items
-        audioURL = s.audioURL
-        audioName = s.audioName
-        audioDuration = s.audioDuration
+        audioClips = s.audioClips
         selectedIDs = s.selectedIDs
+        selectedAudioIDs = s.selectedAudioIDs
         selectedLibraryIDs = s.selectedLibraryIDs
         if let id = s.activeItemID, items.contains(where: { $0.id == id }) {
             selectItemInternal(id, sourceTime: s.currentTime,
@@ -585,6 +596,7 @@ final class EditorModel {
             timelineTime = 0
         }
         reconcileVideoCaches()
+        audioPlayback.reconcile(keeping: Set(audioClips.map(\.id)))
     }
 
     // MARK: - Importing
@@ -955,7 +967,8 @@ final class EditorModel {
         guard let asset = libraryAsset(id) else { return }
         switch asset.kind {
         case .audio:
-            setAudio(asset.url)
+            // Sound has no place in the clip order; it lands under the playhead.
+            insertAudioClip(from: asset, at: timelineTime)
         case .image:
             insertItem(ClipItem(url: asset.url, kind: .image,
                                 naturalWidth: asset.width, naturalHeight: asset.height,
@@ -1014,11 +1027,13 @@ final class EditorModel {
         clearTimelineHover()
         registerUndo()
         let urls = Set(assets.map(\.url))
-        if let audioURL, urls.contains(where: { isSameSource($0, audioURL) }) {
-            resetAudioState()
-        }
         library.removeAll { ids.contains($0.id) }
         selectedLibraryIDs.subtract(ids)
+        // Sound cut from the asset goes with it, detached from a clip or not.
+        let doomedAudio = Set(audioClips.filter { clip in
+            urls.contains(where: { isSameSource($0, clip.url) })
+        }.map(\.id))
+        if !doomedAudio.isEmpty { removeAudioClipsInternal(doomedAudio) }
         let doomed = Set(items.filter { item in
             urls.contains(where: { isSameSource($0, item.url) })
         }.map(\.id))
@@ -1027,7 +1042,7 @@ final class EditorModel {
             let url = normalizedSourceURL(rawURL)
             let stillReferenced = library.contains { isSameSource($0.url, url) }
                 || items.contains { isSameSource($0.url, url) }
-                || audioURL.map { isSameSource($0, url) } == true
+                || audioClips.contains { isSameSource($0.url, url) }
             if !stillReferenced {
                 sourceImportGenerations[url, default: 0] &+= 1
             }
@@ -1050,35 +1065,238 @@ final class EditorModel {
         return ["mp3", "m4a", "wav", "aiff", "aif", "aac", "flac", "ogg"].contains(url.pathExtension.lowercased())
     }
 
-    func setAudio(_ url: URL) {
+    // MARK: - Audio track
+
+    static let maximumAudioGain = 2.0
+
+    /// Put a stretch of a file on the track at `start`. The movie's length is
+    /// untouched: the track is heard under the picture, never appended to it,
+    /// and sound that runs past the last frame simply is not in the file.
+    @discardableResult
+    func insertAudioClip(from asset: LibraryAsset, at start: Double) -> AudioClip.ID? {
+        guard asset.kind == .audio, asset.duration > AudioClip.minimumDuration else { return nil }
+        pauseTimelinePlayback()
+        clearTimelineHover()
         registerUndo()
-        let sourceURL = normalizedSourceURL(url)
-        audioDurationRequestID &+= 1
-        let requestID = audioDurationRequestID
-        audioURL = sourceURL
-        audioName = sourceURL.lastPathComponent
-        audioDuration = 0
-        Task {
-            let duration = if let ff {
-                (try? await ff.probeDuration(sourceURL)) ?? 0.0
-            } else {
-                0.0
+        let clip = AudioClip(url: normalizedSourceURL(asset.url),
+                             audioEndTime: asset.duration,
+                             inPoint: 0, outPoint: asset.duration,
+                             timelineStart: max(0, start))
+        audioClips.append(clip)
+        selectAudioClip(clip.id)
+        return clip.id
+    }
+
+    /// Take a clip's own sound off its picture and onto the track, where it can
+    /// be moved, trimmed and split on its own. The picture goes quiet: that is
+    /// the half of "detach" that makes the other half worth having.
+    func detachOriginalAudio(from id: ClipItem.ID) {
+        pauseTimelinePlayback()
+        guard let index = items.firstIndex(where: { $0.id == id }),
+              let start = timelineStart(for: id) else { return }
+        let item = items[index]
+        guard !item.isImage, item.hasAudio, !item.isAudioMuted else { return }
+        // Up to where the picture's own lane runs: through the black pad when
+        // there is one, and never past the end of the recording.
+        let end = min(item.paddedOutPoint, item.effectiveAudioOutPoint)
+        guard end > item.inPoint + AudioClip.minimumDuration else { return }
+        registerUndo()
+        let clip = AudioClip(url: item.url,
+                             containerStartTime: item.containerStartTime,
+                             audioStartTime: item.audioStartTime,
+                             audioEndTime: item.sourceAudioEndTime,
+                             inPoint: item.inPoint, outPoint: end,
+                             timelineStart: start,
+                             gain: item.audioGain,
+                             fadeIn: item.audioFadeIn, fadeOut: item.audioFadeOut)
+        items[index].isAudioMuted = true
+        applyOriginalAudioGain()
+        audioClips.append(clip)
+        selectAudioClip(clip.id)
+    }
+
+    /// The one piece of the track the inspector and the split key address.
+    var selectedAudioClip: AudioClip? {
+        guard selectedAudioIDs.count == 1, let id = selectedAudioIDs.first else { return nil }
+        return audioClips.first { $0.id == id }
+    }
+
+    func selectAudioClip(_ id: AudioClip.ID) {
+        selectedAudioIDs = [id]
+        selectedIDs = []
+        selectedLibraryIDs = []
+        focusedPane = .timeline
+        endTextEditing()
+    }
+
+    func toggleAudioSelection(_ id: AudioClip.ID) {
+        if selectedAudioIDs.contains(id) {
+            selectedAudioIDs.remove(id)
+        } else {
+            selectedAudioIDs.insert(id)
+        }
+        selectedLibraryIDs = []
+        focusedPane = .timeline
+    }
+
+    /// Slide a clip along the movie. Where it starts is the only thing that
+    /// moves; what plays inside it stays the same.
+    func moveAudioClip(_ id: AudioClip.ID, to start: Double) {
+        pauseTimelinePlayback()
+        guard let index = audioClips.firstIndex(where: { $0.id == id }) else { return }
+        let target = max(0, start)
+        guard abs(target - audioClips[index].timelineStart) > 1e-9 else { return }
+        registerUndo()
+        audioClips[index].timelineStart = target
+    }
+
+    /// Re-cut a clip. Trimming the head keeps the sound where it was on the
+    /// movie by moving the start with the in point, which is what the handle
+    /// expresses; the caller passes all three so the clamping here can decide
+    /// them together rather than one at a time.
+    func trimAudioClip(_ id: AudioClip.ID, inPoint: Double, outPoint: Double,
+                       timelineStart: Double) {
+        pauseTimelinePlayback()
+        guard let index = audioClips.firstIndex(where: { $0.id == id }) else { return }
+        let clip = audioClips[index]
+        let newOut = min(max(outPoint, clip.sourceFloor + AudioClip.minimumDuration),
+                         clip.sourceCeiling)
+        let newIn = min(max(inPoint, clip.sourceFloor), newOut - AudioClip.minimumDuration)
+        let newStart = max(0, timelineStart)
+        guard abs(newIn - clip.inPoint) > 1e-9 || abs(newOut - clip.outPoint) > 1e-9
+                || abs(newStart - clip.timelineStart) > 1e-9 else { return }
+        registerUndo()
+        audioClips[index].inPoint = newIn
+        audioClips[index].outPoint = newOut
+        audioClips[index].timelineStart = newStart
+    }
+
+    /// Cut a clip in two at a moment on the movie. The fades stay with the
+    /// ends they belong to — the first half keeps the fade-in, the second the
+    /// fade-out — so the cut itself is clean.
+    func splitAudioClip(_ id: AudioClip.ID, at time: Double) {
+        pauseTimelinePlayback()
+        guard let index = audioClips.firstIndex(where: { $0.id == id }) else { return }
+        let clip = audioClips[index]
+        let offset = time - clip.timelineStart
+        guard offset > AudioClip.minimumDuration,
+              clip.duration - offset > AudioClip.minimumDuration else { return }
+        registerUndo()
+        var left = clip
+        left.outPoint = clip.inPoint + offset
+        left.fadeOut = 0
+        var right = clip.withNewIdentity()
+        right.inPoint = left.outPoint
+        right.timelineStart = time
+        right.fadeIn = 0
+        audioClips[index] = left
+        audioClips.insert(right, at: index + 1)
+        selectAudioClip(right.id)
+    }
+
+    func setAudioClipMuted(_ muted: Bool, for id: AudioClip.ID) {
+        pauseTimelinePlayback()
+        guard let index = audioClips.firstIndex(where: { $0.id == id }),
+              audioClips[index].isMuted != muted else { return }
+        registerUndo()
+        audioClips[index].isMuted = muted
+    }
+
+    func setAudioClipGain(_ gain: Double, for id: AudioClip.ID) {
+        guard let index = audioClips.firstIndex(where: { $0.id == id }) else { return }
+        let value = min(max(0, gain), Self.maximumAudioGain)
+        guard abs(value - audioClips[index].gain) > 1e-9 else { return }
+        registerUndoForEdit("audio-gain:\(id)")
+        audioClips[index].gain = value
+    }
+
+    func setAudioClipFades(in fadeIn: Double, out fadeOut: Double, for id: AudioClip.ID) {
+        guard let index = audioClips.firstIndex(where: { $0.id == id }) else { return }
+        let clip = audioClips[index]
+        let newIn = min(max(0, fadeIn), clip.duration)
+        let newOut = min(max(0, fadeOut), clip.duration)
+        guard abs(newIn - clip.fadeIn) > 1e-9 || abs(newOut - clip.fadeOut) > 1e-9 else { return }
+        registerUndoForEdit("audio-fade:\(id)")
+        audioClips[index].fadeIn = newIn
+        audioClips[index].fadeOut = newOut
+    }
+
+    // A clip's own sound.
+
+    func setOriginalAudioMuted(_ muted: Bool, for id: ClipItem.ID) {
+        pauseTimelinePlayback()
+        guard let index = items.firstIndex(where: { $0.id == id }),
+              items[index].isAudioMuted != muted else { return }
+        registerUndo()
+        items[index].isAudioMuted = muted
+        applyOriginalAudioGain()
+    }
+
+    func setOriginalAudioGain(_ gain: Double, for id: ClipItem.ID) {
+        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        let value = min(max(0, gain), Self.maximumAudioGain)
+        guard abs(value - items[index].audioGain) > 1e-9 else { return }
+        registerUndoForEdit("original-gain:\(id)")
+        items[index].audioGain = value
+        applyOriginalAudioGain()
+    }
+
+    func setOriginalAudioFades(in fadeIn: Double, out fadeOut: Double, for id: ClipItem.ID) {
+        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        let item = items[index]
+        let newIn = min(max(0, fadeIn), item.displayDuration)
+        let newOut = min(max(0, fadeOut), item.displayDuration)
+        guard abs(newIn - item.audioFadeIn) > 1e-9 || abs(newOut - item.audioFadeOut) > 1e-9 else {
+            return
+        }
+        registerUndoForEdit("original-fade:\(id)")
+        items[index].audioFadeIn = newIn
+        items[index].audioFadeOut = newOut
+    }
+
+    /// The active clip's player plays at the clip's level. Set whenever the
+    /// level or the clip changes; the fades ride on top of it while playing.
+    private func applyOriginalAudioGain() {
+        guard let item = activeItem else { return }
+        player?.volume = Float(item.effectiveAudioGain)
+    }
+
+    /// A slider sends a value per pixel of travel, and each one must not be an
+    /// undo step of its own. The first change of a drag pushes the state from
+    /// before it; the rest ride on that step. Same shape as the image-duration
+    /// slider's session, for every control that came after it.
+    func beginContinuousEdit(_ key: String) {
+        pauseTimelinePlayback()
+        guard continuousEdit?.key != key else { return }
+        continuousEdit = (key, snapshot(), false)
+    }
+
+    func endContinuousEdit(_ key: String) {
+        guard continuousEdit?.key == key else { return }
+        continuousEdit = nil
+    }
+
+    private func registerUndoForEdit(_ key: String) {
+        if var session = continuousEdit, session.key == key {
+            if !session.hasRegisteredUndo {
+                registerUndo(session.undoSnapshot)
+                session.hasRegisteredUndo = true
+                continuousEdit = session
             }
-            guard audioDurationRequestID == requestID, audioURL == sourceURL else { return }
-            audioDuration = duration
+        } else {
+            registerUndo()
         }
     }
 
-    func clearAudio() {
-        registerUndo()
-        resetAudioState()
+    private func removeAudioClipsInternal(_ ids: Set<AudioClip.ID>) {
+        audioClips.removeAll { ids.contains($0.id) }
+        selectedAudioIDs.subtract(ids)
+        audioPlayback.reconcile(keeping: Set(audioClips.map(\.id)))
     }
 
-    private func resetAudioState() {
-        audioDurationRequestID &+= 1
-        audioURL = nil
-        audioName = nil
-        audioDuration = 0
+    private func syncAudioPlayback() {
+        audioPlayback.sync(clips: audioClips, at: timelineTime, playing: isTimelinePlaying,
+                           movieDuration: totalOutputDuration)
     }
 
     // MARK: - Item list ops
@@ -1087,6 +1305,7 @@ final class EditorModel {
         pauseTimelinePlayback()
         selectItemInternal(id)
         selectedIDs = [id]
+        selectedAudioIDs = []
         selectedLibraryIDs = []
     }
 
@@ -1119,6 +1338,7 @@ final class EditorModel {
             players[sourceURL] = np; return np
         }()
         player = p
+        p.volume = Float(item.effectiveAudioGain)
         attachObserver(to: p)
         let target = min(max(item.inPoint, requestedSourceTime ?? item.inPoint), item.outPoint)
         currentTime = target
@@ -1131,6 +1351,7 @@ final class EditorModel {
 
     func selectOnly(_ id: ClipItem.ID) {
         selectedIDs = [id]
+        selectedAudioIDs = []
         selectedLibraryIDs = []
         focusedPane = .timeline
     }
@@ -1144,8 +1365,9 @@ final class EditorModel {
     /// ⌘A on the timeline: every clip becomes selected, ready for a bulk Delete.
     /// The playhead and the active clip stay where they are.
     func selectAllItems() {
-        guard !items.isEmpty else { return }
+        guard !items.isEmpty || !audioClips.isEmpty else { return }
         selectedIDs = Set(items.map(\.id))
+        selectedAudioIDs = Set(audioClips.map(\.id))
         selectedLibraryIDs = []
         focusedPane = .timeline
     }
@@ -1157,6 +1379,7 @@ final class EditorModel {
         guard !visible.isEmpty else { return }
         selectedLibraryIDs = Set(visible.map(\.id))
         selectedIDs = []
+        selectedAudioIDs = []
         focusedPane = .library
     }
 
@@ -1165,7 +1388,7 @@ final class EditorModel {
     @discardableResult
     func selectAllInFocusedPane() -> Bool {
         if timelineHasFocus {
-            guard !items.isEmpty else { return false }
+            guard !items.isEmpty || !audioClips.isEmpty else { return false }
             selectAllItems()
         } else {
             guard !visibleLibraryAssets.isEmpty else { return false }
@@ -1176,12 +1399,14 @@ final class EditorModel {
 
     func clearSelection() {
         selectedIDs = []
+        selectedAudioIDs = []
         selectedLibraryIDs = []
     }
 
     func selectLibraryAsset(_ id: LibraryAsset.ID) {
         selectedLibraryIDs = [id]
         selectedIDs = []
+        selectedAudioIDs = []
         focusedPane = .library
         // The sidebar's counterpart to `pauseTimelinePlayback`: touching a card
         // means the search field is done, and a search field that silently kept
@@ -1196,6 +1421,7 @@ final class EditorModel {
             selectedLibraryIDs.insert(id)
         }
         selectedIDs = []
+        selectedAudioIDs = []
         focusedPane = .library
         endTextEditing()
     }
@@ -1203,11 +1429,12 @@ final class EditorModel {
     /// Remove every selected clip. The playhead lands on the nearest remaining
     /// clip and nothing stays visually selected afterwards.
     func removeSelectedItems() {
-        guard !selectedIDs.isEmpty else { return }
+        guard !selectedIDs.isEmpty || !selectedAudioIDs.isEmpty else { return }
         pauseTimelinePlayback()
         clearTimelineHover()
         registerUndo()
-        removeItemsInternal(selectedIDs)
+        if !selectedAudioIDs.isEmpty { removeAudioClipsInternal(selectedAudioIDs) }
+        if !selectedIDs.isEmpty { removeItemsInternal(selectedIDs) }
         reconcileVideoCaches()
     }
 
@@ -1443,8 +1670,14 @@ final class EditorModel {
         setTrimEnd(edit.sourceTime, for: edit.id)
     }
 
-    /// Split the selected video item at the playhead into two items.
+    /// Split the selected video item at the playhead into two items — or, with
+    /// a piece of the track selected, that piece: the playhead is the one cut
+    /// point, and it reads against whatever is selected under it.
     func splitAtPlayhead() {
+        if let clip = selectedAudioClip {
+            splitAudioClip(clip.id, at: timelineTime)
+            return
+        }
         pauseTimelinePlayback()
         guard let i = activeIndex, !items[i].isImage else { return }
         let seg = items[i]
@@ -1495,6 +1728,12 @@ final class EditorModel {
                     }
                 } else {
                     self.currentTime = max(item.inPoint, t.seconds)
+                    // The clip's own fades, drawn on the volume as it plays.
+                    p.volume = Float(audioGain(at: self.currentTime - item.inPoint,
+                                               duration: item.contentDuration,
+                                               gain: item.effectiveAudioGain,
+                                               fadeIn: item.audioFadeIn,
+                                               fadeOut: item.audioFadeOut))
                     self.syncTimelineTimeFromActive()
                 }
             }
@@ -1567,6 +1806,7 @@ final class EditorModel {
         }
         isTimelinePlaying = true
         playCurrentTimelineItem()
+        syncAudioPlayback()
     }
 
     /// Return keyboard focus from any time/frame text field to the timeline, so
@@ -1583,6 +1823,7 @@ final class EditorModel {
         let wasPlaying = isTimelinePlaying
         isTimelinePlaying = false
         player?.pause()
+        audioPlayback.pauseAll()
         imagePlaybackTask?.cancel()
         imagePlaybackTask = nil
         isAdvancingPlayback = false
@@ -1641,6 +1882,7 @@ final class EditorModel {
                 seekPlayer(to: item.inPoint)
                 syncTimelineTimeFromActive()
             }
+            player.volume = Float(item.effectiveAudioGain)
             player.play()
         }
     }
@@ -1670,6 +1912,7 @@ final class EditorModel {
                 guard let self, self.isTimelinePlaying,
                       self.activeItemID == itemID else { return }
                 self.timelineTime = min(padEnd, initial + Date().timeIntervalSince(startedAt))
+                self.syncAudioPlayback()
                 if self.timelineTime >= padEnd - 1e-6 { break }
                 try? await Task.sleep(for: .milliseconds(33))
             }
@@ -1698,6 +1941,7 @@ final class EditorModel {
             timelineTime = totalOutputDuration
             isTimelinePlaying = false
             isAdvancingPlayback = false
+            audioPlayback.pauseAll()
         }
     }
 
@@ -2070,7 +2314,7 @@ final class EditorModel {
     /// Exporting there is supported, but it consumes the source.
     func isSourceMedia(_ url: URL) -> Bool {
         let target = url.standardizedFileURL.resolvingSymlinksInPath().path
-        return (items.map(\.url) + [audioURL].compactMap { $0 })
+        return (items.map(\.url) + audioClips.map(\.url))
             .contains { $0.standardizedFileURL.resolvingSymlinksInPath().path == target }
     }
 
@@ -2120,7 +2364,25 @@ final class EditorModel {
                                 audioEndTime: audioEnd,
                                 padDuration: pad,
                                 sourceSize: item.sourcePixelSize,
-                                geometry: item.geometry)
+                                geometry: item.geometry,
+                                audioGain: item.effectiveAudioGain,
+                                audioFadeIn: item.audioFadeIn,
+                                audioFadeOut: item.audioFadeOut)
+        }
+    }
+
+    /// The track as export mixes it. A muted clip goes across as silent gain
+    /// and is dropped there, which keeps the deciding in one place.
+    func assemblyAudioClipsForExport() -> [AssemblyAudio] {
+        audioClips.map { clip in
+            AssemblyAudio(url: clip.url,
+                          inputStartTime: clip.containerStartTime,
+                          audioStartTime: clip.audioStartTime,
+                          audioEndTime: clip.audioEndTime,
+                          trimStart: clip.inPoint, trimEnd: clip.outPoint,
+                          timelineStart: clip.timelineStart,
+                          gain: clip.effectiveGain,
+                          fadeIn: clip.fadeIn, fadeOut: clip.fadeOut)
         }
     }
 
@@ -2129,7 +2391,7 @@ final class EditorModel {
         let assemblyItems = assemblyItemsForExport()
         guard !assemblyItems.isEmpty else { errorMessage = "沒有可輸出的素材。"; return }
         let canvas = self.canvas
-        let audio = self.audioURL
+        let track = assemblyAudioClipsForExport()
         isExporting = true
         exportProgress = 0
         exportResult = nil
@@ -2141,7 +2403,7 @@ final class EditorModel {
         exportTask = Task { [self] in
             do {
                 self.exportResult = try await ff.exportAssembly(
-                    items: assemblyItems, audioURL: audio,
+                    items: assemblyItems, audioClips: track,
                     canvas: canvas, output: outURL,
                     onProgress: { [weak self] p in
                         Task { @MainActor [weak self] in self?.exportProgress = p }

@@ -3,8 +3,10 @@
 //  VideoEditor
 //
 //  The assembly project is an ordered list of ClipItems (video clips + still
-//  images) plus one optional background-audio track. Each video item carries an
-//  in/out trim; each image item carries a display duration (stored as outPoint).
+//  images) plus an audio track of AudioClips laid over them. Each video item
+//  carries an in/out trim; each image item carries a display duration (stored
+//  as outPoint); each audio clip carries a stretch of a file and the moment it
+//  starts on the output timeline.
 //
 
 import Foundation
@@ -305,6 +307,13 @@ struct ClipItem: Identifiable, Equatable {
     var url: URL
     var kind: ClipKind
     var geometry = ClipGeometry()
+    /// The clip's own sound as it is heard: a multiplier on the recording, and
+    /// the fades the file will get at either end. Mute keeps the number, so
+    /// switching the sound back on brings back the level it had.
+    var audioGain: Double = 1
+    var isAudioMuted = false
+    var audioFadeIn: Double = 0
+    var audioFadeOut: Double = 0
 
     var naturalWidth: Int
     var naturalHeight: Int
@@ -336,6 +345,9 @@ struct ClipItem: Identifiable, Equatable {
 
     var isImage: Bool { kind == .image }
     var sourcePixelSize: PixelSize { PixelSize(width: naturalWidth, height: naturalHeight) }
+    /// What the recording is multiplied by on the way out — nothing when there
+    /// is no track, or it has been muted or detached onto the audio track.
+    var effectiveAudioGain: Double { hasAudio && !isAudioMuted ? audioGain : 0 }
     /// The clip's real frame span. All source-time arithmetic uses this — the
     /// pad has no source time behind it, only black.
     var contentDuration: Double { max(0, outPoint - inPoint) }
@@ -426,6 +438,89 @@ struct ClipItem: Identifiable, Equatable {
     /// carries over and only a boundary moves afterwards. Spelling the fields
     /// out in an initializer call is how the crop went missing from that half.
     func withNewIdentity() -> ClipItem {
+        var copy = self
+        copy.id = UUID()
+        return copy
+    }
+}
+
+// MARK: - Audio track
+
+/// The level a piece of sound plays at, `time` seconds into it: its gain, taken
+/// down by whichever fade it is inside. Straight lines, because that is what
+/// ffmpeg's `afade` draws by default — the preview approximates this on an
+/// `AVPlayer`'s volume while the export writes the filter, and the two have
+/// to describe the same curve.
+nonisolated func audioGain(at time: Double, duration: Double, gain: Double,
+                           fadeIn: Double, fadeOut: Double) -> Double {
+    guard duration > 0, gain > 0 else { return 0 }
+    var factor = 1.0
+    if fadeIn > 0 { factor = min(factor, time / fadeIn) }
+    if fadeOut > 0 { factor = min(factor, (duration - time) / fadeOut) }
+    return gain * min(1, max(0, factor))
+}
+
+/// One piece of sound on the audio track: a stretch of a file, placed at a
+/// moment on the output timeline and heard under whatever picture is there.
+///
+/// This is what background music became once it could be cut. The old track
+/// was one file, starting at zero, replacing every clip's own sound; a clip on
+/// a track can start anywhere, be trimmed and split like the picture, sit
+/// beside others, and is *mixed* with the clips' sound rather than standing
+/// in for it. A clip's own audio detached from its picture is one of these
+/// too, pointing at the video file — which is why a clip carries the file's
+/// audio timing: a detached track keeps the late start or early end it had.
+struct AudioClip: Identifiable, Equatable {
+    private(set) var id = UUID()
+    var url: URL
+    /// Absolute source timestamp ffmpeg strips from this input without
+    /// `-copyts`; zero for a plain audio file.
+    var containerStartTime: Double = 0
+    /// Where the file's audio actually begins and ends, absolute. `nil` is an
+    /// unknown end, which export treats as "through the out point".
+    var audioStartTime: Double = 0
+    var audioEndTime: Double? = nil
+    /// The stretch of the file that plays, in source seconds.
+    var inPoint: Double
+    var outPoint: Double
+    /// Where that stretch begins on the output timeline.
+    var timelineStart: Double
+    var gain: Double = 1
+    var isMuted = false
+    var fadeIn: Double = 0
+    var fadeOut: Double = 0
+
+    /// Shorter than this and a clip is a click, not a sound — and the trim
+    /// handles would sit on top of each other.
+    static let minimumDuration = 0.05
+
+    var duration: Double { max(0, outPoint - inPoint) }
+    var timelineEnd: Double { timelineStart + duration }
+    var effectiveGain: Double { isMuted ? 0 : gain }
+    var name: String { url.lastPathComponent }
+
+    /// The source seconds a trim may reach: the file's audio, and no further.
+    var sourceFloor: Double { min(audioStartTime, inPoint) }
+    var sourceCeiling: Double { max(audioEndTime ?? outPoint, outPoint) }
+
+    /// How much of the clip the movie has room for: its own length, or less
+    /// when it starts near the end and outruns the picture.
+    func heardDuration(movieDuration: Double) -> Double {
+        min(duration, movieDuration - timelineStart)
+    }
+
+    /// The level `offset` seconds in, with the fade-out leading into wherever
+    /// the sound stops being heard — the clip's own end, or the movie's when
+    /// that comes first. A fade into silence after the last frame would be a
+    /// setting that does nothing.
+    func gain(at offset: Double, movieDuration: Double) -> Double {
+        audioGain(at: offset, duration: heardDuration(movieDuration: movieDuration),
+                  gain: effectiveGain, fadeIn: fadeIn, fadeOut: fadeOut)
+    }
+
+    /// The same sound under a new identity, so a split's second half can stand
+    /// beside its first — every field rides along, as it does for a clip.
+    func withNewIdentity() -> AudioClip {
         var copy = self
         copy.id = UUID()
         return copy

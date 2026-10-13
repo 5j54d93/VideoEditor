@@ -10,7 +10,7 @@ final class AssemblyArgumentsTests: XCTestCase {
 
         let args = FFTools.assembleArgs(
             items: [input],
-            audioURL: nil,
+            audioClips: [],
             canvas: CanvasSpec(width: 1920, height: 1080, fps: "30000/1001", fpsValue: 29.97),
             output: output
         )
@@ -49,13 +49,13 @@ final class AssemblyArgumentsTests: XCTestCase {
         let output = URL(fileURLWithPath: "/exports/result.mp4")
 
         let odd = FFTools.assembleArgs(
-            items: [input], audioURL: nil,
+            items: [input], audioClips: [],
             canvas: CanvasSpec(width: 615, height: 820, fps: "30", fpsValue: 30),
             output: output)
         XCTAssertEqual(odd.value(after: "-pix_fmt"), "yuv444p")
 
         let even = FFTools.assembleArgs(
-            items: [input], audioURL: nil,
+            items: [input], audioClips: [],
             canvas: CanvasSpec(width: 1920, height: 1080, fps: "30", fpsValue: 30),
             output: output)
         XCTAssertEqual(even.value(after: "-pix_fmt"), "yuv420p")
@@ -84,7 +84,7 @@ final class AssemblyArgumentsTests: XCTestCase {
 
         let args = FFTools.assembleArgs(
             items: [video, image],
-            audioURL: nil,
+            audioClips: [],
             canvas: CanvasSpec(width: 1280, height: 720, fps: "25", fpsValue: 25),
             output: URL(fileURLWithPath: "/exports/result.mp4")
         )
@@ -196,27 +196,151 @@ final class AssemblyArgumentsTests: XCTestCase {
         XCTAssertFalse(filter.contains("anullsrc=channel_layout=stereo:sample_rate=44100"))
     }
 
-    func testBackgroundAudioUsesFollowingInputAndExactTimelineDuration() throws {
+    /// The track is mixed over the clips' own sound, not swapped in for it: a
+    /// piece placed at 1.5 s is cut to its own length, shaped, delayed by
+    /// exactly that many samples, and summed with the bed without rescaling.
+    func testTrackIsMixedOverTheClipsOwnAudioWhereItSits() throws {
         let first = videoItem(path: "/fixtures/a.mov", duration: 1.5, hasAudio: true)
         let second = videoItem(path: "/fixtures/b.mov", duration: 2.25, hasAudio: true)
-        let music = URL(fileURLWithPath: "/fixtures/music.m4a")
+        let music = AssemblyAudio(url: URL(fileURLWithPath: "/fixtures/music.m4a"),
+                                  audioEndTime: 30, trimStart: 10, trimEnd: 12,
+                                  timelineStart: 1.5, gain: 0.5, fadeIn: 0.5, fadeOut: 1)
 
         let args = FFTools.assembleArgs(
             items: [first, second],
-            audioURL: music,
+            audioClips: [music],
             canvas: CanvasSpec(width: 1920, height: 1080, fps: "30", fpsValue: 30),
             output: URL(fileURLWithPath: "/exports/result.mp4")
         )
 
-        XCTAssertEqual(args.values(after: "-i"), [first.url.path, second.url.path, music.path])
+        XCTAssertEqual(args.values(after: "-i"), [first.url.path, second.url.path, music.url.path])
         XCTAssertEqual(args.values(after: "-fflags"),
                        ["+bitexact", "+bitexact", "+bitexact", "+bitexact"])
 
         let filter = try XCTUnwrap(args.value(after: "-filter_complex"))
-        XCTAssertTrue(filter.contains("[v0][v1]concat=n=2:v=1:a=0[vout]"))
-        XCTAssertTrue(filter.contains("[2:a]aresample="))
-        XCTAssertTrue(filter.contains("apad,atrim=0:3.750000"))
-        XCTAssertFalse(filter.contains("[0:a]atrim="), "Background music must override source audio")
+        XCTAssertTrue(filter.contains("[0:a]atrim="), "The clips keep their own sound under the track")
+        XCTAssertTrue(filter.contains("[v0][a0][v1][a1]concat=n=2:v=1:a=1[vout][abed];"))
+        XCTAssertTrue(filter.contains("[2:a]atrim=start=10.000000:end=12.000000,asetpts=PTS-STARTPTS,aresample="))
+        // Two seconds of the file, sample-exact, before it is shaped or placed.
+        XCTAssertTrue(filter.contains(
+            "apad=whole_len=88200,atrim=end_sample=88200,asetpts=N/SR/TB,volume=0.500000,"
+            + "afade=t=in:st=0:d=0.500000,afade=t=out:st=1.000000:d=1.000000,"
+            + "adelay=66150S:all=1[t0];"))
+        XCTAssertTrue(filter.hasSuffix("[abed][t0]amix=inputs=2:duration=first:normalize=0[aout]"))
+    }
+
+    /// A project that never touched the track or a clip's sound asks ffmpeg
+    /// for exactly what it did before either existed. The promise is the bytes
+    /// of the file, and these arguments are all that stands between the
+    /// project and them.
+    func testUntouchedSoundProducesTheChainItAlwaysDid() throws {
+        let video = videoItem(path: "/fixtures/plain.mp4", hasAudio: true,
+                              audioStartTime: 0, audioEndTime: 1)
+
+        let filter = try filter(for: video)
+
+        XCTAssertTrue(filter.hasSuffix(
+            "[0:a]atrim=start=0.000000:end=1.000000,asetpts=PTS-STARTPTS,"
+            + "aresample=sample_rate=44100:out_chlayout=stereo:out_sample_fmt=fltp:"
+            + "internal_sample_fmt=s32p:dither_method=none:exact_rational=1,"
+            + "apad=whole_len=44100,atrim=end_sample=44100,asetpts=N/SR/TB[a0];"
+            + "[v0][a0]concat=n=1:v=1:a=1[vout][aout]"))
+        XCTAssertFalse(filter.contains("volume="))
+        XCTAssertFalse(filter.contains("afade="))
+        XCTAssertFalse(filter.contains("amix="))
+    }
+
+    /// A clip's own sound is shaped in place — after its length is fixed, so
+    /// a fade-out knows where the end is — and muted into the same exact
+    /// silence a clip without a track gets.
+    func testAClipsOwnSoundIsShapedInPlaceAndMutedIntoExactSilence() throws {
+        var shaped = videoItem(path: "/fixtures/shaped.mp4", trimStart: 0, trimEnd: 2,
+                               duration: 2, hasAudio: true, audioStartTime: 0, audioEndTime: 2)
+        shaped.audioGain = 1.5
+        shaped.audioFadeIn = 0.25
+        shaped.audioFadeOut = 0.5
+
+        XCTAssertTrue(try filter(for: shaped).contains(
+            "asetpts=N/SR/TB,volume=1.500000,afade=t=in:st=0:d=0.250000,"
+            + "afade=t=out:st=1.500000:d=0.500000[a0];"))
+
+        var muted = shaped
+        muted.audioGain = 0
+        let silent = try filter(for: muted)
+        XCTAssertFalse(silent.contains("[0:a]"))
+        XCTAssertTrue(silent.contains("anullsrc=channel_layout=stereo:sample_rate=44100,"
+                                      + "atrim=end_sample=88200,asetpts=N/SR/TB[a0];"))
+    }
+
+    /// Pieces of the track that cannot be heard — muted, starting after the
+    /// movie ends, or cut from a stretch the file has no sound for — are left
+    /// out before they become inputs, so the command carries nothing idle.
+    func testTrackPiecesThatCannotBeHeardNeverBecomeInputs() throws {
+        let video = videoItem(path: "/fixtures/a.mov", duration: 1, hasAudio: false)
+        let file = URL(fileURLWithPath: "/fixtures/music.m4a")
+        let muted = AssemblyAudio(url: file, audioEndTime: 10, trimStart: 0, trimEnd: 1,
+                                  timelineStart: 0, gain: 0)
+        let late = AssemblyAudio(url: file, audioEndTime: 10, trimStart: 0, trimEnd: 1,
+                                 timelineStart: 1)
+        let silentStretch = AssemblyAudio(url: file, audioStartTime: 5, audioEndTime: 10,
+                                          trimStart: 0, trimEnd: 1, timelineStart: 0)
+        let heard = AssemblyAudio(url: file, audioEndTime: 10, trimStart: 0, trimEnd: 0.5,
+                                  timelineStart: 0.25)
+
+        let args = FFTools.assembleArgs(
+            items: [video],
+            audioClips: [muted, late, silentStretch, heard],
+            canvas: CanvasSpec(width: 1280, height: 720, fps: "25", fpsValue: 25),
+            output: URL(fileURLWithPath: "/exports/result.mp4")
+        )
+
+        XCTAssertEqual(args.values(after: "-i"), [video.url.path, file.path])
+        let filter = try XCTUnwrap(args.value(after: "-filter_complex"))
+        XCTAssertTrue(filter.contains("[1:a]atrim=start=0.000000:end=0.500000"))
+        XCTAssertTrue(filter.contains("adelay=11025S:all=1[t0];"))
+        XCTAssertTrue(filter.hasSuffix("[abed][t0]amix=inputs=2:duration=first:normalize=0[aout]"))
+    }
+
+    /// Sound that outruns the picture is cut where the picture ends, and its
+    /// fade-out leads into that cut rather than into silence nobody hears.
+    func testSoundOutrunningTheMovieIsCutThereAndFadesIntoTheCut() throws {
+        let video = videoItem(path: "/fixtures/a.mov", duration: 4, hasAudio: false)
+        let long = AssemblyAudio(url: URL(fileURLWithPath: "/fixtures/music.m4a"),
+                                 audioEndTime: 60, trimStart: 0, trimEnd: 30,
+                                 timelineStart: 1, fadeOut: 1)
+
+        let args = FFTools.assembleArgs(
+            items: [video],
+            audioClips: [long],
+            canvas: CanvasSpec(width: 1280, height: 720, fps: "25", fpsValue: 25),
+            output: URL(fileURLWithPath: "/exports/result.mp4")
+        )
+
+        let filter = try XCTUnwrap(args.value(after: "-filter_complex"))
+        XCTAssertTrue(filter.contains("[1:a]atrim=start=0.000000:end=3.000000"))
+        XCTAssertTrue(filter.contains(
+            "apad=whole_len=132300,atrim=end_sample=132300,asetpts=N/SR/TB,"
+            + "afade=t=out:st=2.000000:d=1.000000,adelay=44100S:all=1[t0];"))
+    }
+
+    /// Floats add in order, so the order the track is mixed in is part of the
+    /// bytes. It follows where the pieces sit, never how they were arranged.
+    func testTrackOrderIsFixedByPlacementNotByArrayOrder() {
+        let video = videoItem(path: "/fixtures/a.mov", duration: 5, hasAudio: false)
+        let early = AssemblyAudio(url: URL(fileURLWithPath: "/fixtures/early.m4a"),
+                                  audioEndTime: 10, trimStart: 0, trimEnd: 1, timelineStart: 1)
+        let later = AssemblyAudio(url: URL(fileURLWithPath: "/fixtures/later.m4a"),
+                                  audioEndTime: 10, trimStart: 0, trimEnd: 1, timelineStart: 3)
+        let canvas = CanvasSpec(width: 1280, height: 720, fps: "25", fpsValue: 25)
+        let output = URL(fileURLWithPath: "/exports/result.mp4")
+
+        let a = FFTools.assembleArgs(items: [video], audioClips: [early, later],
+                                     canvas: canvas, output: output)
+        let b = FFTools.assembleArgs(items: [video], audioClips: [later, early],
+                                     canvas: canvas, output: output)
+
+        XCTAssertEqual(a, b)
+        XCTAssertEqual(a.values(after: "-i"), [video.url.path, early.url.path, later.url.path])
     }
 
     func testProbeParsersRetainTrackAndFinalPacketTiming() throws {
@@ -335,7 +459,7 @@ final class AssemblyArgumentsTests: XCTestCase {
     private func filter(for item: AssemblyItem) throws -> String {
         let args = FFTools.assembleArgs(
             items: [item],
-            audioURL: nil,
+            audioClips: [],
             canvas: CanvasSpec(width: 1280, height: 720, fps: "25", fpsValue: 25),
             output: URL(fileURLWithPath: "/exports/result.mp4")
         )

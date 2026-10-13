@@ -72,6 +72,52 @@ struct AssemblyItem: Sendable {
     /// geometry chain falls back to letting ffmpeg fit at runtime.
     var sourceSize: PixelSize = .zero
     var geometry = ClipGeometry()
+    /// The clip's own sound on the way out. Zero is silence — the same exact
+    /// silence a clip without a track gets — and one is the recording as it
+    /// is, which adds no filter at all.
+    var audioGain: Double = 1
+    var audioFadeIn: Double = 0
+    var audioFadeOut: Double = 0
+}
+
+/// One piece of the audio track, as export sees it: a stretch of a file and
+/// where on the movie it lands. Timing fields mean what `AssemblyItem`'s do.
+nonisolated struct AssemblyAudio: Sendable, Equatable {
+    var url: URL
+    var inputStartTime: Double = 0
+    var audioStartTime: Double = 0
+    var audioEndTime: Double? = nil
+    var trimStart: Double
+    var trimEnd: Double
+    var timelineStart: Double
+    var gain: Double = 1
+    var fadeIn: Double = 0
+    var fadeOut: Double = 0
+
+    var duration: Double { max(0, trimEnd - trimStart) }
+
+    /// The part of the trim the file actually has sound for, or `nil` when
+    /// the two never meet — a trim entirely before a late-starting track.
+    var audibleRange: (start: Double, end: Double)? {
+        let start = max(trimStart, audioStartTime)
+        let end = min(trimEnd, audioEndTime ?? trimEnd)
+        return end > start + 1e-9 ? (start, end) : nil
+    }
+
+    /// How much of the clip the movie has room for: its own length, or less
+    /// when it starts near the end and outruns the picture.
+    func heardDuration(movieDuration: Double) -> Double {
+        min(duration, movieDuration - timelineStart)
+    }
+
+    /// `audibleRange`, cut again where the movie ends. Sound past the last
+    /// frame is not in the file, so it is not in the segment either — which is
+    /// also what puts a fade-out where the sound actually stops.
+    func heardRange(movieDuration: Double) -> (start: Double, end: Double)? {
+        guard let range = audibleRange else { return nil }
+        let end = min(range.end, trimStart + heardDuration(movieDuration: movieDuration))
+        return end > range.start + 1e-9 ? (range.start, end) : nil
+    }
 }
 
 /// The exact integers one clip's geometry becomes on the ffmpeg command line.
@@ -603,17 +649,23 @@ struct FFTools: Sendable {
     // MARK: Export
 
     /// Build ffmpeg args to assemble several assets (videos + images) into one clip
-    /// on a shared canvas, with either a background-music track (overriding original
-    /// audio) or each item's own audio (silence for images). Re-encoded into the
+    /// on a shared canvas, each clip's own audio under its picture (silence for
+    /// images) and the audio track mixed over the lot. Re-encoded into the
     /// fixed, byte-repeatable-within-one-architecture output profile.
-    nonisolated static func assembleArgs(items: [AssemblyItem], audioURL: URL?, canvas: CanvasSpec,
-                                         output: URL) -> [String] {
+    ///
+    /// A project whose track is empty and whose clips' sound is untouched
+    /// produces the arguments it always did, filter for filter: every addition
+    /// below is conditional on the thing it expresses, so the bytes of an old
+    /// export are not moved by a feature it never used.
+    nonisolated static func assembleArgs(items: [AssemblyItem], audioClips: [AssemblyAudio] = [],
+                                         canvas: CanvasSpec, output: URL) -> [String] {
         let FPS = canvas.fps
         let normalizeAudio = "aresample=sample_rate=44100:out_chlayout=stereo:" +
                              "out_sample_fmt=fltp:internal_sample_fmt=s32p:" +
                              "dither_method=none:exact_rational=1"
         let audioSampleRate = 44_100.0
-        let useOriginalAudio = (audioURL == nil)
+        let movieDuration = items.reduce(0) { $0 + $1.duration }
+        let track = placedAudioClips(audioClips, movieDuration: movieDuration)
 
         // These values are part of the output format, not user preferences. In
         // particular, automatic filter and x264 thread counts change output bytes
@@ -632,8 +684,9 @@ struct FFTools: Sendable {
                 args += ["-fflags", "+bitexact", "-i", it.url.path]
             }
         }
-        let musicIndex = items.count
-        if let audioURL { args += ["-fflags", "+bitexact", "-i", audioURL.path] }
+        // The track's files follow the clips, so a clip keeps the input index it
+        // always had and an empty track changes nothing about the inputs.
+        for clip in track { args += ["-fflags", "+bitexact", "-i", clip.url.path] }
 
         var f = ""
         for (i, it) in items.enumerated() {
@@ -651,58 +704,67 @@ struct FFTools: Sendable {
             } else {
                 f += "[\(i):v]trim=start_frame=\(it.trimStartFrame):end_frame=\(it.trimEndFrame),setpts=PTS-STARTPTS,\(fit)\(videoPad)[v\(i)];"
             }
-            if useOriginalAudio {
-                if it.hasAudio && !it.isImage {
-                    let sourceAudioStart = max(it.trimStart, it.audioStartTime)
-                    // Black appended to the picture raises the ceiling on real
-                    // audio by exactly its own length — otherwise the pad would
-                    // hold silence and preserve nothing.
-                    let audioCeiling = it.trimEnd + max(0, it.padDuration)
-                    let sourceAudioEnd = min(audioCeiling, it.audioEndTime ?? audioCeiling)
-                    let targetSamples = max(1, Int64(floor(it.duration * audioSampleRate + 1e-9)))
-                    if sourceAudioEnd > sourceAudioStart + 1e-9 {
-                        // ffmpeg rebases each input by its container start when
-                        // `-copyts` is absent. Trim in that input-local coordinate,
-                        // then explicitly restore the audio track's offset from the
-                        // selected video boundary as leading silence.
-                        let localStart = sourceAudioStart - it.inputStartTime
-                        let localEnd = sourceAudioEnd - it.inputStartTime
-                        let leadDuration = max(0, sourceAudioStart - it.trimStart)
-                        let leadSamples = max(0, Int64((leadDuration * audioSampleRate).rounded()))
-                        f += "[\(i):a]atrim=start=\(fmt(localStart)):end=\(fmt(localEnd))," +
-                             "asetpts=PTS-STARTPTS,\(normalizeAudio)"
-                        if leadSamples > 0 {
-                            // Sample units avoid adelay's millisecond default and
-                            // preserve sub-millisecond source offsets.
-                            f += ",adelay=\(leadSamples)S:all=1"
-                        }
-                        f += ",apad=whole_len=\(targetSamples)," +
-                             "atrim=end_sample=\(targetSamples),asetpts=N/SR/TB[a\(i)];"
-                    } else {
-                        // A real track wholly outside this video selection would
-                        // produce an empty concat input. Supply an exact-length
-                        // silent segment instead.
-                        f += "anullsrc=channel_layout=stereo:sample_rate=44100," +
-                             "atrim=end_sample=\(targetSamples),asetpts=N/SR/TB[a\(i)];"
+            // The clip's own sound, or exact-length silence in its place. A
+            // track turned off counts as absent: the same silence, the same bytes.
+            let targetSamples = max(1, Int64(floor(it.duration * audioSampleRate + 1e-9)))
+            if it.hasAudio && !it.isImage && it.audioGain > 0 {
+                let sourceAudioStart = max(it.trimStart, it.audioStartTime)
+                // Black appended to the picture raises the ceiling on real
+                // audio by exactly its own length — otherwise the pad would
+                // hold silence and preserve nothing.
+                let audioCeiling = it.trimEnd + max(0, it.padDuration)
+                let sourceAudioEnd = min(audioCeiling, it.audioEndTime ?? audioCeiling)
+                if sourceAudioEnd > sourceAudioStart + 1e-9 {
+                    // ffmpeg rebases each input by its container start when
+                    // `-copyts` is absent. Trim in that input-local coordinate,
+                    // then explicitly restore the audio track's offset from the
+                    // selected video boundary as leading silence.
+                    let localStart = sourceAudioStart - it.inputStartTime
+                    let localEnd = sourceAudioEnd - it.inputStartTime
+                    let leadDuration = max(0, sourceAudioStart - it.trimStart)
+                    let leadSamples = max(0, Int64((leadDuration * audioSampleRate).rounded()))
+                    f += "[\(i):a]atrim=start=\(fmt(localStart)):end=\(fmt(localEnd))," +
+                         "asetpts=PTS-STARTPTS,\(normalizeAudio)"
+                    if leadSamples > 0 {
+                        // Sample units avoid adelay's millisecond default and
+                        // preserve sub-millisecond source offsets.
+                        f += ",adelay=\(leadSamples)S:all=1"
                     }
+                    f += ",apad=whole_len=\(targetSamples)," +
+                         "atrim=end_sample=\(targetSamples),asetpts=N/SR/TB" +
+                         audioShaping(gain: it.audioGain, fadeIn: it.audioFadeIn,
+                                      fadeOut: it.audioFadeOut, duration: it.duration) +
+                         "[a\(i)];"
                 } else {
-                    let targetSamples = max(1, Int64(floor(it.duration * audioSampleRate + 1e-9)))
+                    // A real track wholly outside this video selection would
+                    // produce an empty concat input. Supply an exact-length
+                    // silent segment instead.
                     f += "anullsrc=channel_layout=stereo:sample_rate=44100," +
                          "atrim=end_sample=\(targetSamples),asetpts=N/SR/TB[a\(i)];"
                 }
+            } else {
+                f += "anullsrc=channel_layout=stereo:sample_rate=44100," +
+                     "atrim=end_sample=\(targetSamples),asetpts=N/SR/TB[a\(i)];"
             }
         }
         var concatIn = ""
-        for i in 0..<items.count {
-            concatIn += "[v\(i)]"
-            if useOriginalAudio { concatIn += "[a\(i)]" }
-        }
-        if useOriginalAudio {
+        for i in 0..<items.count { concatIn += "[v\(i)][a\(i)]" }
+        if track.isEmpty {
             f += "\(concatIn)concat=n=\(items.count):v=1:a=1[vout][aout]"
         } else {
-            let total = items.reduce(0) { $0 + $1.duration }
-            f += "\(concatIn)concat=n=\(items.count):v=1:a=0[vout];"
-            f += "[\(musicIndex):a]\(normalizeAudio),apad,atrim=0:\(fmt(total)),asetpts=PTS-STARTPTS[aout]"
+            // The clips' sound as a bed, and every piece of the track laid over
+            // it where it sits. `duration=first` ends the mix where the movie
+            // ends, and `normalize=0` adds the inputs as they are: a bed stays
+            // as loud as it was whether one effect lands on it or ten.
+            f += "\(concatIn)concat=n=\(items.count):v=1:a=1[vout][abed];"
+            var mixIn = "[abed]"
+            for (k, clip) in track.enumerated() {
+                f += trackSegment(clip, input: items.count + k, label: "t\(k)",
+                                  normalize: normalizeAudio, sampleRate: audioSampleRate,
+                                  movieDuration: movieDuration)
+                mixIn += "[t\(k)]"
+            }
+            f += "\(mixIn)amix=inputs=\(track.count + 1):duration=first:normalize=0[aout]"
         }
 
         args += ["-filter_complex", f, "-map", "[vout]", "-map", "[aout]"]
@@ -721,8 +783,66 @@ struct FFTools: Sendable {
         return args
     }
 
-    nonisolated func exportAssembly(items: [AssemblyItem], audioURL: URL?, canvas: CanvasSpec,
-                                    output: URL,
+    /// The track as the mixer will hear it. Clips that would contribute nothing
+    /// are left out *before* they become inputs, and the rest are put in an
+    /// order fixed by their content, so the same project adds the same floats
+    /// in the same sequence however its clips happen to be arranged in memory.
+    nonisolated static func placedAudioClips(_ clips: [AssemblyAudio],
+                                             movieDuration: Double) -> [AssemblyAudio] {
+        clips.filter { clip in
+            clip.gain > 0 && clip.timelineStart < movieDuration - 1e-9
+                && clip.heardRange(movieDuration: movieDuration) != nil
+        }
+        .sorted { a, b in
+            if a.timelineStart != b.timelineStart { return a.timelineStart < b.timelineStart }
+            if a.trimStart != b.trimStart { return a.trimStart < b.trimStart }
+            return a.url.path < b.url.path
+        }
+    }
+
+    /// One piece of the track: its sound cut, lengthened to exactly what the
+    /// movie has room for, shaped, and then delayed to where it sits.
+    private nonisolated static func trackSegment(_ clip: AssemblyAudio, input: Int, label: String,
+                                                 normalize: String, sampleRate: Double,
+                                                 movieDuration: Double) -> String {
+        guard let range = clip.heardRange(movieDuration: movieDuration) else { return "" }
+        let heard = clip.heardDuration(movieDuration: movieDuration)
+        let targetSamples = max(1, Int64(floor(heard * sampleRate + 1e-9)))
+        let localStart = range.start - clip.inputStartTime
+        let localEnd = range.end - clip.inputStartTime
+        let leadSamples = max(0, Int64(((range.start - clip.trimStart) * sampleRate).rounded()))
+        var chain = "[\(input):a]atrim=start=\(fmt(localStart)):end=\(fmt(localEnd))," +
+                    "asetpts=PTS-STARTPTS,\(normalize)"
+        if leadSamples > 0 { chain += ",adelay=\(leadSamples)S:all=1" }
+        chain += ",apad=whole_len=\(targetSamples),atrim=end_sample=\(targetSamples),asetpts=N/SR/TB"
+        chain += audioShaping(gain: clip.gain, fadeIn: clip.fadeIn,
+                              fadeOut: clip.fadeOut, duration: heard)
+        // Placement last, after the length is fixed: the delay is part of the
+        // movie's time, not of the clip's.
+        let placeSamples = Int64((clip.timelineStart * sampleRate).rounded())
+        if placeSamples > 0 { chain += ",adelay=\(placeSamples)S:all=1" }
+        return chain + "[\(label)];"
+    }
+
+    /// Gain and fades for a segment whose timestamps already start at zero and
+    /// whose length is already exactly `duration`. Nothing for a clip at unity
+    /// with no fades, so an untouched clip's chain is the one it always had.
+    private nonisolated static func audioShaping(gain: Double, fadeIn: Double,
+                                                 fadeOut: Double, duration: Double) -> String {
+        var chain = ""
+        if gain != 1 { chain += ",volume=\(fmt(gain))" }
+        if fadeIn > 0 {
+            chain += ",afade=t=in:st=0:d=\(fmt(min(fadeIn, duration)))"
+        }
+        if fadeOut > 0 {
+            let length = min(fadeOut, duration)
+            chain += ",afade=t=out:st=\(fmt(duration - length)):d=\(fmt(length))"
+        }
+        return chain
+    }
+
+    nonisolated func exportAssembly(items: [AssemblyItem], audioClips: [AssemblyAudio],
+                                    canvas: CanvasSpec, output: URL,
                                     onProgress: (@Sendable (Double) -> Void)? = nil) async throws -> ExportResult {
         // ffmpeg refuses to open an output path that is also one of its inputs
         // ("cannot edit existing files in-place"), which is exactly what happens
@@ -733,7 +853,7 @@ struct FFTools: Sendable {
         let scratch = Self.scratchURL(besides: output)
         defer { try? FileManager.default.removeItem(at: scratch) }
 
-        var args = Self.assembleArgs(items: items, audioURL: audioURL, canvas: canvas,
+        var args = Self.assembleArgs(items: items, audioClips: audioClips, canvas: canvas,
                                      output: scratch)
         let outcome: ToolRun
         if let onProgress {

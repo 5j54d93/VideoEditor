@@ -728,6 +728,162 @@ final class EditorModelTimelineTests: XCTestCase {
                       "A 1920×1080 window clamped to a 1280×720 frame is that frame")
     }
 
+    // MARK: The audio track
+
+    /// A three-second still with a ten-second piece of music under it from
+    /// 0.5 s, the music selected — the state every track test starts from.
+    private func trackModel() -> (EditorModel, AudioClip.ID) {
+        let image = LibraryAsset(url: URL(fileURLWithPath: "/fixtures/still.png"),
+                                 kind: .image, width: 640, height: 480)
+        let music = LibraryAsset(url: URL(fileURLWithPath: "/fixtures/music.m4a"),
+                                 kind: .audio, duration: 10)
+        let model = EditorModel()
+        model.library = [image, music]
+        model.imageDefaultDuration = 3
+        model.insertLibraryAsset(image.id)
+        model.seekTimeline(to: 0.5)
+        model.insertLibraryAsset(music.id)
+        return (model, model.audioClips[0].id)
+    }
+
+    /// Sound joins the movie under the playhead and leaves its length alone:
+    /// the track is heard under the picture, never appended to it.
+    func testAudioLandsUnderThePlayheadWithoutLengtheningTheMovie() {
+        let (model, id) = trackModel()
+
+        XCTAssertEqual(model.audioClips.count, 1)
+        XCTAssertEqual(model.audioClips[0].timelineStart, 0.5, accuracy: 1e-9)
+        XCTAssertEqual(model.audioClips[0].duration, 10, accuracy: 1e-9)
+        XCTAssertEqual(model.totalOutputDuration, 3, accuracy: 1e-9)
+        XCTAssertEqual(model.selectedAudioIDs, [id])
+        XCTAssertTrue(model.selectedIDs.isEmpty, "Selecting sound deselects the picture")
+
+        model.undo()
+        XCTAssertTrue(model.audioClips.isEmpty)
+        XCTAssertEqual(model.items.count, 1)
+    }
+
+    /// S cuts whatever is selected under the playhead. With sound selected
+    /// that is the sound: the halves stay where they were on the movie, and
+    /// the fades stay with the ends they belong to.
+    func testSplittingSoundKeepsItInPlaceAndTheFadesWithTheirEnds() {
+        let (model, id) = trackModel()
+        model.setAudioClipFades(in: 0.4, out: 0.6, for: id)
+        model.seekTimeline(to: 2)
+
+        model.splitAtPlayhead()
+
+        XCTAssertEqual(model.items.count, 1, "The picture under the sound is not cut")
+        XCTAssertEqual(model.audioClips.count, 2)
+        let left = model.audioClips[0], right = model.audioClips[1]
+        XCTAssertEqual(left.timelineStart, 0.5, accuracy: 1e-9)
+        XCTAssertEqual(left.outPoint, 1.5, accuracy: 1e-9)
+        XCTAssertEqual(right.inPoint, 1.5, accuracy: 1e-9)
+        XCTAssertEqual(right.timelineStart, 2, accuracy: 1e-9)
+        XCTAssertEqual(right.outPoint, 10, accuracy: 1e-9)
+        XCTAssertEqual(left.fadeIn, 0.4, accuracy: 1e-9)
+        XCTAssertEqual(left.fadeOut, 0)
+        XCTAssertEqual(right.fadeIn, 0)
+        XCTAssertEqual(right.fadeOut, 0.6, accuracy: 1e-9)
+        XCTAssertEqual(model.selectedAudioIDs, [right.id])
+    }
+
+    /// Trimming the head moves the start with the in point, so the sound stays
+    /// where it was heard; a reach past the file or before the movie is held
+    /// at the edge rather than obeyed.
+    func testTrimmingSoundIsClampedToTheFileAndTheMovie() {
+        let (model, id) = trackModel()
+
+        model.trimAudioClip(id, inPoint: 1, outPoint: 4, timelineStart: 1.5)
+        XCTAssertEqual(model.audioClips[0].inPoint, 1, accuracy: 1e-9)
+        XCTAssertEqual(model.audioClips[0].outPoint, 4, accuracy: 1e-9)
+        XCTAssertEqual(model.audioClips[0].timelineStart, 1.5, accuracy: 1e-9)
+
+        model.trimAudioClip(id, inPoint: -2, outPoint: 50, timelineStart: -1)
+        XCTAssertEqual(model.audioClips[0].inPoint, 0, accuracy: 1e-9)
+        XCTAssertEqual(model.audioClips[0].outPoint, 10, accuracy: 1e-9)
+        XCTAssertEqual(model.audioClips[0].timelineStart, 0, accuracy: 1e-9)
+
+        model.moveAudioClip(id, to: 2.25)
+        XCTAssertEqual(model.audioClips[0].timelineStart, 2.25, accuracy: 1e-9)
+        XCTAssertEqual(model.audioClips[0].inPoint, 0, accuracy: 1e-9,
+                       "Moving changes where the sound starts, not what plays")
+    }
+
+    /// Detaching puts the clip's sound on the track as a piece of its own and
+    /// silences the clip, level and all — export hears it from the track only.
+    func testDetachingSoundMovesItToTheTrackAndSilencesTheClip() {
+        let video = LibraryAsset(
+            url: URL(fileURLWithPath: "/fixtures/talk.mp4"),
+            kind: .video, width: 1920, height: 1080,
+            duration: 4, fps: 25, fpsRational: "25",
+            hasAudio: true, frameTimes: [0, 1, 2, 3], frameEndTime: 4, audioDuration: 4
+        )
+        let model = EditorModel()
+        model.library = [video]
+        model.insertLibraryAsset(video.id)
+        let id = model.items[0].id
+        model.setOriginalAudioGain(0.5, for: id)
+
+        model.detachOriginalAudio(from: id)
+
+        XCTAssertTrue(model.items[0].isAudioMuted)
+        XCTAssertEqual(model.items[0].effectiveAudioGain, 0)
+        XCTAssertEqual(model.audioClips.count, 1)
+        let clip = model.audioClips[0]
+        XCTAssertEqual(clip.url, model.items[0].url)
+        XCTAssertEqual(clip.inPoint, 0, accuracy: 1e-9)
+        XCTAssertEqual(clip.outPoint, 4, accuracy: 1e-9)
+        XCTAssertEqual(clip.timelineStart, 0, accuracy: 1e-9)
+        XCTAssertEqual(clip.gain, 0.5, accuracy: 1e-9)
+        XCTAssertEqual(model.assemblyItemsForExport()[0].audioGain, 0)
+        XCTAssertEqual(model.assemblyAudioClipsForExport()[0].gain, 0.5, accuracy: 1e-9)
+
+        model.undo()
+        XCTAssertFalse(model.items[0].isAudioMuted)
+        XCTAssertTrue(model.audioClips.isEmpty)
+    }
+
+    /// ⌫ takes the selected sound and nothing else, and comes back in one step.
+    func testDeletingSelectedSoundLeavesThePictureAndUndoes() {
+        let (model, id) = trackModel()
+
+        model.removeSelectedItems()
+        XCTAssertTrue(model.audioClips.isEmpty)
+        XCTAssertEqual(model.items.count, 1)
+
+        model.undo()
+        XCTAssertEqual(model.audioClips.map(\.id), [id])
+    }
+
+    /// Removing an asset takes its sound off the track with it.
+    func testRemovingAnAssetTakesItsSoundOffTheTrack() throws {
+        let (model, _) = trackModel()
+        let music = try XCTUnwrap(model.library.first { $0.kind == .audio })
+
+        model.removeFromLibrary(music.id)
+
+        XCTAssertTrue(model.audioClips.isEmpty)
+        XCTAssertFalse(model.isSourceMedia(music.url))
+    }
+
+    /// A slider drag is one undo step, however many values it sends.
+    func testAGainDragIsOneUndoStep() {
+        let (model, id) = trackModel()
+        let key = "audio-gain:\(id)"
+
+        model.beginContinuousEdit(key)
+        model.setAudioClipGain(0.8, for: id)
+        model.setAudioClipGain(0.6, for: id)
+        model.setAudioClipGain(0.4, for: id)
+        model.endContinuousEdit(key)
+        XCTAssertEqual(model.audioClips[0].gain, 0.4, accuracy: 1e-9)
+
+        model.undo()
+        XCTAssertEqual(model.audioClips[0].gain, 1, accuracy: 1e-9)
+        XCTAssertEqual(model.audioClips.count, 1, "The step before the drag was the insert, not a tick of it")
+    }
+
     func testSelectAllThenDeleteClearsTheTimelineAsOneUndoStep() {
         let image = LibraryAsset(
             url: URL(fileURLWithPath: "/fixtures/still.png"),

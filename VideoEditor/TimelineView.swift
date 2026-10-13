@@ -13,6 +13,10 @@ import UniformTypeIdentifiers
 private enum TimelineLaneMetrics {
     static let spacing: CGFloat = 2
     static let audioHeight: CGFloat = 28
+    /// The audio track under the clip row: one lane per overlapping clip.
+    static let audioLaneHeight: CGFloat = 30
+    static let audioLaneSpacing: CGFloat = 2
+    static let audioTrackGap: CGFloat = 6
     /// Below this a to-scale band carries no information — it is thinner than
     /// the seam between two clips. Under the threshold the tail is a mark, and
     /// the chip's zoom action is how you get to see its real length.
@@ -126,8 +130,69 @@ struct TimelineView: View {
 
     }
 
+    /// Where the rows sit vertically. One place rather than the arithmetic
+    /// repeated at every call site — which is how the audio track could have
+    /// ended up drawn in one spot and hit-tested in another.
+    private struct TrackGeometry {
+        let rulerHeight: CGFloat
+        let clipRowHeight: CGFloat
+        let audioLanes: Int
+        let trackHeight: CGFloat
+
+        init(paneHeight: CGFloat, rulerHeight: CGFloat, clipRowHeight: CGFloat, audioLanes: Int) {
+            self.rulerHeight = rulerHeight
+            self.clipRowHeight = clipRowHeight
+            self.audioLanes = audioLanes
+            // The drop zone always fills the pane; the rows inside render at
+            // fixed heights so filmstrips never get stretched.
+            trackHeight = max(clipRowHeight + Self.audioArea(lanes: audioLanes),
+                              paneHeight - rulerHeight)
+        }
+
+        private static func audioArea(lanes: Int) -> CGFloat {
+            guard lanes > 0 else { return 0 }
+            return TimelineLaneMetrics.audioTrackGap
+                + CGFloat(lanes) * TimelineLaneMetrics.audioLaneHeight
+                + CGFloat(lanes - 1) * TimelineLaneMetrics.audioLaneSpacing
+        }
+
+        var audioArea: CGFloat { Self.audioArea(lanes: audioLanes) }
+        var totalHeight: CGFloat { rulerHeight + trackHeight }
+        /// The clip row and the track under it, centred together in the pane.
+        var clipRowTop: CGFloat { rulerHeight + (trackHeight - clipRowHeight - audioArea) / 2 }
+        var clipRowBottom: CGFloat { clipRowTop + clipRowHeight }
+        var audioTrackTop: CGFloat { clipRowBottom + TimelineLaneMetrics.audioTrackGap }
+
+        func laneTop(_ lane: Int) -> CGFloat {
+            audioTrackTop + CGFloat(lane)
+                * (TimelineLaneMetrics.audioLaneHeight + TimelineLaneMetrics.audioLaneSpacing)
+        }
+
+        /// The lane under a y, or `nil` between lanes and off the track.
+        func audioLane(at y: CGFloat) -> Int? {
+            guard audioLanes > 0, y >= audioTrackTop else { return nil }
+            let pitch = TimelineLaneMetrics.audioLaneHeight + TimelineLaneMetrics.audioLaneSpacing
+            let lane = Int((y - audioTrackTop) / pitch)
+            guard lane < audioLanes,
+                  y - laneTop(lane) <= TimelineLaneMetrics.audioLaneHeight else { return nil }
+            return lane
+        }
+
+        /// Every lane a vertical span touches.
+        func lanes(touching range: ClosedRange<CGFloat>) -> ClosedRange<Int>? {
+            let touched = (0..<audioLanes).filter { lane in
+                let top = laneTop(lane)
+                return range.lowerBound <= top + TimelineLaneMetrics.audioLaneHeight
+                    && range.upperBound >= top
+            }
+            guard let first = touched.first, let last = touched.last else { return nil }
+            return first...last
+        }
+    }
+
     var body: some View {
         let layout = TimelineLayout(items: model.items)
+        let track = AudioTrackLayout(clips: model.audioClips)
         VStack(alignment: .leading, spacing: Self.headerSpacing) {
             header(layout: layout)
 
@@ -136,9 +201,9 @@ struct TimelineView: View {
                 let clipsWidth = CGFloat(layout.totalDuration) * scale
                 let trailingWorkspace = max(360, geo.size.width * 0.72)
                 let contentWidth = max(geo.size.width, clipsWidth + trailingWorkspace)
-                // The drop zone always fills the pane; clips inside render at a
-                // fixed height so filmstrips never get stretched.
-                let trackHeight = max(baseTrackHeight, geo.size.height - rulerHeight)
+                let geometry = TrackGeometry(paneHeight: geo.size.height, rulerHeight: rulerHeight,
+                                             clipRowHeight: baseTrackHeight,
+                                             audioLanes: track.laneCount)
 
                 ScrollView(.horizontal, showsIndicators: true) {
                     // The chips sit outside the canvas rather than inside it: as
@@ -146,11 +211,11 @@ struct TimelineView: View {
                     // pressing one no longer also runs the canvas-wide tap that
                     // would seek the playhead out from under you.
                     ZStack(alignment: .topLeading) {
-                        canvas(layout: layout, width: contentWidth,
+                        canvas(layout: layout, track: track, width: contentWidth,
                                clipsWidth: clipsWidth, scale: scale,
-                               viewportWidth: geo.size.width, trackHeight: trackHeight)
+                               viewportWidth: geo.size.width, geometry: geometry)
                         tailChips(layout: layout, width: contentWidth,
-                                  scale: scale, trackHeight: trackHeight)
+                                  scale: scale, geometry: geometry)
                     }
                 }
                 .scrollPosition($scrollPosition)
@@ -210,7 +275,7 @@ struct TimelineView: View {
                         KeyCapHint("S")
                     }
                 }
-                .help("在播放頭分割成兩段（S）")
+                .help("在播放頭分割成兩段；選著一段音訊時分割的是那段音訊（S）")
                 Button { model.deleteAfterPlayhead() } label: {
                     HStack(spacing: 5) {
                         Label("刪除右側", systemImage: "delete.right")
@@ -242,11 +307,23 @@ struct TimelineView: View {
                 .help("一次確認所有片段的尾端差異；不會改變輸出")
             }
 
-            if !model.selectedIDs.isEmpty {
+            // The clip row's split button already cuts a selected piece of the
+            // track; this one stands in only when that row has nothing to show.
+            if model.activeItem?.isImage != false, model.selectedAudioClip != nil {
+                Button { model.splitAtPlayhead() } label: {
+                    HStack(spacing: 5) {
+                        Label("分割", systemImage: "scissors")
+                        KeyCapHint("S")
+                    }
+                }
+                .help("在播放頭把選取的音訊分成兩段（S）")
+            }
+
+            let selectedCount = model.selectedIDs.count + model.selectedAudioIDs.count
+            if selectedCount > 0 {
                 Button(role: .destructive) { model.removeSelectedItems() } label: {
                     HStack(spacing: 5) {
-                        Label(model.selectedIDs.count > 1
-                              ? "刪除 \(model.selectedIDs.count) 段" : "刪除片段",
+                        Label(selectedCount > 1 ? "刪除 \(selectedCount) 段" : "刪除片段",
                               systemImage: "trash")
                         KeyCapHint("⌫")
                     }
@@ -326,12 +403,14 @@ struct TimelineView: View {
                 : String(format: "%.3f", c.fpsValue)
             s += " · 畫布 \(c.width)×\(c.height) @ \(fps)fps"
         }
+        if !model.audioClips.isEmpty { s += " · 音訊 \(model.audioClips.count) 段" }
         return s
     }
 
-    private func canvas(layout: TimelineLayout, width: CGFloat,
+    private func canvas(layout: TimelineLayout, track: AudioTrackLayout, width: CGFloat,
                         clipsWidth: CGFloat, scale: CGFloat,
-                        viewportWidth: CGFloat, trackHeight: CGFloat) -> some View {
+                        viewportWidth: CGFloat, geometry: TrackGeometry) -> some View {
+        let trackHeight = geometry.trackHeight
         let visibleTimelineRange = ClosedRange(
             uncheckedBounds: (
                 lower: Double(scrollOffset / scale),
@@ -366,9 +445,12 @@ struct TimelineView: View {
                 }
             }
             .frame(width: clipsWidth, height: baseTrackHeight, alignment: .leading)
-            .offset(y: rulerHeight + (trackHeight - baseTrackHeight) / 2)
+            .offset(y: geometry.clipRowTop)
 
-            tailMarks(layout: layout, width: width, scale: scale, trackHeight: trackHeight)
+            audioTrack(track: track, layout: layout, scale: scale, geometry: geometry,
+                       visibleTimelineRange: visibleTimelineRange, width: width)
+
+            tailMarks(layout: layout, width: width, scale: scale, geometry: geometry)
 
             trailingDropZone(width: max(1, width - clipsWidth), trackHeight: trackHeight)
                 .offset(x: clipsWidth, y: rulerHeight)
@@ -386,7 +468,7 @@ struct TimelineView: View {
                     .fill(Color.accentColor)
                     .frame(width: 3, height: baseTrackHeight + 12)
                     .offset(x: layout.insertionX(insertion, scale: scale) - 1.5,
-                            y: rulerHeight + (trackHeight - baseTrackHeight) / 2 - 6)
+                            y: geometry.clipRowTop - 6)
                     .allowsHitTesting(false)
             }
 
@@ -414,10 +496,11 @@ struct TimelineView: View {
             insertionIndex: { location in
                 layout.insertionIndex(at: location.x, scale: scale)
             },
+            dropTime: { location in Double(location.x / scale) },
             setIndicator: { dropInsertionIndex = $0 },
             autoScroll: { location in updateDropAutoScroll(pointerX: location.x) },
             stopAutoScroll: { stopDropAutoScroll() },
-            perform: { payload, index in handleTimelineDrop(payload, at: index) }
+            perform: { payload, index, time in handleTimelineDrop(payload, at: index, time: time) }
         ))
         .coordinateSpace(.named("outputTimelineCanvas"))
         .onContinuousHover(coordinateSpace: .named("outputTimelineCanvas")) { phase in
@@ -436,7 +519,7 @@ struct TimelineView: View {
                     // focus hand-back that every seek performs — and a search
                     // field still holding focus swallows ⌘A.
                     model.endTextEditing()
-                    let clipRowTop = rulerHeight + (trackHeight - baseTrackHeight) / 2
+                    let clipRowTop = geometry.clipRowTop
                     let time = Double(value.location.x / scale)
                     let beforeTimelineEnd = value.location.x < clipsWidth
                     let onRuler = value.location.y <= rulerHeight
@@ -444,15 +527,24 @@ struct TimelineView: View {
                     let onClips = beforeTimelineEnd
                         && value.location.y >= clipRowTop
                         && value.location.y <= clipRowTop + baseTrackHeight
+                    let onTrack = track.clip(at: time,
+                                             lane: geometry.audioLane(at: value.location.y))
                     if NSEvent.modifierFlags.contains(.command) {
                         // ⌘-click toggles a clip in/out of the selection and never
                         // moves the playhead.
-                        if onClips, let itemID = layout.itemID(at: time) {
+                        if let onTrack {
+                            model.toggleAudioSelection(onTrack.id)
+                        } else if onClips, let itemID = layout.itemID(at: time) {
                             model.toggleSelection(itemID)
                         }
                         return
                     }
-                    if onClips {
+                    if let onTrack {
+                        // A piece of the track: select it, with the playhead
+                        // parked under the pointer as a clip click would.
+                        model.seekTimeline(to: min(time, layout.totalDuration))
+                        model.selectAudioClip(onTrack.id)
+                    } else if onClips {
                         model.seekTimeline(to: time)
                         if let itemID = layout.itemID(at: time) {
                             model.selectOnly(itemID)
@@ -475,16 +567,19 @@ struct TimelineView: View {
         .simultaneousGesture(
             DragGesture(minimumDistance: 5, coordinateSpace: .named("outputTimelineCanvas"))
                 .onChanged { value in
-                    let clipRowTop = rulerHeight + (trackHeight - baseTrackHeight) / 2
+                    let clipRowTop = geometry.clipRowTop
                     if marqueeStart == nil {
                         // A marquee only starts from blank space; drags that begin
-                        // on a clip belong to drag-reorder, and the ruler stays a
-                        // pure seek surface.
+                        // on a clip belong to drag-reorder, those on a piece of
+                        // the track to moving or trimming it, and the ruler
+                        // stays a pure seek surface.
                         let s = value.startLocation
                         let onRuler = s.y <= rulerHeight
                         let onClip = s.x <= clipsWidth
                             && s.y >= clipRowTop && s.y <= clipRowTop + baseTrackHeight
-                        guard !onRuler, !onClip else { return }
+                        let onTrack = track.clip(at: Double(s.x / scale),
+                                                 lane: geometry.audioLane(at: s.y)) != nil
+                        guard !onRuler, !onClip, !onTrack else { return }
                         marqueeStart = s
                         model.selectedLibraryIDs = []
                         model.focusedPane = .timeline
@@ -499,6 +594,9 @@ struct TimelineView: View {
                     model.selectedIDs = marqueeSelection(rect, layout: layout,
                                                          scale: scale,
                                                          clipRowTop: clipRowTop)
+                    model.selectedAudioIDs = marqueeAudioSelection(rect, track: track,
+                                                                   scale: scale,
+                                                                   geometry: geometry)
                 }
                 .onEnded { _ in
                     marqueeStart = nil
@@ -528,9 +626,15 @@ struct TimelineView: View {
 
     // MARK: Reorder / insertion drops
 
-    private func handleTimelineDrop(_ payload: String, at index: Int) {
+    private func handleTimelineDrop(_ payload: String, at index: Int, time: Double) {
         if let assetID = libraryAssetID(payload) {
-            model.insertLibraryAsset(assetID, at: index)
+            if let asset = model.libraryAsset(assetID), asset.kind == .audio {
+                // Sound lands where it was dropped, not in a gap between
+                // clips: the track has no gaps to insert into.
+                model.insertAudioClip(from: asset, at: max(0, time))
+            } else {
+                model.insertLibraryAsset(assetID, at: index)
+            }
         } else {
             let itemIDs = Set(timelineItemIDs(payload))
             if !itemIDs.isEmpty { model.moveItems(itemIDs, to: index) }
@@ -573,6 +677,36 @@ struct TimelineView: View {
         return layout.selection(in: rect, scale: scale)
     }
 
+    /// Pieces of the track whose span the marquee crosses, in the lanes it
+    /// reaches.
+    private func marqueeAudioSelection(_ rect: CGRect, track: AudioTrackLayout,
+                                       scale: CGFloat,
+                                       geometry: TrackGeometry) -> Set<AudioClip.ID> {
+        guard let lanes = geometry.lanes(touching: rect.minY...rect.maxY) else { return [] }
+        return track.clips(in: Double(rect.minX / scale)...Double(rect.maxX / scale),
+                           lanes: lanes)
+    }
+
+    /// The audio track: every piece of sound in its lane, under the clip row.
+    private func audioTrack(track: AudioTrackLayout, layout: TimelineLayout, scale: CGFloat,
+                            geometry: TrackGeometry, visibleTimelineRange: ClosedRange<Double>,
+                            width: CGFloat) -> some View {
+        ZStack(alignment: .topLeading) {
+            ForEach(track.entries) { entry in
+                TimelineAudioClipView(
+                    model: model, clip: entry.clip, pointsPerSecond: scale,
+                    height: TimelineLaneMetrics.audioLaneHeight,
+                    movieDuration: layout.totalDuration,
+                    snapTimes: track.snapTimes(excluding: entry.id,
+                                               clipBoundaries: layout.boundaries),
+                    visibleTimelineRange: visibleTimelineRange)
+                .offset(x: CGFloat(entry.clip.timelineStart) * scale,
+                        y: geometry.laneTop(entry.lane))
+            }
+        }
+        .frame(width: width, height: geometry.totalHeight, alignment: .topLeading)
+    }
+
     /// Purely visual — the canvas-wide drop delegate owns the actual drop.
     private func trailingDropZone(width: CGFloat, trackHeight: CGFloat) -> some View {
         ZStack(alignment: .leading) {
@@ -593,8 +727,9 @@ struct TimelineView: View {
     /// length. Neither is hit-testable, so clicking a tail still seeks to the
     /// output time underneath it.
     private func tailMarks(layout: TimelineLayout, width: CGFloat,
-                           scale: CGFloat, trackHeight: CGFloat) -> some View {
-        let laneTop = laneTop(trackHeight: trackHeight)
+                           scale: CGFloat, geometry: TrackGeometry) -> some View {
+        let laneTop = originalAudioLaneTop(geometry)
+        let trackHeight = geometry.trackHeight
         return ZStack(alignment: .topLeading) {
             ForEach(Array(layout.entries.enumerated()), id: \.element.id) { index, entry in
                 let tail = entry.item.trailingOverhangDuration
@@ -629,9 +764,10 @@ struct TimelineView: View {
     /// may overlap its own clip freely — which is what keeps the action reachable
     /// on a clip of any length.
     private func tailChips(layout: TimelineLayout, width: CGFloat,
-                           scale: CGFloat, trackHeight: CGFloat) -> some View {
-        let chipTop = laneTop(trackHeight: trackHeight)
+                           scale: CGFloat, geometry: TrackGeometry) -> some View {
+        let chipTop = originalAudioLaneTop(geometry)
             - TimelineLaneMetrics.tailChipHeight - 3
+        let trackHeight = geometry.trackHeight
         return ZStack(alignment: .topLeading) {
             ForEach(layout.entries) { entry in
                 if entry.item.trailingOverhangDuration > 1e-9, showsTailChip(entry.id) {
@@ -649,10 +785,9 @@ struct TimelineView: View {
         .frame(width: width, height: rulerHeight + trackHeight, alignment: .topLeading)
     }
 
-    /// Top of the audio lane in canvas coordinates.
-    private func laneTop(trackHeight: CGFloat) -> CGFloat {
-        rulerHeight + (trackHeight - baseTrackHeight) / 2
-            + baseTrackHeight - TimelineLaneMetrics.audioHeight
+    /// Top of a clip's own audio lane in canvas coordinates.
+    private func originalAudioLaneTop(_ geometry: TrackGeometry) -> CGFloat {
+        geometry.clipRowBottom - TimelineLaneMetrics.audioHeight
     }
 
     /// A band spills onto the next clip, so it must never swallow it. The final
@@ -864,22 +999,25 @@ private struct TimelineClipView: View {
         let end = min(item.paddedOutPoint, item.effectiveAudioOutPoint)
         let activeWidth = max(0, CGFloat(end - start) * pointsPerSecond)
         let activeOffset = max(0, CGFloat(start - item.inPoint) * pointsPerSecond)
+        // Muted — or detached onto the track, which mutes — draws like no
+        // track at all: the lane shows what will be heard from the clip itself.
+        let heard = item.hasAudio && !item.isAudioMuted
         return ZStack(alignment: .leading) {
             RoundedRectangle(cornerRadius: 3)
                 .fill(Color.black.opacity(0.58))
-            if item.hasAudio, activeWidth > 0 {
+            if heard, activeWidth > 0 {
                 RoundedRectangle(cornerRadius: 3)
                     .fill(Color.cyan.opacity(0.34))
                     .frame(width: activeWidth)
                     .offset(x: activeOffset)
             }
             HStack(spacing: 4) {
-                Image(systemName: item.hasAudio ? "waveform" : "speaker.slash")
-                Text(item.hasAudio ? "原音" : "無原音")
+                Image(systemName: heard ? "waveform" : "speaker.slash")
+                Text(!item.hasAudio ? "無原音" : item.isAudioMuted ? "原音已靜音" : "原音")
                 Spacer(minLength: 0)
             }
             .font(.system(size: 9, weight: .medium))
-            .foregroundStyle(item.hasAudio ? Color.white.opacity(0.82) : Color.secondary)
+            .foregroundStyle(heard ? Color.white.opacity(0.82) : Color.secondary)
             .padding(.horizontal, 6)
 
             // Keep the full clip draggable from either lane. The warning button
@@ -898,10 +1036,247 @@ private struct TimelineClipView: View {
                     .allowsHitTesting(false)
             }
         }
-        .accessibilityLabel(item.hasAudio ? "原始音訊" : "沒有原始音訊")
+        .accessibilityLabel(!item.hasAudio ? "沒有原始音訊"
+                            : item.isAudioMuted ? "原始音訊已靜音" : "原始音訊")
         .accessibilityValue(item.hasVideoPad
             ? "延長 \(String(format: "%.2f", item.videoPadDuration)) 秒黑畫面以保留原音"
             : "")
+    }
+}
+
+/// One piece of sound on the track. Dragging its body slides it along the
+/// movie; dragging either end trims it, keeping the sound where it was. Both
+/// are drawn live from the view's own copy of the drag and handed to the model
+/// once, on release — one undo step, and no re-laning under the pointer while
+/// it is still moving.
+private struct TimelineAudioClipView: View {
+    let model: EditorModel
+    let clip: AudioClip
+    let pointsPerSecond: CGFloat
+    let height: CGFloat
+    let movieDuration: Double
+    let snapTimes: [Double]
+    let visibleTimelineRange: ClosedRange<Double>
+
+    /// Screen distance within which an end is pulled onto a cut or the playhead.
+    private let snapDistance: CGFloat = 6
+    /// How far in from either end a drag counts as a trim rather than a move.
+    private let gripWidth: CGFloat = 8
+
+    private enum DragKind { case move, trimStart, trimEnd }
+    private struct Drag {
+        let kind: DragKind
+        let origin: AudioClip
+    }
+
+    @State private var drag: Drag?
+    /// The clip with the drag in flight applied; `nil` when nothing is moving.
+    @State private var shown: AudioClip?
+    @State private var peaks: AudioPeaks?
+
+    private var selected: Bool { model.selectedAudioIDs.contains(clip.id) }
+    private var canSplitAtPlayhead: Bool {
+        model.timelineTime > clip.timelineStart + AudioClip.minimumDuration
+            && model.timelineTime < clip.timelineEnd - AudioClip.minimumDuration
+    }
+
+    var body: some View {
+        let shown = self.shown ?? clip
+        let width = max(2, CGFloat(shown.duration) * pointsPerSecond)
+        ZStack(alignment: .topLeading) {
+            RoundedRectangle(cornerRadius: 4)
+                .fill(shown.isMuted ? Color.gray.opacity(0.35) : Color.teal.opacity(0.5))
+            waveform(shown, width: width)
+            fadeRamps(shown)
+            if shown.timelineEnd > movieDuration {
+                // Past the last frame nothing is heard: the sound stops where
+                // the picture does, and the bar says so.
+                let silentFrom = max(movieDuration, shown.timelineStart)
+                Rectangle()
+                    .fill(Color.black.opacity(0.45))
+                    .frame(width: max(0, CGFloat(shown.timelineEnd - silentFrom) * pointsPerSecond))
+                    .offset(x: CGFloat(silentFrom - shown.timelineStart) * pointsPerSecond)
+            }
+            label(shown)
+        }
+        .frame(width: width, height: height)
+        .clipShape(RoundedRectangle(cornerRadius: 4))
+        .overlay {
+            RoundedRectangle(cornerRadius: 4)
+                .stroke(selected ? Color.accentColor : Color.white.opacity(0.25),
+                        lineWidth: selected ? 2 : 1)
+        }
+        .contentShape(Rectangle())
+        .offset(x: CGFloat(shown.timelineStart - clip.timelineStart) * pointsPerSecond)
+        .onContinuousHover { phase in
+            switch phase {
+            case .active(let point):
+                let onGrip = point.x < gripWidth || point.x > width - gripWidth
+                (onGrip ? NSCursor.resizeLeftRight : NSCursor.openHand).set()
+            case .ended:
+                NSCursor.arrow.set()
+            }
+        }
+        .gesture(dragGesture(width: width))
+        .contextMenu {
+            Button("在播放頭分割") { model.splitAudioClip(clip.id, at: model.timelineTime) }
+                .disabled(!canSplitAtPlayhead)
+            Button(clip.isMuted ? "取消靜音" : "靜音") {
+                model.setAudioClipMuted(!clip.isMuted, for: clip.id)
+            }
+            Divider()
+            Button("刪除", role: .destructive) {
+                model.selectAudioClip(clip.id)
+                model.removeSelectedItems()
+            }
+        }
+        .task(id: clip.url) { peaks = await AudioWaveformStore.shared.peaks(for: clip.url) }
+        .accessibilityLabel("音訊 \(clip.name)")
+        .accessibilityValue("\(String(format: "%.2f", clip.duration)) 秒，"
+                            + "從 \(String(format: "%.2f", clip.timelineStart)) 秒起")
+    }
+
+    private func dragGesture(width: CGFloat) -> some Gesture {
+        DragGesture(minimumDistance: 3, coordinateSpace: .named("outputTimelineCanvas"))
+            .onChanged { value in
+                if drag == nil {
+                    let local = value.startLocation.x - CGFloat(clip.timelineStart) * pointsPerSecond
+                    let kind: DragKind = local < gripWidth ? .trimStart
+                        : local > width - gripWidth ? .trimEnd
+                        : .move
+                    drag = Drag(kind: kind, origin: clip)
+                    if !selected { model.selectAudioClip(clip.id) }
+                }
+                guard let drag else { return }
+                shown = apply(drag, translation: value.translation.width)
+            }
+            .onEnded { _ in
+                defer { drag = nil; shown = nil }
+                guard let drag, let result = shown else { return }
+                switch drag.kind {
+                case .move:
+                    model.moveAudioClip(clip.id, to: result.timelineStart)
+                case .trimStart, .trimEnd:
+                    model.trimAudioClip(clip.id, inPoint: result.inPoint,
+                                        outPoint: result.outPoint,
+                                        timelineStart: result.timelineStart)
+                }
+            }
+    }
+
+    /// The clip as a drag of `translation` points leaves it: moved, or trimmed
+    /// at one end, with that end pulled onto a nearby cut.
+    private func apply(_ drag: Drag, translation: CGFloat) -> AudioClip {
+        var clip = drag.origin
+        let delta = Double(translation / pointsPerSecond)
+        switch drag.kind {
+        case .move:
+            var start = max(0, clip.timelineStart + delta)
+            // Either end may snap, whichever a cut is nearer to.
+            if let snapped = snap(start) {
+                start = snapped
+            } else if let snappedEnd = snap(start + clip.duration) {
+                start = max(0, snappedEnd - clip.duration)
+            }
+            clip.timelineStart = start
+        case .trimStart:
+            let floor = max(clip.sourceFloor, clip.inPoint - clip.timelineStart)   // not before the movie's start
+            let ceiling = clip.outPoint - AudioClip.minimumDuration
+            var inPoint = min(max(clip.inPoint + delta, floor), ceiling)
+            if let snapped = snap(clip.timelineStart + (inPoint - clip.inPoint)) {
+                let candidate = clip.inPoint + (snapped - clip.timelineStart)
+                if candidate >= floor && candidate <= ceiling { inPoint = candidate }
+            }
+            clip.timelineStart += inPoint - clip.inPoint
+            clip.inPoint = inPoint
+        case .trimEnd:
+            let floor = clip.inPoint + AudioClip.minimumDuration
+            var outPoint = min(max(clip.outPoint + delta, floor), clip.sourceCeiling)
+            if let snapped = snap(clip.timelineStart + (outPoint - clip.inPoint)) {
+                let candidate = clip.inPoint + (snapped - clip.timelineStart)
+                if candidate >= floor && candidate <= clip.sourceCeiling { outPoint = candidate }
+            }
+            clip.outPoint = outPoint
+        }
+        return clip
+    }
+
+    private func snap(_ time: Double) -> Double? {
+        let candidates = snapTimes + [0, model.timelineTime]
+        guard let nearest = candidates.min(by: { abs($0 - time) < abs($1 - time) }),
+              abs(nearest - time) * Double(pointsPerSecond) <= Double(snapDistance) else {
+            return nil
+        }
+        return nearest
+    }
+
+    /// The loudness along the clip, one column per point, drawn only for the
+    /// columns on screen: a song at a wide zoom is tens of thousands of them,
+    /// most scrolled away.
+    private func waveform(_ shown: AudioClip, width: CGFloat) -> some View {
+        Canvas { context, size in
+            guard let peaks else { return }
+            let first = max(0, CGFloat(visibleTimelineRange.lowerBound - shown.timelineStart)
+                            * pointsPerSecond).rounded(.down)
+            let last = min(size.width, CGFloat(visibleTimelineRange.upperBound - shown.timelineStart)
+                           * pointsPerSecond).rounded(.up)
+            guard last > first else { return }
+            // Height follows the level, so a turned-down clip looks turned down.
+            let amplitude = CGFloat(min(1, shown.gain)) * (size.height - 6)
+            let middle = size.height / 2
+            var bars = Path()
+            var x = first
+            while x < last {
+                let from = shown.inPoint + Double(x / pointsPerSecond) - shown.audioStartTime
+                let to = shown.inPoint + Double((x + 1) / pointsPerSecond) - shown.audioStartTime
+                let bar = max(1, CGFloat(peaks.peak(from: from, to: to)) * amplitude)
+                bars.addRect(CGRect(x: x, y: middle - bar / 2, width: 1, height: bar))
+                x += 1
+            }
+            context.fill(bars, with: .color(.white.opacity(shown.isMuted ? 0.3 : 0.65)))
+        }
+    }
+
+    /// The fades as shaded wedges over the ends: the sound under the wedge is
+    /// the part being taken down. The fade-out leads into wherever the sound
+    /// stops — the movie's end, when the clip outruns it.
+    private func fadeRamps(_ shown: AudioClip) -> some View {
+        Canvas { context, size in
+            var wedges = Path()
+            if shown.fadeIn > 0 {
+                let run = min(size.width, CGFloat(shown.fadeIn) * pointsPerSecond)
+                wedges.move(to: CGPoint(x: 0, y: size.height))
+                wedges.addLine(to: CGPoint(x: 0, y: 0))
+                wedges.addLine(to: CGPoint(x: run, y: 0))
+                wedges.closeSubpath()
+            }
+            if shown.fadeOut > 0 {
+                let end = max(0, min(size.width,
+                                     CGFloat(shown.heardDuration(movieDuration: movieDuration))
+                                     * pointsPerSecond))
+                let run = min(end, CGFloat(shown.fadeOut) * pointsPerSecond)
+                wedges.move(to: CGPoint(x: end, y: size.height))
+                wedges.addLine(to: CGPoint(x: end, y: 0))
+                wedges.addLine(to: CGPoint(x: end - run, y: 0))
+                wedges.closeSubpath()
+            }
+            context.fill(wedges, with: .color(.black.opacity(0.35)))
+        }
+        .allowsHitTesting(false)
+    }
+
+    private func label(_ shown: AudioClip) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: shown.isMuted ? "speaker.slash" : "music.note")
+            Text(shown.name).lineLimit(1).truncationMode(.middle)
+            if shown.gain != 1 { Text("\(Int((shown.gain * 100).rounded()))%") }
+            Spacer(minLength: 0)
+        }
+        .font(.system(size: 9, weight: .medium))
+        .foregroundStyle(.white.opacity(shown.isMuted ? 0.6 : 0.9))
+        .padding(.horizontal, 6)
+        .frame(height: height)
+        .allowsHitTesting(false)
     }
 }
 
@@ -1313,10 +1688,13 @@ struct FilmstripStrip: View {
 /// the caret position is exactly what a release does.
 private struct TimelineInsertionDropDelegate: DropDelegate {
     let insertionIndex: (CGPoint) -> Int
+    /// The moment under the pointer, for what lands on the track rather than
+    /// in the clip order.
+    let dropTime: (CGPoint) -> Double
     let setIndicator: (Int?) -> Void
     let autoScroll: (CGPoint) -> Void
     let stopAutoScroll: () -> Void
-    let perform: (String, Int) -> Void
+    let perform: (String, Int, Double) -> Void
 
     func validateDrop(info: DropInfo) -> Bool {
         info.hasItemsConforming(to: [.text])
@@ -1339,12 +1717,13 @@ private struct TimelineInsertionDropDelegate: DropDelegate {
 
     func performDrop(info: DropInfo) -> Bool {
         let index = insertionIndex(info.location)
+        let time = dropTime(info.location)
         setIndicator(nil)
         stopAutoScroll()
         guard let provider = info.itemProviders(for: [.text]).first else { return false }
         _ = provider.loadObject(ofClass: NSString.self) { object, _ in
             guard let payload = object as? String else { return }
-            Task { @MainActor in perform(payload, index) }
+            Task { @MainActor in perform(payload, index, time) }
         }
         return true
     }
