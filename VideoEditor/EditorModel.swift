@@ -2052,7 +2052,7 @@ final class EditorModel {
         exportElapsed = nil
         errorMessage = nil
 
-        exportTask = Task {
+        exportTask = Task { [self] in
             do {
                 self.exportResult = try await ff.exportAssembly(
                     items: assemblyItems, audioURL: audio,
