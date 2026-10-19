@@ -460,6 +460,40 @@ final class EditorModelTimelineTests: XCTestCase {
         XCTAssertEqual(model.totalOutputDuration, 1, accuracy: 1e-12)
     }
 
+    /// The preview plays a padded clip's sound on under its black, so the fades
+    /// have to be read over the span the export shapes: picture and black
+    /// together. A fade-out set on the clip finishes at the end of the black.
+    func testAPaddedClipsOwnSoundFadesOverItsBlackAsTheExportDoes() {
+        let video = LibraryAsset(
+            url: URL(fileURLWithPath: "/fixtures/fading-tail.mp4"),
+            kind: .video, width: 640, height: 480,
+            duration: 1.4, fps: 25, fpsRational: "25",
+            hasAudio: true, frameTimes: [0, 0.96], frameEndTime: 1,
+            audioStartTime: 0, audioDuration: 1.4)
+        let model = EditorModel()
+        model.library = [video]
+        model.insertLibraryAsset(video.id)
+        let id = model.items[0].id
+        model.extendVideoToAudioTail(for: id)
+        model.setOriginalAudioFades(in: 0, out: 0.8, for: id)
+
+        let clip = model.items[0]
+        XCTAssertEqual(clip.audioLevel(at: 0.5), 1, accuracy: 1e-12)
+        XCTAssertEqual(clip.audioLevel(at: 1.0), 0.5, accuracy: 1e-12,
+                       "Where the picture stops the fade is only half done")
+        XCTAssertEqual(clip.audioLevel(at: 1.2), 0.25, accuracy: 1e-12)
+        XCTAssertEqual(clip.audioLevel(at: 1.4), 0, accuracy: 1e-12)
+
+        // The curve the export writes over the clip's segment, point for point.
+        let item = model.assemblyItemsForExport()[0]
+        for offset in stride(from: 0.0, through: 1.4, by: 0.1) {
+            XCTAssertEqual(clip.audioLevel(at: offset),
+                           audioGain(at: offset, duration: item.duration, gain: item.audioGain,
+                                     fadeIn: item.audioFadeIn, fadeOut: item.audioFadeOut),
+                           accuracy: 1e-12, "at \(offset)")
+        }
+    }
+
     func testBlackPadPreviewBeginsAtTheExclusiveVideoBoundary() throws {
         let video = LibraryAsset(
             url: URL(fileURLWithPath: "/fixtures/pad-boundary.mp4"),

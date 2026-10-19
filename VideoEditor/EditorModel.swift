@@ -175,6 +175,10 @@ final class EditorModel {
     @ObservationIgnored private var timeObserverGeneration = 0
     @ObservationIgnored private var imagePlaybackTask: Task<Void, Never>?
     @ObservationIgnored private var isAdvancingPlayback = false
+    /// The clip whose black pad is playing. Past the last frame the pad's own
+    /// clock runs the playhead and the player is only its sound, so what the
+    /// player reports about its time is not the playhead's to follow.
+    @ObservationIgnored private var videoPadPlayback: ClipItem.ID?
 
     var hasProject: Bool { !items.isEmpty }
     var hasLibrary: Bool { !library.isEmpty }
@@ -1700,6 +1704,7 @@ final class EditorModel {
 
     private func attachObserver(to p: AVPlayer) {
         detachObserver()
+        videoPadPlayback = nil
         timeObserverGeneration &+= 1
         let generation = timeObserverGeneration
         let itemID = activeItemID
@@ -1717,11 +1722,16 @@ final class EditorModel {
                       self.player === p,
                       self.activeItemID == itemID else { return }
                 guard let item = self.activeItem, !item.isImage else { return }
+                if self.videoPadPlayback == item.id { return }
                 if t.seconds >= item.outPoint - item.frameDuration / 2 {
-                    p.pause()
+                    // A padded clip's recording runs on past its last frame,
+                    // and the export keeps it under the black: there the
+                    // player goes on playing, as the sound of the pad.
+                    if !item.hasVideoPad { p.pause() }
                     self.currentTime = item.outPoint
                     self.syncTimelineTimeFromActive()
                     if self.isTimelinePlaying, !self.isAdvancingPlayback {
+                        if item.hasVideoPad { self.videoPadPlayback = item.id }
                         Task { @MainActor [weak self] in
                             self?.playVideoPadThenAdvance(after: item.id)
                         }
@@ -1729,11 +1739,7 @@ final class EditorModel {
                 } else {
                     self.currentTime = max(item.inPoint, t.seconds)
                     // The clip's own fades, drawn on the volume as it plays.
-                    p.volume = Float(audioGain(at: self.currentTime - item.inPoint,
-                                               duration: item.contentDuration,
-                                               gain: item.effectiveAudioGain,
-                                               fadeIn: item.audioFadeIn,
-                                               fadeOut: item.audioFadeOut))
+                    p.volume = Float(item.audioLevel(at: self.currentTime - item.inPoint))
                     self.syncTimelineTimeFromActive()
                 }
             }
@@ -1827,6 +1833,7 @@ final class EditorModel {
         imagePlaybackTask?.cancel()
         imagePlaybackTask = nil
         isAdvancingPlayback = false
+        videoPadPlayback = nil
         // Playback reports time every ~30ms, so pausing almost always lands
         // between two frame boundaries. Snap the committed playhead onto the
         // nearest frame so it lines up with the frame cells and future cuts.
@@ -1882,29 +1889,35 @@ final class EditorModel {
                 seekPlayer(to: item.inPoint)
                 syncTimelineTimeFromActive()
             }
-            player.volume = Float(item.effectiveAudioGain)
+            // Starting inside a fade starts at the fade's level, not at full
+            // level for the first report's worth of sound.
+            player.volume = Float(item.audioLevel(at: currentTime - item.inPoint))
             player.play()
         }
     }
 
-    /// Play a clip's black tail, then continue to the next clip. Nothing decodes
-    /// here — the player has already stopped on the final frame — so the pad
-    /// advances on wall-clock time, exactly the way a still image's span does.
+    /// Play a clip's black tail, then continue to the next clip. The pad has no
+    /// frames to decode, so it advances on wall-clock time, exactly the way a
+    /// still image's span does. The player stays on as its sound: the export
+    /// keeps the recording playing under the black, and so does the preview.
     private func playVideoPadThenAdvance(after itemID: ClipItem.ID) {
         guard isTimelinePlaying,
               let item = items.first(where: { $0.id == itemID }), item.hasVideoPad,
               let start = timelineStart(for: itemID) else {
+            videoPadPlayback = nil
             advanceTimelinePlayback(after: itemID)
             return
         }
         let padEnd = start + item.displayDuration
         let initial = min(max(start + item.contentDuration, timelineTime), padEnd)
         guard padEnd - initial > 1e-6 else {
+            videoPadPlayback = nil
             advanceTimelinePlayback(after: itemID)
             return
         }
-        player?.pause()
+        videoPadPlayback = itemID
         timelineTime = initial
+        playVideoPadSound(item, from: initial - start)
         imagePlaybackTask?.cancel()
         imagePlaybackTask = Task { [weak self] in
             let startedAt = Date()
@@ -1912,6 +1925,7 @@ final class EditorModel {
                 guard let self, self.isTimelinePlaying,
                       self.activeItemID == itemID else { return }
                 self.timelineTime = min(padEnd, initial + Date().timeIntervalSince(startedAt))
+                self.shapeVideoPadSound(item, at: self.timelineTime - start)
                 self.syncAudioPlayback()
                 if self.timelineTime >= padEnd - 1e-6 { break }
                 try? await Task.sleep(for: .milliseconds(33))
@@ -1922,10 +1936,47 @@ final class EditorModel {
         }
     }
 
+    /// Where the recording stops under the black: at the pad's end, or sooner
+    /// where the clip's own audio has been cut short, as the export cuts it.
+    /// A source that simply runs out of sound needs no stop of its own — the
+    /// player goes quiet there, the way the export's padding does.
+    private func videoPadSoundEnd(_ item: ClipItem) -> Double {
+        min(item.paddedOutPoint, item.audioOutPoint ?? .infinity)
+    }
+
+    /// Start the pad's sound `offset` seconds into the clip. Coming off the
+    /// last frame the player is already there and running; only a resume
+    /// inside the black has to put it in place first.
+    private func playVideoPadSound(_ item: ClipItem, from offset: Double) {
+        guard let player else { return }
+        let source = item.inPoint + offset
+        guard source < videoPadSoundEnd(item) - 1e-6 else {
+            player.pause()
+            return
+        }
+        if player.rate == 0 || abs(player.currentTime().seconds - source) > 0.1 {
+            player.seek(to: CMTime(seconds: source, preferredTimescale: 44_100),
+                        toleranceBefore: .zero, toleranceAfter: .zero)
+        }
+        player.volume = Float(item.audioLevel(at: offset))
+        player.play()
+    }
+
+    /// The pad's sound along the clip's own fades, until it is cut.
+    private func shapeVideoPadSound(_ item: ClipItem, at offset: Double) {
+        guard let player else { return }
+        if item.inPoint + offset >= videoPadSoundEnd(item) - 1e-6 {
+            player.pause()
+        } else {
+            player.volume = Float(item.audioLevel(at: offset))
+        }
+    }
+
     private func advanceTimelinePlayback(after itemID: ClipItem.ID) {
         guard isTimelinePlaying, !isAdvancingPlayback,
               let index = items.firstIndex(where: { $0.id == itemID }) else { return }
         isAdvancingPlayback = true
+        videoPadPlayback = nil
         player?.pause()
         imagePlaybackTask?.cancel()
         imagePlaybackTask = nil

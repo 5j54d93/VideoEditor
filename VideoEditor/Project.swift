@@ -460,6 +460,18 @@ nonisolated func audioGain(at time: Double, duration: Double, gain: Double,
     return gain * min(1, max(0, factor))
 }
 
+extension ClipItem {
+    /// The clip's own sound as heard `offset` seconds into its span. The black
+    /// pad is part of the span: the export shapes the whole of it, and the
+    /// recording plays on under the black, so a fade-out on a padded clip
+    /// finishes where the black does rather than where the picture does.
+    func audioLevel(at offset: Double) -> Double {
+        // Qualified, because inside a clip `audioGain` is the clip's own level.
+        VideoEditor.audioGain(at: offset, duration: displayDuration, gain: effectiveAudioGain,
+                              fadeIn: audioFadeIn, fadeOut: audioFadeOut)
+    }
+}
+
 /// One piece of sound on the audio track: a stretch of a file, placed at a
 /// moment on the output timeline and heard under whatever picture is there.
 ///
