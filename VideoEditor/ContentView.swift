@@ -438,6 +438,16 @@ struct ContentView: View {
             }.keyboardShortcut(.delete, modifiers: [])
 
             Button("") { model.toggleGeometryEditing() }.keyboardShortcut("c", modifiers: [])
+            // Sound, on what R would turn: the selection, or the clip under the
+            // playhead when nothing is selected.
+            Button("") { whileEditing { model.toggleMuteForSoundTargets() } }
+                .keyboardShortcut("m", modifiers: [])
+            Button("") { whileEditing { model.nudgeGainForSoundTargets(by: 0.05) } }
+                .keyboardShortcut("=", modifiers: .control)
+            Button("") { whileEditing { model.nudgeGainForSoundTargets(by: -0.05) } }
+                .keyboardShortcut("-", modifiers: .control)
+            Button("") { whileEditing { model.detachSoundTarget() } }
+                .keyboardShortcut("s", modifiers: [.control, .shift])
             // Live in the workspace too, where they turn the clip being
             // reframed. Both registrations land in one place that reads ⇧
             // off the event, for the reason `arrow` gives.

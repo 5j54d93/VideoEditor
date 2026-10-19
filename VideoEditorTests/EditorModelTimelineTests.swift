@@ -1000,6 +1000,59 @@ final class EditorModelTimelineTests: XCTestCase {
         XCTAssertFalse(model.items[0].isAudioMuted)
     }
 
+    /// M, ⌃= ⌃− and ⌃⇧S act on the selection, and with nothing selected on
+    /// the clip being heard — the rule R has. M quiets everything it reaches
+    /// unless all of it is already quiet; a muted sound keeps its level.
+    func testTheSoundKeysActOnTheSelectionOrTheClipBeingHeard() {
+        let video = LibraryAsset(
+            url: URL(fileURLWithPath: "/fixtures/keys.mp4"),
+            kind: .video, width: 640, height: 480,
+            duration: 1, fps: 25, fpsRational: "25",
+            hasAudio: true, frameTimes: [0, 0.96], frameEndTime: 1,
+            audioStartTime: 0, audioDuration: 1)
+        let music = LibraryAsset(url: URL(fileURLWithPath: "/fixtures/keys.m4a"),
+                                 kind: .audio, duration: 10)
+        let model = EditorModel()
+        model.library = [video, music]
+        model.insertLibraryAsset(video.id)
+        let clip = model.items[0].id
+        model.insertLibraryAsset(music.id)
+        let piece = model.audioClips[0].id
+
+        XCTAssertEqual(model.soundTargets.pieces, [piece], "The piece just laid down is selected")
+        model.toggleMuteForSoundTargets()
+        XCTAssertTrue(model.audioClips[0].isMuted)
+        XCTAssertFalse(model.items[0].isAudioMuted)
+
+        model.clearSelection()
+        XCTAssertEqual(model.soundTargets.clips, [clip], "With nothing selected, the clip being heard")
+        model.nudgeGainForSoundTargets(by: 0.05)
+        XCTAssertEqual(model.items[0].audioGain, 1.05)
+        model.nudgeGainForSoundTargets(by: -0.05)
+        model.nudgeGainForSoundTargets(by: -0.05)
+        XCTAssertEqual(model.items[0].audioGain, 0.95)
+
+        model.selectOnly(clip)
+        model.toggleAudioSelection(piece)
+        model.toggleMuteForSoundTargets()
+        XCTAssertTrue(model.items[0].isAudioMuted, "One of them was sounding, so both go quiet")
+        XCTAssertTrue(model.audioClips[0].isMuted)
+        model.nudgeGainForSoundTargets(by: 0.05)
+        XCTAssertEqual(model.items[0].audioGain, 0.95, "A muted sound keeps its level")
+        model.toggleMuteForSoundTargets()
+        XCTAssertFalse(model.items[0].isAudioMuted, "All were quiet, so all come back")
+        XCTAssertFalse(model.audioClips[0].isMuted)
+
+        model.selectOnly(clip)
+        model.detachSoundTarget()
+        XCTAssertEqual(model.audioClips.count, 2, "⌃⇧S puts the clip's own sound on the track")
+        XCTAssertTrue(model.items[0].isAudioMuted)
+
+        model.selectLibraryAsset(video.id)
+        XCTAssertTrue(model.soundTargets.pieces.isEmpty && model.soundTargets.clips.isEmpty,
+                      "Over the library the sound keys reach nothing")
+    }
+
     func testSelectAllThenDeleteClearsTheTimelineAsOneUndoStep() {
         let image = LibraryAsset(
             url: URL(fileURLWithPath: "/fixtures/still.png"),

@@ -1322,6 +1322,53 @@ final class EditorModel {
         changeSound(pieces: pieces, clips: clips) { $0.fadeIn = 0; $0.fadeOut = 0 }
     }
 
+    /// A level a step at a time. A muted sound keeps its level, as its line
+    /// does, so it is passed over; and playback carries on, since this is the
+    /// key to reach for while listening.
+    func nudgeSoundGain(by delta: Double, pieces: Set<AudioClip.ID>, clips: Set<ClipItem.ID>) {
+        changeSound(pieces: pieces, clips: clips, pausing: false) { shaping in
+            guard !shaping.isMuted else { return }
+            shaping.gain += delta
+        }
+    }
+
+    // The keys: M, ⌃= and ⌃−, ⌃⇧S.
+
+    /// What the sound keys act on, by the rule R has: the selected pieces of
+    /// the track and the selected clips' own sound; with nothing selected,
+    /// the sound of the clip under the playhead — the one being heard. Only
+    /// while the timeline is the pane being worked in, as for ⌫: a key pressed
+    /// over the library should not quietly mute the movie.
+    var soundTargets: (pieces: Set<AudioClip.ID>, clips: Set<ClipItem.ID>) {
+        guard timelineHasFocus else { return ([], []) }
+        if !selectedAudioIDs.isEmpty || !selectedIDs.isEmpty { return (selectedAudioIDs, selectedIDs) }
+        guard let active = activeItem, !active.isImage, active.hasAudio else { return ([], []) }
+        return ([], [active.id])
+    }
+
+    /// M. Everything targeted goes quiet, unless all of it already is; then it
+    /// all comes back.
+    func toggleMuteForSoundTargets() {
+        let (pieces, clips) = soundTargets
+        let sounding = audioClips.contains { pieces.contains($0.id) && !$0.isMuted }
+            || items.contains { clips.contains($0.id) && $0.hasAudio && !$0.isImage && !$0.isAudioMuted }
+        setSoundMuted(sounding, pieces: pieces, clips: clips)
+    }
+
+    /// ⌃= and ⌃−, five percent a press.
+    func nudgeGainForSoundTargets(by delta: Double) {
+        let (pieces, clips) = soundTargets
+        nudgeSoundGain(by: delta, pieces: pieces, clips: clips)
+    }
+
+    /// ⌃⇧S, the key Final Cut Pro gives it: the targeted clip's own sound
+    /// onto the track. One clip at a time, as the menu item is.
+    func detachSoundTarget() {
+        let clips = soundTargets.clips
+        guard clips.count == 1, let id = clips.first else { return }
+        detachOriginalAudio(from: id)
+    }
+
     /// A level as it is kept: within what the mix allows, in whole percents —
     /// the number every label reads and the one the export writes.
     static func storedGain(_ gain: Double) -> Double {

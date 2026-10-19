@@ -937,6 +937,7 @@ private struct TimelineClipView: View {
     @State private var soundDrag: SoundDrag?
     /// The control of the clip's own sound under the pointer.
     @State private var soundHover: SoundBarGeometry.Zone?
+    @State private var showsSoundPanel = false
 
     private struct SoundDrag {
         let zone: SoundBarGeometry.Zone
@@ -1023,6 +1024,7 @@ private struct TimelineClipView: View {
                     .disabled(sounds.allSatisfy { $0.audioGain == 1 })
                 Button("移除原音淡入淡出") { model.removeSoundFades(pieces: [], clips: targets) }
                     .disabled(sounds.allSatisfy { $0.audioFadeIn == 0 && $0.audioFadeOut == 0 })
+                Button("原音音量與淡入淡出…") { showsSoundPanel = true }
                 Button("分離原音") { model.detachOriginalAudio(from: item.id) }
                     .disabled(item.isAudioMuted)
                 Divider()
@@ -1171,14 +1173,37 @@ private struct TimelineClipView: View {
                 NSCursor.arrow.set()
             }
         }
+        .popover(isPresented: $showsSoundPanel, arrowEdge: .bottom) {
+            SoundShapingPanel(model: model, target: .original(item.id))
+        }
         .accessibilityLabel(!item.hasAudio ? "沒有原始音訊"
                             : item.isAudioMuted ? "原始音訊已靜音" : "原始音訊")
-        .accessibilityValue(item.hasVideoPad
-            ? "延長 \(String(format: "%.2f", item.videoPadDuration)) 秒黑畫面以保留原音"
-            : "")
+        .accessibilityValue(originalSoundAccessibilityValue)
+        .accessibilityAdjustableAction { direction in
+            guard item.hasAudio else { return }
+            switch direction {
+            case .increment: model.nudgeSoundGain(by: 0.05, pieces: [], clips: [item.id])
+            case .decrement: model.nudgeSoundGain(by: -0.05, pieces: [], clips: [item.id])
+            @unknown default: break
+            }
+        }
+        .accessibilityAction(named: Text(item.isAudioMuted ? "取消原音靜音" : "原音靜音")) {
+            guard item.hasAudio else { return }
+            model.setOriginalAudioMuted(!item.isAudioMuted, for: item.id)
+        }
         .task(id: item.hasAudio ? item.url : nil) {
             peaks = item.hasAudio ? await AudioWaveformStore.shared.peaks(for: item.url) : nil
         }
+    }
+
+    private var originalSoundAccessibilityValue: String {
+        guard item.hasAudio else { return "" }
+        var value = soundAccessibilityValue(gain: item.audioGain, isMuted: item.isAudioMuted,
+                                            fadeIn: item.audioFadeIn, fadeOut: item.audioFadeOut)
+        if item.hasVideoPad {
+            value += "，延長 \(String(format: "%.2f", item.videoPadDuration)) 秒黑畫面以保留原音"
+        }
+        return value
     }
 
     /// The clip's own sound as drawn: a drag in hand applied.
@@ -1336,6 +1361,7 @@ private struct TimelineAudioClipView: View {
     @State private var hoverZone: SoundBarGeometry.Zone?
     /// What the drag in hand is setting, and where along the bar to say it.
     @State private var readout: (text: String, x: CGFloat)?
+    @State private var showsPanel = false
 
     private var selected: Bool { model.selectedAudioIDs.contains(clip.id) }
     private var canSplitAtPlayhead: Bool {
@@ -1390,6 +1416,7 @@ private struct TimelineAudioClipView: View {
                 .disabled(shaped.allSatisfy { $0.gain == 1 })
             Button("移除淡入淡出") { model.removeSoundFades(pieces: pieces, clips: []) }
                 .disabled(shaped.allSatisfy { $0.fadeIn == 0 && $0.fadeOut == 0 })
+            Button("音量與淡入淡出…") { showsPanel = true }
             Divider()
             Button("在播放頭分割") { model.splitAudioClip(clip.id, at: model.timelineTime) }
                 .disabled(!canSplitAtPlayhead)
@@ -1399,10 +1426,25 @@ private struct TimelineAudioClipView: View {
                 model.removeSelectedItems()
             }
         }
+        .popover(isPresented: $showsPanel, arrowEdge: .bottom) {
+            SoundShapingPanel(model: model, target: .piece(clip.id))
+        }
         .task(id: clip.url) { peaks = await AudioWaveformStore.shared.peaks(for: clip.url) }
         .accessibilityLabel("音訊 \(clip.name)")
         .accessibilityValue("\(String(format: "%.2f", clip.duration)) 秒，"
-                            + "從 \(String(format: "%.2f", clip.timelineStart)) 秒起")
+                            + "從 \(String(format: "%.2f", clip.timelineStart)) 秒起，"
+                            + soundAccessibilityValue(gain: clip.gain, isMuted: clip.isMuted,
+                                                      fadeIn: clip.fadeIn, fadeOut: clip.fadeOut))
+        .accessibilityAdjustableAction { direction in
+            switch direction {
+            case .increment: model.nudgeSoundGain(by: 0.05, pieces: [clip.id], clips: [])
+            case .decrement: model.nudgeSoundGain(by: -0.05, pieces: [clip.id], clips: [])
+            @unknown default: break
+            }
+        }
+        .accessibilityAction(named: Text(clip.isMuted ? "取消靜音" : "靜音")) {
+            model.setAudioClipMuted(!clip.isMuted, for: clip.id)
+        }
     }
 
     private func zone(of drag: Drag) -> SoundBarGeometry.Zone {

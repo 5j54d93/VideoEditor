@@ -435,3 +435,132 @@ extension SoundBarGeometry {
         return handles.union(band)
     }
 }
+
+/// What VoiceOver says a piece of sound is set to.
+func soundAccessibilityValue(gain: Double, isMuted: Bool, fadeIn: Double, fadeOut: Double) -> String {
+    var parts = [isMuted ? "已靜音" : "音量 \(Int((gain * 100).rounded()))%"]
+    if fadeIn > 0 { parts.append(String(format: "淡入 %.1f 秒", fadeIn)) }
+    if fadeOut > 0 { parts.append(String(format: "淡出 %.1f 秒", fadeOut)) }
+    return parts.joined(separator: "，")
+}
+
+/// The exact numbers, for when a drag is not precise enough: the sliders the
+/// row above the timeline used to carry, opened from a bar's menu instead.
+/// Every slider drag is one undo step, however many values it sends.
+struct SoundShapingPanel: View {
+    enum Target: Equatable {
+        case piece(AudioClip.ID)
+        case original(ClipItem.ID)
+    }
+
+    let model: EditorModel
+    let target: Target
+
+    private struct Values {
+        let title: String
+        let gain: Double
+        let isMuted: Bool
+        let fadeIn: Double
+        let fadeOut: Double
+        /// How long the fades may run between them.
+        let length: Double
+    }
+
+    private var values: Values? {
+        switch target {
+        case .piece(let id):
+            guard let clip = model.audioClips.first(where: { $0.id == id }) else { return nil }
+            return Values(title: clip.name, gain: clip.gain, isMuted: clip.isMuted,
+                          fadeIn: clip.fadeIn, fadeOut: clip.fadeOut, length: clip.duration)
+        case .original(let id):
+            guard let item = model.items.first(where: { $0.id == id }) else { return nil }
+            return Values(title: "原音 · \(item.url.lastPathComponent)", gain: item.audioGain,
+                          isMuted: item.isAudioMuted, fadeIn: item.audioFadeIn,
+                          fadeOut: item.audioFadeOut, length: item.displayDuration)
+        }
+    }
+
+    var body: some View {
+        if let values {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 8) {
+                    Text(values.title).font(.headline).lineLimit(1).truncationMode(.middle)
+                    Spacer(minLength: 0)
+                    Button { setMuted(!values.isMuted) } label: {
+                        Image(systemName: values.isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                            .frame(width: 16)
+                    }
+                    .help(values.isMuted ? "取消靜音" : "靜音")
+                }
+                row("音量", value: values.gain, in: 0...EditorModel.maximumAudioGain,
+                    readout: "\(Int((values.gain * 100).rounded()))%", key: gainKey,
+                    set: setGain)
+                    .disabled(values.isMuted)
+                row("淡入", value: values.fadeIn, in: 0...max(0.1, values.length),
+                    readout: String(format: "%.2f 秒", values.fadeIn), key: fadeKey) { fadeIn in
+                    setFades(fadeIn, values.fadeOut)
+                }
+                row("淡出", value: values.fadeOut, in: 0...max(0.1, values.length),
+                    readout: String(format: "%.2f 秒", values.fadeOut), key: fadeKey) { fadeOut in
+                    setFades(values.fadeIn, fadeOut)
+                }
+            }
+            .controlSize(.small)
+            .padding(14)
+            .frame(width: 300)
+        }
+    }
+
+    /// A value and its readout. The setter is `@MainActor`, which is what lets
+    /// it pass into SwiftUI's `@Sendable` binding.
+    private func row(_ title: String, value: Double, in range: ClosedRange<Double>,
+                     readout: String, key: String,
+                     set: @escaping @MainActor (Double) -> Void) -> some View {
+        HStack(spacing: 8) {
+            Text(title).font(.callout).foregroundStyle(.secondary)
+                .frame(width: 30, alignment: .leading)
+            Slider(value: Binding(get: { value }, set: set), in: range,
+                   onEditingChanged: { editing in
+                       if editing { model.beginContinuousEdit(key) } else { model.endContinuousEdit(key) }
+                   })
+            Text(readout)
+                .font(.system(.callout, design: .monospaced))
+                .frame(width: 64, alignment: .trailing)
+        }
+    }
+
+    private var gainKey: String {
+        switch target {
+        case .piece(let id): "audio-gain:\(id)"
+        case .original(let id): "original-gain:\(id)"
+        }
+    }
+
+    private var fadeKey: String {
+        switch target {
+        case .piece(let id): "audio-fade:\(id)"
+        case .original(let id): "original-fade:\(id)"
+        }
+    }
+
+    @MainActor private func setGain(_ gain: Double) {
+        switch target {
+        case .piece(let id): model.setAudioClipGain(gain, for: id)
+        case .original(let id): model.setOriginalAudioGain(gain, for: id)
+        }
+    }
+
+    @MainActor private func setFades(_ fadeIn: Double, _ fadeOut: Double) {
+        switch target {
+        case .piece(let id): model.setAudioClipFades(in: fadeIn, out: fadeOut, for: id)
+        case .original(let id): model.setOriginalAudioFades(in: fadeIn, out: fadeOut, for: id)
+        }
+    }
+
+    private func setMuted(_ muted: Bool) {
+        switch target {
+        case .piece(let id): model.setAudioClipMuted(muted, for: id)
+        case .original(let id): model.setOriginalAudioMuted(muted, for: id)
+        }
+    }
+}
