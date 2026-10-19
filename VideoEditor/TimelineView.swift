@@ -13,8 +13,10 @@ import UniformTypeIdentifiers
 private enum TimelineLaneMetrics {
     static let spacing: CGFloat = 2
     static let audioHeight: CGFloat = 28
-    /// The audio track under the clip row: one lane per overlapping clip.
-    static let audioLaneHeight: CGFloat = 30
+    /// The audio track under the clip row: one lane per overlapping clip. Tall
+    /// enough for a level line, a pair of fade handles and a label to each
+    /// have room of their own.
+    static let audioLaneHeight: CGFloat = 40
     static let audioLaneSpacing: CGFloat = 2
     static let audioTrackGap: CGFloat = 6
     /// Below this a to-scale band carries no information — it is thinner than
@@ -529,6 +531,14 @@ struct TimelineView: View {
                         && value.location.y <= clipRowTop + baseTrackHeight
                     let onTrack = track.clip(at: time,
                                              lane: geometry.audioLane(at: value.location.y))
+                    if let onTrack, let lane = geometry.audioLane(at: value.location.y),
+                       soundControlClick(
+                           on: onTrack,
+                           at: CGPoint(x: value.location.x - CGFloat(onTrack.timelineStart) * scale,
+                                       y: value.location.y - geometry.laneTop(lane)),
+                           scale: scale, movieDuration: layout.totalDuration) {
+                        return
+                    }
                     if NSEvent.modifierFlags.contains(.command) {
                         // ⌘-click toggles a clip in/out of the selection and never
                         // moves the playhead.
@@ -687,6 +697,33 @@ struct TimelineView: View {
                            lanes: lanes)
     }
 
+    /// A click on one of a piece's own controls: the speaker mutes it or
+    /// brings it back, and ⌥ on the line or a handle puts that control back
+    /// where it started. True when the click was one of these; it then neither
+    /// selects nor moves the playhead, as a click anywhere else on the piece
+    /// still does. Here rather than on the bar because this tap sees every
+    /// click on the canvas, a button inside it included.
+    private func soundControlClick(on clip: AudioClip, at point: CGPoint,
+                                   scale: CGFloat, movieDuration: Double) -> Bool {
+        let bar = SoundBarGeometry(piece: clip, width: max(2, CGFloat(clip.duration) * scale),
+                                   height: TimelineLaneMetrics.audioLaneHeight,
+                                   pointsPerSecond: scale, movieDuration: movieDuration)
+        let option = NSEvent.modifierFlags.contains(.option)
+        switch bar.zone(at: point, isMuted: clip.isMuted, trims: true) {
+        case .mute:
+            model.setAudioClipMuted(!clip.isMuted, for: clip.id)
+        case .level where option:
+            model.setAudioClipGain(1, for: clip.id)
+        case .fadeIn where option:
+            model.setAudioClipFades(in: 0, out: clip.fadeOut, for: clip.id)
+        case .fadeOut where option:
+            model.setAudioClipFades(in: clip.fadeIn, out: 0, for: clip.id)
+        default:
+            return false
+        }
+        return true
+    }
+
     /// The audio track: every piece of sound in its lane, under the clip row.
     private func audioTrack(track: AudioTrackLayout, layout: TimelineLayout, scale: CGFloat,
                             geometry: TrackGeometry, visibleTimelineRange: ClosedRange<Double>,
@@ -696,6 +733,7 @@ struct TimelineView: View {
                 TimelineAudioClipView(
                     model: model, clip: entry.clip, pointsPerSecond: scale,
                     height: TimelineLaneMetrics.audioLaneHeight,
+                    top: geometry.laneTop(entry.lane),
                     movieDuration: layout.totalDuration,
                     snapTimes: track.snapTimes(excluding: entry.id,
                                                clipBoundaries: layout.boundaries),
@@ -1071,39 +1109,51 @@ private struct TimelineClipView: View {
                         peaks: peaks,
                         peaksOffset: item.inPoint - item.audioStartTime,
                         soundRange: soundFrom...max(soundFrom, soundTo),
-                        visibleRange: firstVisible...max(firstVisible, lastVisible))
+                        visibleRange: firstVisible...max(firstVisible, lastVisible),
+                        showsLevel: false)
     }
 }
 
-/// One piece of sound on the track. Dragging its body slides it along the
-/// movie; dragging either end trims it, keeping the sound where it was. Both
-/// are drawn live from the view's own copy of the drag and handed to the model
-/// once, on release — one undo step, and no re-laning under the pointer while
-/// it is still moving.
+/// One piece of sound on the track, with its controls on it. Dragging its body
+/// slides it along the movie; dragging either end trims it, keeping the sound
+/// where it was; dragging the line sets its level and the handles at the top
+/// its fades. Every one of them is drawn live from the view's own copy of the
+/// drag and handed to the model once, on release — one undo step, and no
+/// re-laning under the pointer while it is still moving. Clicks on the
+/// speaker, and ⌥-clicks that put a control back, are the canvas's: its tap
+/// sees every click first, so it is where they are told apart from a click
+/// that selects.
 private struct TimelineAudioClipView: View {
     let model: EditorModel
     let clip: AudioClip
     let pointsPerSecond: CGFloat
     let height: CGFloat
+    /// The lane's top in the canvas, which the drag's coordinates are in.
+    let top: CGFloat
     let movieDuration: Double
     let snapTimes: [Double]
     let visibleTimelineRange: ClosedRange<Double>
 
     /// Screen distance within which an end is pulled onto a cut or the playhead.
     private let snapDistance: CGFloat = 6
-    /// How far in from either end a drag counts as a trim rather than a move.
-    private let gripWidth: CGFloat = 8
 
-    private enum DragKind { case move, trimStart, trimEnd }
+    private enum DragKind { case move, trimStart, trimEnd, level, fadeIn, fadeOut }
     private struct Drag {
         let kind: DragKind
         let origin: AudioClip
+        /// Where a level drag last changed gear, ⌘ going down or up: the gain
+        /// and the pointer's rise there, so the line never jumps.
+        var levelBase: (gain: Double, rise: CGFloat, fine: Bool)?
     }
 
     @State private var drag: Drag?
     /// The clip with the drag in flight applied; `nil` when nothing is moving.
     @State private var shown: AudioClip?
     @State private var peaks: AudioPeaks?
+    /// The control under the pointer, `nil` when the pointer is elsewhere.
+    @State private var hoverZone: SoundBarGeometry.Zone?
+    /// What the drag in hand is setting, and where along the bar to say it.
+    @State private var readout: (text: String, x: CGFloat)?
 
     private var selected: Bool { model.selectedAudioIDs.contains(clip.id) }
     private var canSplitAtPlayhead: Bool {
@@ -1121,15 +1171,27 @@ private struct TimelineAudioClipView: View {
                  peaks: peaks,
                  peaksOffset: shown.inPoint - shown.audioStartTime,
                  visibleRange: visibleColumns(shown, width: width),
-                 selected: selected)
+                 selected: selected,
+                 showsHandles: selected || hoverZone != nil || drag != nil,
+                 hot: drag.map(zone(of:)) ?? hoverZone)
         .contentShape(Rectangle())
+        .overlay(alignment: .topLeading) {
+            if let readout {
+                SoundReadout(text: readout.text)
+                    .offset(x: readout.x + 10, y: -22)
+            }
+        }
         .offset(x: CGFloat(shown.timelineStart - clip.timelineStart) * pointsPerSecond)
         .onContinuousHover { phase in
             switch phase {
             case .active(let point):
-                let onGrip = point.x < gripWidth || point.x > width - gripWidth
-                (onGrip ? NSCursor.resizeLeftRight : NSCursor.openHand).set()
+                guard drag == nil else { return }
+                let zone = barGeometry(clip, width: width)
+                    .zone(at: point, isMuted: clip.isMuted, trims: true)
+                if zone != hoverZone { hoverZone = zone }
+                SoundBarCursor.cursor(for: zone).set()
             case .ended:
+                hoverZone = nil
                 NSCursor.arrow.set()
             }
         }
@@ -1152,39 +1214,80 @@ private struct TimelineAudioClipView: View {
                             + "從 \(String(format: "%.2f", clip.timelineStart)) 秒起")
     }
 
+    private func zone(of drag: Drag) -> SoundBarGeometry.Zone {
+        switch drag.kind {
+        case .move: .body
+        case .trimStart: .trimStart
+        case .trimEnd: .trimEnd
+        case .level: .level
+        case .fadeIn: .fadeIn
+        case .fadeOut: .fadeOut
+        }
+    }
+
     private func dragGesture(width: CGFloat) -> some Gesture {
         DragGesture(minimumDistance: 3, coordinateSpace: .named("outputTimelineCanvas"))
             .onChanged { value in
                 if drag == nil {
-                    let local = value.startLocation.x - CGFloat(clip.timelineStart) * pointsPerSecond
-                    let kind: DragKind = local < gripWidth ? .trimStart
-                        : local > width - gripWidth ? .trimEnd
-                        : .move
+                    let start = CGPoint(x: value.startLocation.x - CGFloat(clip.timelineStart) * pointsPerSecond,
+                                        y: value.startLocation.y - top)
+                    let kind: DragKind
+                    switch barGeometry(clip, width: width).zone(at: start, isMuted: clip.isMuted, trims: true) {
+                    case .fadeIn: kind = .fadeIn
+                    case .fadeOut: kind = .fadeOut
+                    case .level: kind = .level
+                    case .trimStart: kind = .trimStart
+                    case .trimEnd: kind = .trimEnd
+                    case .mute, .body: kind = .move
+                    }
                     drag = Drag(kind: kind, origin: clip)
                     if !selected { model.selectAudioClip(clip.id) }
+                    // A level or a fade is a continuous edit, as a slider's was:
+                    // playback stops for it, and the drag is one undo step.
+                    if let key = editKey(kind) { model.beginContinuousEdit(key) }
                 }
-                guard let drag else { return }
-                shown = apply(drag, translation: value.translation.width)
+                guard var drag else { return }
+                let result = apply(&drag, value: value)
+                self.drag = drag
+                shown = result
+                readout = (readoutText(drag, result),
+                           value.location.x - CGFloat(result.timelineStart) * pointsPerSecond)
             }
             .onEnded { _ in
-                defer { drag = nil; shown = nil }
-                guard let drag, let result = shown else { return }
-                switch drag.kind {
-                case .move:
-                    model.moveAudioClip(clip.id, to: result.timelineStart)
-                case .trimStart, .trimEnd:
-                    model.trimAudioClip(clip.id, inPoint: result.inPoint,
-                                        outPoint: result.outPoint,
-                                        timelineStart: result.timelineStart)
+                defer { drag = nil; shown = nil; readout = nil }
+                guard let drag else { return }
+                if let result = shown {
+                    switch drag.kind {
+                    case .move:
+                        model.moveAudioClip(clip.id, to: result.timelineStart)
+                    case .trimStart, .trimEnd:
+                        model.trimAudioClip(clip.id, inPoint: result.inPoint,
+                                            outPoint: result.outPoint,
+                                            timelineStart: result.timelineStart)
+                    case .level:
+                        model.setAudioClipGain(result.gain, for: clip.id)
+                    case .fadeIn, .fadeOut:
+                        model.setAudioClipFades(in: result.fadeIn, out: result.fadeOut, for: clip.id)
+                    }
                 }
+                if let key = editKey(drag.kind) { model.endContinuousEdit(key) }
             }
     }
 
-    /// The clip as a drag of `translation` points leaves it: moved, or trimmed
-    /// at one end, with that end pulled onto a nearby cut.
-    private func apply(_ drag: Drag, translation: CGFloat) -> AudioClip {
+    private func editKey(_ kind: DragKind) -> String? {
+        switch kind {
+        case .level: "audio-gain:\(clip.id)"
+        case .fadeIn, .fadeOut: "audio-fade:\(clip.id)"
+        case .move, .trimStart, .trimEnd: nil
+        }
+    }
+
+    /// The clip as the drag so far leaves it: moved, or trimmed at one end
+    /// with that end pulled onto a nearby cut, or set to a new level or fade.
+    private func apply(_ drag: inout Drag, value: DragGesture.Value) -> AudioClip {
         var clip = drag.origin
-        let delta = Double(translation / pointsPerSecond)
+        let delta = Double(value.translation.width / pointsPerSecond)
+        let fine = NSEvent.modifierFlags.contains(.command)
         switch drag.kind {
         case .move:
             var start = max(0, clip.timelineStart + delta)
@@ -1213,8 +1316,45 @@ private struct TimelineAudioClipView: View {
                 if candidate >= floor && candidate <= clip.sourceCeiling { outPoint = candidate }
             }
             clip.outPoint = outPoint
+        case .level:
+            let rise = -value.translation.height
+            if drag.levelBase == nil {
+                drag.levelBase = (clip.gain, 0, fine)
+            } else if drag.levelBase?.fine != fine {
+                drag.levelBase = ((shown ?? clip).gain, rise, fine)
+            }
+            let base = drag.levelBase ?? (clip.gain, 0, fine)
+            clip.gain = barGeometry(clip, width: 0)
+                .gain(from: base.gain, rise: rise - base.rise, fine: fine)
+        case .fadeIn, .fadeOut:
+            // The handle follows the pointer; the other fade stays put and
+            // bounds it.
+            let current = shown ?? clip
+            let geometry = barGeometry(current, width: max(2, CGFloat(current.duration) * pointsPerSecond))
+            let origin = CGFloat(clip.timelineStart) * pointsPerSecond
+            let snaps = fine ? [] : (snapTimes + [0, model.timelineTime])
+                .map { CGFloat($0) * pointsPerSecond - origin }
+            let x = value.location.x - origin
+            if drag.kind == .fadeIn {
+                clip.fadeIn = geometry.fade(.fadeIn, handleAt: x, snaps: snaps)
+                clip.fadeOut = current.fadeOut
+            } else {
+                clip.fadeOut = geometry.fade(.fadeOut, handleAt: x, snaps: snaps)
+                clip.fadeIn = current.fadeIn
+            }
         }
         return clip
+    }
+
+    private func readoutText(_ drag: Drag, _ result: AudioClip) -> String {
+        switch drag.kind {
+        case .move: "起 \(timelineClockText(result.timelineStart))"
+        case .trimStart, .trimEnd: String(format: "長度 %.2f 秒", result.duration)
+        case .level: "\(Int((result.gain * 100).rounded()))%"
+            + (drag.levelBase?.fine == true ? " · 微調" : "")
+        case .fadeIn: String(format: "淡入 %.2f 秒", result.fadeIn)
+        case .fadeOut: String(format: "淡出 %.2f 秒", result.fadeOut)
+        }
     }
 
     private func snap(_ time: Double) -> Double? {
@@ -1229,11 +1369,8 @@ private struct TimelineAudioClipView: View {
     /// The bar's shape for `shown`: its fade-out leads into wherever the
     /// sound stops being heard, the movie's end when the clip outruns it.
     private func barGeometry(_ shown: AudioClip, width: CGFloat) -> SoundBarGeometry {
-        let heard = CGFloat(shown.heardDuration(movieDuration: movieDuration)) * pointsPerSecond
-        return SoundBarGeometry(width: width, height: height,
-                                heardWidth: min(width, max(0, heard)),
-                                pointsPerSecond: pointsPerSecond, gain: shown.gain,
-                                fadeIn: shown.fadeIn, fadeOut: shown.fadeOut)
+        SoundBarGeometry(piece: shown, width: width, height: height,
+                         pointsPerSecond: pointsPerSecond, movieDuration: movieDuration)
     }
 
     /// The columns of the bar on screen, in points from its start.

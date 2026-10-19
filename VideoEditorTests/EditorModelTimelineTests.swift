@@ -918,6 +918,45 @@ final class EditorModelTimelineTests: XCTestCase {
         XCTAssertEqual(model.audioClips.count, 1, "The step before the drag was the insert, not a tick of it")
     }
 
+    /// Sound is kept the way its labels read it — whole percents, hundredths
+    /// of a second — and a pair of fades never overlaps: the one being moved
+    /// stops at the other instead of pushing it.
+    func testSoundIsKeptAsItsLabelsReadIt() {
+        let (model, id) = trackModel()
+        model.setAudioClipGain(0.8349, for: id)
+        XCTAssertEqual(model.audioClips[0].gain, 0.83)
+
+        model.setAudioClipFades(in: 6, out: 0, for: id)
+        model.setAudioClipFades(in: 6, out: 7, for: id)
+        XCTAssertEqual(model.audioClips[0].fadeIn, 6)
+        XCTAssertEqual(model.audioClips[0].fadeOut, 4, accuracy: 1e-9, "The fade-out stops at the fade-in")
+        model.setAudioClipFades(in: 8, out: 4, for: id)
+        XCTAssertEqual(model.audioClips[0].fadeIn, 6, accuracy: 1e-9, "And the fade-in at the fade-out")
+        model.setAudioClipFades(in: 1.234, out: 4, for: id)
+        XCTAssertEqual(model.audioClips[0].fadeIn, 1.23)
+    }
+
+    /// A clip's own fades follow the same rule over the clip's span.
+    func testAClipsOwnFadesStopAtEachOther() {
+        let video = LibraryAsset(
+            url: URL(fileURLWithPath: "/fixtures/own-fades.mp4"),
+            kind: .video, width: 640, height: 480,
+            duration: 1, fps: 25, fpsRational: "25",
+            hasAudio: true, frameTimes: [0, 0.96], frameEndTime: 1,
+            audioStartTime: 0, audioDuration: 1)
+        let model = EditorModel()
+        model.library = [video]
+        model.insertLibraryAsset(video.id)
+        let id = model.items[0].id
+
+        model.setOriginalAudioFades(in: 0.7, out: 0, for: id)
+        model.setOriginalAudioFades(in: 0.7, out: 0.6, for: id)
+        XCTAssertEqual(model.items[0].audioFadeIn, 0.7)
+        XCTAssertEqual(model.items[0].audioFadeOut, 0.3, accuracy: 1e-9)
+        model.setOriginalAudioGain(1.456, for: id)
+        XCTAssertEqual(model.items[0].audioGain, 1.46)
+    }
+
     func testSelectAllThenDeleteClearsTheTimelineAsOneUndoStep() {
         let image = LibraryAsset(
             url: URL(fileURLWithPath: "/fixtures/still.png"),

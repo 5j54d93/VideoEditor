@@ -1210,7 +1210,7 @@ final class EditorModel {
 
     func setAudioClipGain(_ gain: Double, for id: AudioClip.ID) {
         guard let index = audioClips.firstIndex(where: { $0.id == id }) else { return }
-        let value = min(max(0, gain), Self.maximumAudioGain)
+        let value = Self.storedGain(gain)
         guard abs(value - audioClips[index].gain) > 1e-9 else { return }
         registerUndoForEdit("audio-gain:\(id)")
         audioClips[index].gain = value
@@ -1219,8 +1219,8 @@ final class EditorModel {
     func setAudioClipFades(in fadeIn: Double, out fadeOut: Double, for id: AudioClip.ID) {
         guard let index = audioClips.firstIndex(where: { $0.id == id }) else { return }
         let clip = audioClips[index]
-        let newIn = min(max(0, fadeIn), clip.duration)
-        let newOut = min(max(0, fadeOut), clip.duration)
+        let (newIn, newOut) = Self.storedFades(in: fadeIn, out: fadeOut, length: clip.duration,
+                                               was: (clip.fadeIn, clip.fadeOut))
         guard abs(newIn - clip.fadeIn) > 1e-9 || abs(newOut - clip.fadeOut) > 1e-9 else { return }
         registerUndoForEdit("audio-fade:\(id)")
         audioClips[index].fadeIn = newIn
@@ -1240,7 +1240,7 @@ final class EditorModel {
 
     func setOriginalAudioGain(_ gain: Double, for id: ClipItem.ID) {
         guard let index = items.firstIndex(where: { $0.id == id }) else { return }
-        let value = min(max(0, gain), Self.maximumAudioGain)
+        let value = Self.storedGain(gain)
         guard abs(value - items[index].audioGain) > 1e-9 else { return }
         registerUndoForEdit("original-gain:\(id)")
         items[index].audioGain = value
@@ -1250,14 +1250,38 @@ final class EditorModel {
     func setOriginalAudioFades(in fadeIn: Double, out fadeOut: Double, for id: ClipItem.ID) {
         guard let index = items.firstIndex(where: { $0.id == id }) else { return }
         let item = items[index]
-        let newIn = min(max(0, fadeIn), item.displayDuration)
-        let newOut = min(max(0, fadeOut), item.displayDuration)
+        let (newIn, newOut) = Self.storedFades(in: fadeIn, out: fadeOut, length: item.displayDuration,
+                                               was: (item.audioFadeIn, item.audioFadeOut))
         guard abs(newIn - item.audioFadeIn) > 1e-9 || abs(newOut - item.audioFadeOut) > 1e-9 else {
             return
         }
         registerUndoForEdit("original-fade:\(id)")
         items[index].audioFadeIn = newIn
         items[index].audioFadeOut = newOut
+    }
+
+    /// A level as it is kept: within what the mix allows, in whole percents —
+    /// the number every label reads and the one the export writes.
+    static func storedGain(_ gain: Double) -> Double {
+        (min(max(0, gain), maximumAudioGain) * 100).rounded() / 100
+    }
+
+    /// A pair of fades as they are kept: hundredths of a second, inside
+    /// `length`, and never overlapping. When they would, the one being moved
+    /// gives way to the one already there — a handle stops at the other
+    /// rather than pushing it.
+    static func storedFades(in fadeIn: Double, out fadeOut: Double, length: Double,
+                            was previous: (in: Double, out: Double)) -> (Double, Double) {
+        let kept = { (value: Double) in min(length, (max(0, value) * 100).rounded() / 100) }
+        var newIn = kept(fadeIn), newOut = kept(fadeOut)
+        if newIn + newOut > length + 1e-9 {
+            if abs(newIn - previous.in) > 1e-9 {
+                newIn = max(0, length - newOut)
+            } else {
+                newOut = max(0, length - newIn)
+            }
+        }
+        return (newIn, newOut)
     }
 
     /// The active clip's player plays at the clip's level. Set whenever the
