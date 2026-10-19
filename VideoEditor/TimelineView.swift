@@ -847,6 +847,9 @@ private struct TimelineClipView: View {
     let pointsPerSecond: CGFloat
     let height: CGFloat
 
+    /// The clip's own sound, read once per file off the main thread.
+    @State private var peaks: AudioPeaks?
+
     private var selected: Bool { model.selectedIDs.contains(item.id) }
     private var dragPayload: String {
         let draggedItems = selected
@@ -1000,33 +1003,21 @@ private struct TimelineClipView: View {
     }
 
     private var originalAudioLane: some View {
-        let start = max(item.inPoint, item.audioStartTime)
-        // A padded clip keeps its audio across the black: that is the entire
-        // reason the black is there, and it is why the cyan visibly outruns the
-        // picture on an extended clip.
-        let end = min(item.paddedOutPoint, item.effectiveAudioOutPoint)
-        let activeWidth = max(0, CGFloat(end - start) * pointsPerSecond)
-        let activeOffset = max(0, CGFloat(start - item.inPoint) * pointsPerSecond)
-        // Muted — or detached onto the track, which mutes — draws like no
-        // track at all: the lane shows what will be heard from the clip itself.
-        let heard = item.hasAudio && !item.isAudioMuted
-        return ZStack(alignment: .leading) {
-            RoundedRectangle(cornerRadius: 3)
-                .fill(Color.black.opacity(0.58))
-            if heard, activeWidth > 0 {
+        ZStack(alignment: .leading) {
+            if item.hasAudio {
+                originalSoundBar
+            } else {
                 RoundedRectangle(cornerRadius: 3)
-                    .fill(Color.cyan.opacity(0.34))
-                    .frame(width: activeWidth)
-                    .offset(x: activeOffset)
+                    .fill(Color.black.opacity(0.58))
+                HStack(spacing: 4) {
+                    Image(systemName: "speaker.slash")
+                    Text("無原音")
+                    Spacer(minLength: 0)
+                }
+                .font(.system(size: 9, weight: .medium))
+                .foregroundStyle(Color.secondary)
+                .padding(.horizontal, 6)
             }
-            HStack(spacing: 4) {
-                Image(systemName: heard ? "waveform" : "speaker.slash")
-                Text(!item.hasAudio ? "無原音" : item.isAudioMuted ? "原音已靜音" : "原音")
-                Spacer(minLength: 0)
-            }
-            .font(.system(size: 9, weight: .medium))
-            .foregroundStyle(heard ? Color.white.opacity(0.82) : Color.secondary)
-            .padding(.horizontal, 6)
 
             // Keep the full clip draggable from either lane. The warning button
             // is layered after this surface, so its click remains independent.
@@ -1049,6 +1040,38 @@ private struct TimelineClipView: View {
         .accessibilityValue(item.hasVideoPad
             ? "延長 \(String(format: "%.2f", item.videoPadDuration)) 秒黑畫面以保留原音"
             : "")
+        .task(id: item.hasAudio ? item.url : nil) {
+            peaks = item.hasAudio ? await AudioWaveformStore.shared.peaks(for: item.url) : nil
+        }
+    }
+
+    /// The clip's own sound, drawn the way the track's pieces are. Its span is
+    /// the clip's, black included: a padded clip keeps its audio across the
+    /// black — the entire reason the black is there — and the export shapes
+    /// the whole span.
+    private var originalSoundBar: some View {
+        let start = max(item.inPoint, item.audioStartTime)
+        let end = min(item.paddedOutPoint, item.effectiveAudioOutPoint)
+        let soundFrom = max(0, CGFloat(start - item.inPoint) * pointsPerSecond)
+        let soundTo = min(width, soundFrom + max(0, CGFloat(end - start) * pointsPerSecond))
+        let firstVisible = max(0, CGFloat(visibleTimelineRange.lowerBound - timelineStart) * pointsPerSecond)
+        let lastVisible = min(width, CGFloat(visibleTimelineRange.upperBound - timelineStart) * pointsPerSecond)
+        // Muted — or detached onto the track, which mutes — draws like no
+        // sound at all: the bar shows what will be heard from the clip itself.
+        return SoundBar(kind: .original,
+                        geometry: SoundBarGeometry(width: width,
+                                                   height: TimelineLaneMetrics.audioHeight,
+                                                   heardWidth: width,
+                                                   pointsPerSecond: pointsPerSecond,
+                                                   gain: item.audioGain,
+                                                   fadeIn: item.audioFadeIn,
+                                                   fadeOut: item.audioFadeOut),
+                        isMuted: item.isAudioMuted,
+                        label: item.isAudioMuted ? "原音已靜音" : "原音",
+                        peaks: peaks,
+                        peaksOffset: item.inPoint - item.audioStartTime,
+                        soundRange: soundFrom...max(soundFrom, soundTo),
+                        visibleRange: firstVisible...max(firstVisible, lastVisible))
     }
 }
 
@@ -1091,29 +1114,14 @@ private struct TimelineAudioClipView: View {
     var body: some View {
         let shown = self.shown ?? clip
         let width = max(2, CGFloat(shown.duration) * pointsPerSecond)
-        ZStack(alignment: .topLeading) {
-            RoundedRectangle(cornerRadius: 4)
-                .fill(shown.isMuted ? Color.gray.opacity(0.35) : Color.teal.opacity(0.5))
-            waveform(shown, width: width)
-            fadeRamps(shown)
-            if shown.timelineEnd > movieDuration {
-                // Past the last frame nothing is heard: the sound stops where
-                // the picture does, and the bar says so.
-                let silentFrom = max(movieDuration, shown.timelineStart)
-                Rectangle()
-                    .fill(Color.black.opacity(0.45))
-                    .frame(width: max(0, CGFloat(shown.timelineEnd - silentFrom) * pointsPerSecond))
-                    .offset(x: CGFloat(silentFrom - shown.timelineStart) * pointsPerSecond)
-            }
-            label(shown)
-        }
-        .frame(width: width, height: height)
-        .clipShape(RoundedRectangle(cornerRadius: 4))
-        .overlay {
-            RoundedRectangle(cornerRadius: 4)
-                .stroke(selected ? Color.accentColor : Color.white.opacity(0.25),
-                        lineWidth: selected ? 2 : 1)
-        }
+        SoundBar(kind: .track,
+                 geometry: barGeometry(shown, width: width),
+                 isMuted: shown.isMuted,
+                 label: shown.name,
+                 peaks: peaks,
+                 peaksOffset: shown.inPoint - shown.audioStartTime,
+                 visibleRange: visibleColumns(shown, width: width),
+                 selected: selected)
         .contentShape(Rectangle())
         .offset(x: CGFloat(shown.timelineStart - clip.timelineStart) * pointsPerSecond)
         .onContinuousHover { phase in
@@ -1218,73 +1226,21 @@ private struct TimelineAudioClipView: View {
         return nearest
     }
 
-    /// The loudness along the clip, one column per point, drawn only for the
-    /// columns on screen: a song at a wide zoom is tens of thousands of them,
-    /// most scrolled away.
-    private func waveform(_ shown: AudioClip, width: CGFloat) -> some View {
-        Canvas { context, size in
-            guard let peaks else { return }
-            let first = max(0, CGFloat(visibleTimelineRange.lowerBound - shown.timelineStart)
-                            * pointsPerSecond).rounded(.down)
-            let last = min(size.width, CGFloat(visibleTimelineRange.upperBound - shown.timelineStart)
-                           * pointsPerSecond).rounded(.up)
-            guard last > first else { return }
-            // Height follows the level, so a turned-down clip looks turned down.
-            let amplitude = CGFloat(min(1, shown.gain)) * (size.height - 6)
-            let middle = size.height / 2
-            var bars = Path()
-            var x = first
-            while x < last {
-                let from = shown.inPoint + Double(x / pointsPerSecond) - shown.audioStartTime
-                let to = shown.inPoint + Double((x + 1) / pointsPerSecond) - shown.audioStartTime
-                let bar = max(1, CGFloat(peaks.peak(from: from, to: to)) * amplitude)
-                bars.addRect(CGRect(x: x, y: middle - bar / 2, width: 1, height: bar))
-                x += 1
-            }
-            context.fill(bars, with: .color(.white.opacity(shown.isMuted ? 0.3 : 0.65)))
-        }
+    /// The bar's shape for `shown`: its fade-out leads into wherever the
+    /// sound stops being heard, the movie's end when the clip outruns it.
+    private func barGeometry(_ shown: AudioClip, width: CGFloat) -> SoundBarGeometry {
+        let heard = CGFloat(shown.heardDuration(movieDuration: movieDuration)) * pointsPerSecond
+        return SoundBarGeometry(width: width, height: height,
+                                heardWidth: min(width, max(0, heard)),
+                                pointsPerSecond: pointsPerSecond, gain: shown.gain,
+                                fadeIn: shown.fadeIn, fadeOut: shown.fadeOut)
     }
 
-    /// The fades as shaded wedges over the ends: the sound under the wedge is
-    /// the part being taken down. The fade-out leads into wherever the sound
-    /// stops — the movie's end, when the clip outruns it.
-    private func fadeRamps(_ shown: AudioClip) -> some View {
-        Canvas { context, size in
-            var wedges = Path()
-            if shown.fadeIn > 0 {
-                let run = min(size.width, CGFloat(shown.fadeIn) * pointsPerSecond)
-                wedges.move(to: CGPoint(x: 0, y: size.height))
-                wedges.addLine(to: CGPoint(x: 0, y: 0))
-                wedges.addLine(to: CGPoint(x: run, y: 0))
-                wedges.closeSubpath()
-            }
-            if shown.fadeOut > 0 {
-                let end = max(0, min(size.width,
-                                     CGFloat(shown.heardDuration(movieDuration: movieDuration))
-                                     * pointsPerSecond))
-                let run = min(end, CGFloat(shown.fadeOut) * pointsPerSecond)
-                wedges.move(to: CGPoint(x: end, y: size.height))
-                wedges.addLine(to: CGPoint(x: end, y: 0))
-                wedges.addLine(to: CGPoint(x: end - run, y: 0))
-                wedges.closeSubpath()
-            }
-            context.fill(wedges, with: .color(.black.opacity(0.35)))
-        }
-        .allowsHitTesting(false)
-    }
-
-    private func label(_ shown: AudioClip) -> some View {
-        HStack(spacing: 4) {
-            Image(systemName: shown.isMuted ? "speaker.slash" : "music.note")
-            Text(shown.name).lineLimit(1).truncationMode(.middle)
-            if shown.gain != 1 { Text("\(Int((shown.gain * 100).rounded()))%") }
-            Spacer(minLength: 0)
-        }
-        .font(.system(size: 9, weight: .medium))
-        .foregroundStyle(.white.opacity(shown.isMuted ? 0.6 : 0.9))
-        .padding(.horizontal, 6)
-        .frame(height: height)
-        .allowsHitTesting(false)
+    /// The columns of the bar on screen, in points from its start.
+    private func visibleColumns(_ shown: AudioClip, width: CGFloat) -> ClosedRange<CGFloat> {
+        let first = max(0, CGFloat(visibleTimelineRange.lowerBound - shown.timelineStart) * pointsPerSecond)
+        let last = min(width, CGFloat(visibleTimelineRange.upperBound - shown.timelineStart) * pointsPerSecond)
+        return first...max(first, last)
     }
 }
 
