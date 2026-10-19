@@ -120,6 +120,118 @@ extension View {
     }
 }
 
+// MARK: - Turned pictures
+
+/// Every picture surface draws the source unturned — players, decoders and
+/// `NSImage` all hand back the frame as the file plays it — while every frame
+/// the geometry gives them is the turned shape. These put the turn in between,
+/// exactly: a quarter turn is a matrix of zeros and ones, never a sine that
+/// lands a hair off the axis and has the renderer resample what should only
+/// have moved.
+extension ClipRotation {
+    /// The same turn, as SwiftUI draws a bitmap with it. The cheapest of the
+    /// three: no extra view at all, which matters in a filmstrip.
+    var imageOrientation: Image.Orientation {
+        switch self {
+        case .upright: .up
+        case .clockwise: .right
+        case .upsideDown: .down
+        case .counterclockwise: .left
+        }
+    }
+
+    /// Takes a box of `size` — the picture *before* the turn, top-left at the
+    /// origin, y pointing down as SwiftUI's does — onto the turned box, also
+    /// with its top-left at the origin.
+    func placingTransform(for size: CGSize) -> CGAffineTransform {
+        let w = size.width, h = size.height
+        switch self {
+        case .upright: return .identity
+        case .clockwise: return CGAffineTransform(a: 0, b: 1, c: -1, d: 0, tx: h, ty: 0)
+        case .upsideDown: return CGAffineTransform(a: -1, b: 0, c: 0, d: -1, tx: w, ty: h)
+        case .counterclockwise: return CGAffineTransform(a: 0, b: -1, c: 1, d: 0, tx: 0, ty: w)
+        }
+    }
+}
+
+extension View {
+    /// The receiver drawn turned, filling exactly the frame it is given. For
+    /// SwiftUI content only: a SwiftUI transform is not guaranteed to reach an
+    /// AppKit view inside it, so the players turn their own layers instead —
+    /// see `CALayer.fill(_:turnedBy:)`.
+    @ViewBuilder
+    func turned(_ rotation: ClipRotation) -> some View {
+        if rotation == .upright {
+            self
+        } else {
+            TurnedLayout(swapsAxes: rotation.swapsAxes) {
+                modifier(QuarterTurnEffect(rotation: rotation))
+            }
+        }
+    }
+}
+
+/// Lays its one child out in the shape it has before the turn, at the top-left
+/// of the turned bounds; `QuarterTurnEffect` then carries it onto them.
+private struct TurnedLayout: Layout {
+    let swapsAxes: Bool
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews,
+                      cache: inout ()) -> CGSize {
+        guard let child = subviews.first else { return .zero }
+        let size = child.sizeThatFits(unturned(proposal))
+        return swapsAxes ? CGSize(width: size.height, height: size.width) : size
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize,
+                       subviews: Subviews, cache: inout ()) {
+        subviews.first?.place(at: bounds.origin, anchor: .topLeading,
+                              proposal: unturned(ProposedViewSize(bounds.size)))
+    }
+
+    private func unturned(_ proposal: ProposedViewSize) -> ProposedViewSize {
+        swapsAxes ? ProposedViewSize(width: proposal.height, height: proposal.width) : proposal
+    }
+}
+
+private struct QuarterTurnEffect: GeometryEffect {
+    let rotation: ClipRotation
+
+    func effectValue(size: CGSize) -> ProjectionTransform {
+        ProjectionTransform(rotation.placingTransform(for: size))
+    }
+}
+
+extension CALayer {
+    /// Cover `bounds` with this layer turned by `rotation`: sized to the
+    /// unturned picture, centred, and turned about its middle. Through bounds
+    /// and position rather than `frame`, which stops meaning anything once the
+    /// transform is not the identity. Upright, it is exactly `frame = bounds`.
+    ///
+    /// `flipped` is whether the hosting view's y points down. Clockwise on
+    /// screen is a negative angle in AppKit's default upward y, and the
+    /// matrices are written out so that it stays exact either way.
+    func fill(_ bounds: CGRect, turnedBy rotation: ClipRotation, flipped: Bool = false) {
+        let size = rotation.swapsAxes
+            ? CGSize(width: bounds.height, height: bounds.width) : bounds.size
+        setAffineTransform(.identity)
+        self.bounds = CGRect(origin: .zero, size: size)
+        position = CGPoint(x: bounds.midX, y: bounds.midY)
+        // Clockwise quarter turns as an upward y sees them, which is how the
+        // matrices below count; in a flipped view the same matrix turns the
+        // other way, so the count is mirrored.
+        let turns = flipped ? (4 - rotation.rawValue) % 4 : rotation.rawValue
+        let turn: CGAffineTransform
+        switch turns {
+        case 1: turn = CGAffineTransform(a: 0, b: -1, c: 1, d: 0, tx: 0, ty: 0)
+        case 2: turn = CGAffineTransform(a: -1, b: 0, c: 0, d: -1, tx: 0, ty: 0)
+        case 3: turn = CGAffineTransform(a: 0, b: 1, c: -1, d: 0, tx: 0, ty: 0)
+        default: turn = .identity
+        }
+        setAffineTransform(turn)
+    }
+}
+
 /// Where the whole source frame sits so that the kept region fills a tile.
 /// Separated from the view so the property that matters can be asserted: with
 /// no crop this has to reduce to exactly what the strip did before — fill and

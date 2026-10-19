@@ -65,6 +65,20 @@ struct ContentView: View {
                     .help(model.activeItem == nil
                           ? "先在時間軸上選一段影片" : "裁切選取的片段（C）")
                 }
+                // Beside the crop, in the same group: both decide what the
+                // picture is, and a sideways clip is fixed without opening
+                // anything. ⇧ turns it the other way, as it does on the key.
+                ToolbarItem(placement: .primaryAction) {
+                    Button { rotateKey() } label: {
+                        Label("旋轉", systemImage: "rotate.right")
+                            .labelStyle(.iconOnly)
+                    }
+                    .buttonBorderShape(.circle)
+                    .disabled(model.rotationTargets.isEmpty)
+                    .help(model.rotationTargets.isEmpty
+                          ? "先在時間軸上選一段影片"
+                          : "向右旋轉 90°（R）；按住 ⇧ 向左旋轉（⇧R）")
+                }
                 ToolbarSpacer(.fixed, placement: .primaryAction)
                 ToolbarItem(placement: .primaryAction) {
                     Button { startExport() } label: {
@@ -189,11 +203,12 @@ struct ContentView: View {
             scrubPreviewLayer
 
             if let hover = model.timelinePreview, let imageURL = hover.imageURL {
+                let hovered = model.items.first { $0.id == hover.itemID }
                 CanvasStage(canvas: model.canvas,
                             placement: model.placement(forItemID: hover.itemID),
-                            sourceSize: model.items.first { $0.id == hover.itemID }?
-                                .sourcePixelSize ?? .zero) {
-                    ImagePreview(url: imageURL)
+                            sourceSize: hovered?.orientedPixelSize ?? .zero) {
+                    ImagePreview(url: imageURL,
+                                 rotation: hovered?.geometry.rotation ?? .upright)
                 }
                 .allowsHitTesting(false)
             }
@@ -244,6 +259,7 @@ struct ContentView: View {
         if item.isImage {
             ImagePreview(
                 url: item.url,
+                rotation: item.geometry.rotation,
                 interpolation: usesNearestNeighbour ? .none : .high)
         } else if let player = model.player {
             let frameIndex = model.currentFrameIndex
@@ -255,6 +271,7 @@ struct ContentView: View {
                     url: item.url,
                     frameIndex: frameIndex,
                     sourceRevision: sourceRevision),
+                rotation: item.geometry.rotation,
                 interpolation: usesNearestNeighbour ? .none : .high)
         }
     }
@@ -270,8 +287,9 @@ struct ContentView: View {
         }
         CanvasStage(canvas: model.canvas,
                     placement: hovered.flatMap { model.placement(for: $0) },
-                    sourceSize: hovered?.sourcePixelSize ?? .zero) {
-            ScrubPlayerSurface(player: model.scrubPlayer, videoGravity: .resize)
+                    sourceSize: hovered?.orientedPixelSize ?? .zero) {
+            ScrubPlayerSurface(player: model.scrubPlayer, videoGravity: .resize,
+                               rotation: hovered?.geometry.rotation ?? .upright)
         }
         .opacity(model.timelinePreview?.showsScrubPlayer == true ? 1 : 0)
         .allowsHitTesting(false)
@@ -282,13 +300,25 @@ struct ContentView: View {
         if let item = model.activeItem {
             CanvasStage(canvas: model.canvas,
                         placement: model.placement(for: item),
-                        sourceSize: item.sourcePixelSize) {
+                        sourceSize: item.orientedPixelSize) {
                 if item.isImage {
-                    ImagePreview(url: item.url)
+                    ImagePreview(url: item.url, rotation: item.geometry.rotation)
                 } else if let player = model.player {
-                    PlayerSurface(player: player)
-                        .allowsHitTesting(false)
-                        .accessibilityHidden(true)
+                    // `AVPlayerView` cannot be turned from outside: its layers
+                    // are its own, and a SwiftUI transform is not guaranteed
+                    // to reach an AppKit view. A turned clip plays on a bare
+                    // layer that turns itself — the same kind the hover scrub
+                    // has always used — so an upright one keeps exactly the
+                    // surface it had.
+                    Group {
+                        if item.geometry.rotation == .upright {
+                            PlayerSurface(player: player)
+                        } else {
+                            RawPlayerSurface(player: player, rotation: item.geometry.rotation)
+                        }
+                    }
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
                 }
             }
         } else {
@@ -518,6 +548,11 @@ struct ContentView: View {
             }.keyboardShortcut(.delete, modifiers: [])
 
             Button("") { model.toggleGeometryEditing() }.keyboardShortcut("c", modifiers: [])
+            // Live in the workspace too, where they turn the clip being
+            // reframed. Both registrations land in one place that reads ⇧
+            // off the event, for the reason `arrow` gives.
+            Button("") { rotateKey() }.keyboardShortcut("r", modifiers: [])
+            Button("") { rotateKey() }.keyboardShortcut("r", modifiers: .shift)
             // Esc, Return and the ⌥-arrows are registered on the workspace's
             // own visible buttons instead of here — they only mean anything
             // while it is up, and a real button carries a key equivalent more
@@ -542,6 +577,17 @@ struct ContentView: View {
         } else if dy == 0 {
             model.stepFrame(dx * (coarse ? 10 : 1))
         }
+    }
+
+    /// R turns clockwise, ⇧R the other way — on the key and on the toolbar's
+    /// button alike.
+    ///
+    /// ⇧ comes off the event being handled, not the keyboard's state now: a
+    /// quick ⇧R can let go of ⇧ before the shortcut fires, and reading the
+    /// live state then would turn the clip the wrong way.
+    private func rotateKey() {
+        let modifiers = NSApp.currentEvent?.modifierFlags ?? NSEvent.modifierFlags
+        model.rotate(by: modifiers.contains(.shift) ? -1 : 1)
     }
 
     /// Timeline edits stand aside while the preview is an editing surface.
@@ -628,6 +674,7 @@ private struct PlayerSurface: NSViewRepresentable {
 /// it, and the black behind it belongs to the canvas.
 private struct ImagePreview: View {
     let url: URL
+    var rotation: ClipRotation = .upright
     /// `.none` past the zoom where interpolation turns a pixel edge into a
     /// gradient — the boundary being placed has to stay visibly where it is.
     var interpolation: Image.Interpolation = .medium
@@ -636,6 +683,7 @@ private struct ImagePreview: View {
         ZStack {
             if let img {
                 Image(nsImage: img).resizable().interpolation(interpolation)
+                    .turned(rotation)
             } else {
                 ProgressView().controlSize(.small)
             }
@@ -662,6 +710,7 @@ private struct CropVideoPreview: View {
     let thumbnailer: Thumbnailer?
     let time: Double
     let request: CropFrameRequest
+    let rotation: ClipRotation
     let interpolation: Image.Interpolation
 
     @State private var frame: CGImage?
@@ -669,13 +718,14 @@ private struct CropVideoPreview: View {
     var body: some View {
         ZStack {
             if let frame {
-                Image(decorative: frame, scale: 1)
+                Image(decorative: frame, scale: 1, orientation: rotation.imageOrientation)
                     .resizable()
                     .interpolation(interpolation)
             } else {
                 RawPlayerSurface(
                     player: player,
-                    usesNearestNeighbour: interpolation == .none)
+                    usesNearestNeighbour: interpolation == .none,
+                    rotation: rotation)
             }
         }
         .task(id: request) {
@@ -725,12 +775,15 @@ struct ExportPreviewDescriptor: Equatable {
     let url: URL
     let isImage: Bool
     let sourceTime: Double
+    /// The turned picture, which is what `placement` is in.
     let sourceSize: PixelSize
+    /// How far the decoded picture has to turn to be that picture.
+    let rotation: ClipRotation
     let placement: Placement?
 
     static func first(in items: [ClipItem], canvas: CanvasSpec) -> Self? {
         guard let item = items.first(where: \.isExportable) else { return nil }
-        let sourceSize = item.sourcePixelSize
+        let sourceSize = item.orientedPixelSize
         let placement = sourceSize.isUsable
             ? FFTools.resolve(item.geometry, source: sourceSize, canvas: canvas)
             : nil
@@ -739,7 +792,7 @@ struct ExportPreviewDescriptor: Equatable {
         let sourceTime = item.isImage ? 0 : item.grid.time(ofFrame: item.trimStartFrame)
         return Self(itemID: item.id, url: item.url, isImage: item.isImage,
                     sourceTime: sourceTime, sourceSize: sourceSize,
-                    placement: placement)
+                    rotation: item.geometry.rotation, placement: placement)
     }
 }
 
@@ -784,6 +837,7 @@ private struct ExportSetupSheet: View {
                 canvas: model.canvas,
                 placement: preview?.placement,
                 sourceSize: preview?.sourceSize ?? .zero,
+                rotation: preview?.rotation ?? .upright,
                 cgImage: videoThumb,
                 nsImage: imageThumb)
 
@@ -897,6 +951,7 @@ private struct ExportCompositionThumbnail: View {
     let canvas: CanvasSpec
     let placement: Placement?
     let sourceSize: PixelSize
+    let rotation: ClipRotation
     let cgImage: CGImage?
     var nsImage: NSImage? = nil
 
@@ -919,9 +974,10 @@ private struct ExportCompositionThumbnail: View {
     @ViewBuilder
     private var sourceImage: some View {
         if let cgImage {
-            Image(decorative: cgImage, scale: 1).resizable().interpolation(.high)
+            Image(decorative: cgImage, scale: 1, orientation: rotation.imageOrientation)
+                .resizable().interpolation(.high)
         } else if let nsImage {
-            Image(nsImage: nsImage).resizable().interpolation(.high)
+            Image(nsImage: nsImage).resizable().interpolation(.high).turned(rotation)
         }
     }
 }
@@ -981,6 +1037,7 @@ private struct ExportProgressSheet: View {
                 canvas: model.canvas,
                 placement: preview?.placement,
                 sourceSize: preview?.sourceSize ?? .zero,
+                rotation: preview?.rotation ?? .upright,
                 cgImage: videoThumb,
                 nsImage: imageThumb)
 

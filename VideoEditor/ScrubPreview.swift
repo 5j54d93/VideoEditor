@@ -183,20 +183,27 @@ struct ScrubPlayerSurface: NSViewRepresentable {
     /// exact aspect — inside the canvas stage, letting the layer letterbox again
     /// would inset the frame within its own placement.
     var videoGravity: AVLayerVideoGravity = .resizeAspect
+    /// The hovered clip's turn. The layer stays mounted across hovers, so this
+    /// changes in place as the pointer crosses from one clip to the next.
+    var rotation: ClipRotation = .upright
 
     func makeNSView(context: Context) -> ScrubPlayerNSView {
-        ScrubPlayerNSView(player: player, videoGravity: videoGravity)
+        let view = ScrubPlayerNSView(player: player, videoGravity: videoGravity)
+        view.setRotation(rotation)
+        return view
     }
 
     func updateNSView(_ view: ScrubPlayerNSView, context: Context) {
         view.setPlayer(player)
         view.setVideoGravity(videoGravity)
+        view.setRotation(rotation)
     }
 }
 
 final class ScrubPlayerNSView: NSView {
     private let playerLayer = AVPlayerLayer()
     private var readyObservation: NSKeyValueObservation?
+    private var rotation: ClipRotation = .upright
 
     init(player: AVPlayer, videoGravity: AVLayerVideoGravity = .resizeAspect) {
         super.init(frame: .zero)
@@ -222,6 +229,12 @@ final class ScrubPlayerNSView: NSView {
         playerLayer.videoGravity = gravity
     }
 
+    func setRotation(_ rotation: ClipRotation) {
+        guard self.rotation != rotation else { return }
+        self.rotation = rotation
+        needsLayout = true
+    }
+
     private func observeReadiness() {
         readyObservation = playerLayer.observe(\.isReadyForDisplay, options: [.initial, .new]) {
             [weak self] layer, change in
@@ -240,7 +253,7 @@ final class ScrubPlayerNSView: NSView {
         super.layout()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        playerLayer.frame = bounds
+        playerLayer.fill(bounds, turnedBy: rotation, flipped: isFlipped)
         CATransaction.commit()
     }
 }

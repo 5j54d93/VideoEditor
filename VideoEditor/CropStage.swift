@@ -1229,25 +1229,32 @@ final class MarchingAntsView: NSView {
 
 // MARK: - Picture layer
 
-/// An `AVPlayerLayer` the caller can size exactly and switch to nearest-neighbour
-/// magnification. `AVPlayerView` gives neither, and both matter once the picture
-/// is blown up far enough to place a boundary on it.
+/// An `AVPlayerLayer` the caller can size exactly, switch to nearest-neighbour
+/// magnification and turn. `AVPlayerView` gives none of the three, and the first
+/// two matter once the picture is blown up far enough to place a boundary on it.
 struct RawPlayerSurface: NSViewRepresentable {
     let player: AVPlayer
     var usesNearestNeighbour = false
+    /// The frame this view is given is the turned shape; the video inside is
+    /// turned to fill it.
+    var rotation: ClipRotation = .upright
 
     func makeNSView(context: Context) -> RawPlayerNSView {
-        RawPlayerNSView(player: player, nearest: usesNearestNeighbour)
+        let view = RawPlayerNSView(player: player, nearest: usesNearestNeighbour)
+        view.setRotation(rotation)
+        return view
     }
 
     func updateNSView(_ view: RawPlayerNSView, context: Context) {
         view.setPlayer(player)
         view.setNearestNeighbour(usesNearestNeighbour)
+        view.setRotation(rotation)
     }
 }
 
 final class RawPlayerNSView: NSView {
     private let playerLayer = AVPlayerLayer()
+    private var rotation: ClipRotation = .upright
 
     init(player: AVPlayer, nearest: Bool) {
         super.init(frame: .zero)
@@ -1264,13 +1271,19 @@ final class RawPlayerNSView: NSView {
         super.layout()
         CATransaction.begin()
         CATransaction.setDisableActions(true)   // the frame is driven by a drag
-        playerLayer.frame = bounds
+        playerLayer.fill(bounds, turnedBy: rotation, flipped: isFlipped)
         CATransaction.commit()
     }
 
     func setPlayer(_ player: AVPlayer) {
         guard playerLayer.player !== player else { return }
         playerLayer.player = player
+    }
+
+    func setRotation(_ rotation: ClipRotation) {
+        guard self.rotation != rotation else { return }
+        self.rotation = rotation
+        needsLayout = true
     }
 
     func setNearestNeighbour(_ nearest: Bool) {

@@ -246,12 +246,14 @@ final class EditorModel {
     /// reaches the output decides it and the rest are fitted into it.
     private var derivedCanvasSize: PixelSize {
         guard let first = items.first(where: \.isExportable),
-              first.sourcePixelSize.isUsable else {
-            let w = items.map(\.naturalWidth).filter { $0 > 0 }.max() ?? 1280
-            let h = items.map(\.naturalHeight).filter { $0 > 0 }.max() ?? 720
+              first.orientedPixelSize.isUsable else {
+            let w = items.map(\.orientedPixelSize.width).filter { $0 > 0 }.max() ?? 1280
+            let h = items.map(\.orientedPixelSize.height).filter { $0 > 0 }.max() ?? 720
             return PixelSize(width: w, height: h)
         }
-        return first.geometry.window(source: first.sourcePixelSize).size
+        // Turned, the first clip turns the file with it: a sideways phone
+        // clip stood upright comes out portrait.
+        return first.geometry.window(source: first.orientedPixelSize).size
     }
 
     private(set) var totalOutputDuration: Double = 0
@@ -938,7 +940,7 @@ final class EditorModel {
         item.naturalWidth = info.width
         item.naturalHeight = info.height
         if case .window(let rect) = item.geometry.framing {
-            item.geometry.framing = .window(rect.clampedWindow(in: item.sourcePixelSize))
+            item.geometry.framing = .window(rect.clampedWindow(in: item.orientedPixelSize))
         }
         item.sourceDuration = info.duration
         item.fps = info.fps
@@ -2182,7 +2184,7 @@ final class EditorModel {
         guard isGeometryEditing, geometryGestureSession?.itemID == id,
               let item = items.first(where: { $0.id == id }) else { return }
         let draft = GeometryDraft(itemID: id,
-                                  window: rect.clampedWindow(in: item.sourcePixelSize))
+                                  window: rect.clampedWindow(in: item.orientedPixelSize))
         if geometryDraft != draft { geometryDraft = draft }
     }
 
@@ -2217,8 +2219,8 @@ final class EditorModel {
     /// Where `item` lands on the canvas. The same resolver export uses, so the
     /// preview cannot drift from the file.
     func placement(for item: ClipItem) -> Placement? {
-        guard item.sourcePixelSize.isUsable else { return nil }
-        return FFTools.resolve(item.geometry, source: item.sourcePixelSize, canvas: canvas)
+        guard item.orientedPixelSize.isUsable else { return nil }
+        return FFTools.resolve(item.geometry, source: item.orientedPixelSize, canvas: canvas)
     }
 
     func placement(forItemID id: ClipItem.ID) -> Placement? {
@@ -2228,7 +2230,7 @@ final class EditorModel {
     /// The rectangle the user is working with, materialising the whole frame the
     /// moment they take hold of it.
     func window(for item: ClipItem) -> PixelRect {
-        item.geometry.window(source: item.sourcePixelSize)
+        item.geometry.window(source: item.orientedPixelSize)
     }
 
     /// The crop as the workspace shows it: mid-drag, the rectangle the drag is
@@ -2245,7 +2247,7 @@ final class EditorModel {
     var displayedCanvas: CanvasSpec {
         var spec = canvas
         if let draft = geometryDraft, let first = itemDefiningOutputSize,
-           first.id == draft.itemID, first.sourcePixelSize.isUsable {
+           first.id == draft.itemID, first.orientedPixelSize.isUsable {
             spec.width = usableCanvasExtent(draft.window.width)
             spec.height = usableCanvasExtent(draft.window.height)
         }
@@ -2255,19 +2257,21 @@ final class EditorModel {
     /// `placement(for:)` with the drag in flight already landed — stored the
     /// way `setFraming` will store it, so the note it feeds describes the drop.
     func displayedPlacement(for item: ClipItem) -> Placement? {
-        guard item.sourcePixelSize.isUsable else { return nil }
+        let source = item.orientedPixelSize
+        guard source.isUsable else { return nil }
         var geometry = item.geometry
         if let draft = geometryDraft, draft.itemID == item.id {
-            geometry.framing = .placed(draft.window, in: item.sourcePixelSize)
+            geometry.framing = .placed(draft.window, in: source)
         }
-        return FFTools.resolve(geometry, source: item.sourcePixelSize, canvas: displayedCanvas)
+        return FFTools.resolve(geometry, source: source, canvas: displayedCanvas)
     }
 
     /// The part of the source frame that survives into the output, or `nil` when
     /// that is all of it. The filmstrip draws from this: the strip is the
     /// output's index, so pixels the window excludes should not survive there.
+    /// In pixels of the turned picture, which is what the strip draws.
     func visibleSourceRegion(for item: ClipItem) -> PixelRect? {
-        let source = item.sourcePixelSize
+        let source = item.orientedPixelSize
         guard source.isUsable else { return nil }
         let window = self.window(for: item)
         let left = max(0, window.x)
@@ -2310,18 +2314,26 @@ final class EditorModel {
         case .ratio(let w, let h):
             return Double(w) / Double(max(1, h))
         case .source:
-            let size = item.sourcePixelSize
+            // The source as it stands on the stage: a portrait clip turned
+            // onto its side locks to landscape.
+            let size = item.orientedPixelSize
             guard size.isUsable else { return nil }
             return Double(size.width) / Double(size.height)
         }
     }
 
+    /// 回到整張畫面: the crop goes, the turn stays. Standing a sideways clip
+    /// upright was its own decision, and it is not what this button is named
+    /// for.
     func resetGeometry(for id: ClipItem.ID) {
-        updateGeometry(for: id) { geometry, _ in geometry = ClipGeometry() }
+        updateGeometry(for: id) { geometry, _ in
+            geometry = ClipGeometry(rotation: geometry.rotation)
+        }
     }
 
-    /// Copy one clip's framing onto every other clip. An explicit window is in
-    /// source pixels, so it is re-clamped against each target's own frame rather
+    /// Copy one clip's framing onto every other clip, its turn included — the
+    /// window is in pixels of the turned picture and means nothing on an
+    /// unturned one. It is re-clamped against each target's own frame rather
     /// than assumed to fit.
     func applyGeometryToAllItems(from id: ClipItem.ID) {
         guard let source = items.first(where: { $0.id == id })?.geometry else { return }
@@ -2333,9 +2345,47 @@ final class EditorModel {
             if case .window(let rect) = source.framing {
                 // A window that covers a smaller clip entirely leaves that
                 // clip untouched, not cropped to its own edges.
-                geometry.framing = .placed(rect, in: items[index].sourcePixelSize)
+                geometry.framing = .placed(
+                    rect, in: source.rotation.turning(items[index].sourcePixelSize))
             }
             items[index].geometry = geometry
+        }
+    }
+
+    // MARK: Rotation
+
+    /// What R, ⇧R and the toolbar's button turn: the clip being reframed while
+    /// the workspace is up; otherwise the timeline's selection, so a sideways
+    /// batch turns in one go; and with nothing selected, the clip under the
+    /// playhead — the one the preview is showing.
+    var rotationTargets: Set<ClipItem.ID> {
+        guard let active = activeItemID else { return selectedIDs }
+        if isGeometryEditing { return [active] }
+        return selectedIDs.isEmpty ? [active] : selectedIDs
+    }
+
+    /// Turn the clips R would, `quarterTurns` clockwise; negative goes the
+    /// other way.
+    func rotate(by quarterTurns: Int) {
+        rotateItems(rotationTargets, by: quarterTurns)
+    }
+
+    /// Turn clips a quarter at a time — positive is clockwise — as one undo
+    /// step however many there are. Each crop goes round with its picture;
+    /// see `ClipGeometry.turned`.
+    func rotateItems(_ ids: Set<ClipItem.ID>, by quarterTurns: Int) {
+        let targets = items.indices.filter { ids.contains(items[$0].id) }
+        guard !targets.isEmpty, quarterTurns % 4 != 0 else { return }
+        pauseTimelinePlayback()
+        // A drag in flight belongs to the picture as it was. What the hand has
+        // placed lands as its own step; the rest of the drag is let go, its
+        // coordinates being in a frame that has just turned under it.
+        commitGeometryDraft()
+        geometryGestureSession = nil
+        registerUndo()
+        for index in targets {
+            items[index].geometry = items[index].geometry
+                .turned(by: quarterTurns, source: items[index].sourcePixelSize)
         }
     }
 
@@ -2344,7 +2394,7 @@ final class EditorModel {
     private func updateGeometry(for id: ClipItem.ID,
                                 _ change: (inout ClipGeometry, PixelSize) -> Void) {
         guard let index = items.firstIndex(where: { $0.id == id }) else { return }
-        let source = items[index].sourcePixelSize
+        let source = items[index].orientedPixelSize
         var updated = items[index].geometry
         change(&updated, source)
         guard updated != items[index].geometry else { return }

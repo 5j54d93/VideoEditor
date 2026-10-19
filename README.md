@@ -4,7 +4,7 @@
 ![GitHub repo size](https://img.shields.io/github/repo-size/5j54d93/VideoEditor)
 ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)
 
-A native macOS video editor built with SwiftUI that cuts on **real** frames and writes repeatable MP4s：with the same app build, sources, cut points and CPU architecture, another export produces the same SHA-256, so re-exporting on the same Mac class does not create another upload in Google Photos or iCloud. Trim, split, reorder, mix in stills, lay music and sound over the cut, then export through the app's own bundled FFmpeg — no Homebrew, no MacPorts, nothing to install.
+A native macOS video editor built with SwiftUI that cuts on **real** frames and writes repeatable MP4s：with the same app build, sources, cut points and CPU architecture, another export produces the same SHA-256, so re-exporting on the same Mac class does not create another upload in Google Photos or iCloud. Trim, split, reorder, crop and turn, mix in stills, lay music and sound over the cut, then export through the app's own bundled FFmpeg — no Homebrew, no MacPorts, nothing to install.
 
 ## Overview
 
@@ -56,6 +56,7 @@ The timeline **is** the output：every visible clip is part of the exported movi
 - **Grab the rectangle anywhere**：every edge is live along its whole length, not just at a marker — the pointer picks up a resize cursor wherever you meet it — and the corners carry a 24 pt target on top of that. Nothing is drawn on the picture to say so: a bar of white laid along the edge you are aiming at covers the very thing you are aiming with. The ratio is unconstrained by default, so all four sides simply go where they are pulled; lock it to the source's own shape or a preset from the right-hand panel when you want it held. The rectangle stops at the frame — a crop selects from the picture that exists, and cannot be dragged out into black. Edges snap to the source's own boundaries and centre lines（<kbd>⌘</kbd> suspends it）, <kbd>⌥</kbd> resizes about the centre, <kbd>⇧</kbd> inverts the ratio lock for one drag, and the mask lightens while you drag so the part being thrown away stays judgeable. **A drag always keeps the edge under the pointer**, which is also why the sizes it can reach are spaced by whatever one point covers：at the common half-size fit that is two source pixels, so dragging moves the width in twos and cannot land on an odd one. That is arithmetic, not a setting — a point cannot pick between two pixels. Precision comes from the zoom, where it costs nothing：**實際像素** makes a point a pixel, so the edge still tracks the pointer and every integer is reachable at the same time. The numbers rail takes an exact value at any zoom. <kbd>⌥</kbd> mirrors the drag onto the opposite edge, so a centred resize moves the width in twos even at 100%；an odd size comes from dragging one edge, or from typing it. <kbd>↩</kbd> commits; <kbd>esc</kbd> cancels the whole session and puts the framing back the way it was on the way in.
 - **Everything else is in one panel**：ratio, exact pixel values, the resulting file size, and "套用到全部" sit down the right-hand side, so the stage itself carries nothing but the picture and the rectangle.
 - **The crop is the output**：there is no canvas to set up, no fit／fill／letterbox to choose between. The file comes out exactly the size of the rectangle — crop 615 pixels wide and the file is 615 pixels wide, odd number and all（delivered in 4:4:4, see below）. With several clips the first one sets the size and the rest are fitted into it; "套用到全部" makes them match in one click.
+- **Turn a clip a quarter at a time**：<kbd>R</kbd> turns 90° clockwise and <kbd>⇧</kbd><kbd>R</kbd> counterclockwise — every selected clip at once, or the one under the playhead when nothing is selected — and so do the toolbar button beside the crop, a clip's context menu and the top of the reframing panel. Quarter turns only, because those move pixels without resampling a single one. The turn comes before the crop: the rectangle is drawn on the turned picture, and a clip that is already cropped keeps exactly the same pixels when it turns, its ratio lock turning with it（16:9 becomes 9:16）. Turning the first clip turns the file — a sideways phone clip stood upright comes out portrait. The preview, the hover scrub, the filmstrips and the export sheet all draw the turned picture; frames are decoded once and turned as they are drawn, so turning never re-decodes anything. 回到整張畫面 removes the crop and leaves the turn.
 
 ## Deterministic Export
 
@@ -64,6 +65,8 @@ The timeline **is** the output：every visible clip is part of the exported movi
 Everything is normalized onto one output frame — the region the first clip keeps — at the exact rational frame rate of the fastest video, scaled, letterboxed, concatenated, and encoded with one fixed internal profile：libx264（medium, CRF 18, `yuv420p`）plus native AAC（two-loop coder, stereo 44.1 kHz, 192 kbps）. There is no hidden quality／threading setting that can silently change the file format.
 
 Sound is the clips' own audio concatenated as a bed — each clip's level and fades applied in place — with every piece of the audio track cut to what the movie has room for, shaped（`volume`, `afade`）, delayed to its place in whole samples and summed over the bed by `amix` with normalization off, so the bed stays as loud as it was however many pieces land on it. Pieces are mixed in an order fixed by where they sit, never by how they were arranged, because floats add in order and the order is part of the bytes. Gain and fades are written only when set, which keeps an untouched project's arguments — and its bytes — exactly what they were before the track existed.
+
+A turned clip starts its chain with ffmpeg's `transpose`（`clock`／`cclock`）or, for a half turn, `hflip,vflip` — the filters FFmpeg itself inserts to honour a display matrix, and pure pixel moves: nothing is interpolated, so a turned clip is as repeatable as an untouched one. The crop that follows is read in the turned picture's pixels, exactly the numbers the workspace showed. An upright clip gets no filter at all, which is why turning shipped without moving a byte of anything exported before it: the same unturned project, cropped to an odd 4:4:4 frame and uncropped, exports to the same SHA-256 from the builds on either side of the change.
 
 The one thing that varies is chroma, and only because it has to：a 4:2:0 plane is half-resolution on both axes and cannot describe an odd-sized picture at all — x264 refuses the encode rather than rounding it. An odd output frame is therefore written in `yuv444p`（High 4:4:4 Predictive）, which costs bitrate and hardware decoding but delivers the size that was asked for. Every even one keeps `yuv420p` and is byte-for-byte what it always was: enabling 4:4:4 in the bundled x264 was verified not to change a single byte of 4:2:0 output.
 
@@ -95,12 +98,14 @@ The guarantee is intentionally scoped to the **same bundled toolchain and CPU ar
 | <kbd>⌘</kbd><kbd>I</kbd> | Import media |
 | <kbd>⌘</kbd><kbd>E</kbd> | Export |
 | <kbd>C</kbd> | Enter／leave cropping |
+| <kbd>R</kbd> <kbd>⇧</kbd><kbd>R</kbd> | Turn the selected clips — or the active one — 90° clockwise／counterclockwise |
 
 Inside the reframing workspace:
 
 | Key | Action |
 | --- | --- |
 | <kbd>←</kbd> <kbd>→</kbd> <kbd>↑</kbd> <kbd>↓</kbd> | Nudge the crop 1 px（<kbd>⇧</kbd> for 10） |
+| <kbd>R</kbd> <kbd>⇧</kbd><kbd>R</kbd> | Turn this clip 90° clockwise／counterclockwise, crop and all |
 | <kbd>⌥</kbd><kbd>←</kbd> <kbd>⌥</kbd><kbd>→</kbd> | Previous／next frame of this clip |
 | <kbd>[</kbd> <kbd>]</kbd> | Previous／next clip, without leaving |
 | <kbd>↩</kbd> | Done |

@@ -242,16 +242,17 @@ nonisolated struct PixelOffset: Equatable, Sendable {
 /// arises: the output frame *is* the first clip's rectangle, so cropping is the
 /// only thing left to decide.
 nonisolated enum ClipFraming: Equatable, Sendable {
-    /// Everything. The default, and what `isIdentity` reports.
+    /// Everything. The default, and what `isCropped` reports as uncropped.
     case wholeFrame
-    /// A rectangle the user placed, in source pixels, always inside the source
-    /// frame — see `PixelRect.clampedWindow`. Everything it contains is picture.
+    /// A rectangle the user placed, in pixels of the (turned) source, always
+    /// inside that frame — see `PixelRect.clampedWindow`. Everything it
+    /// contains is picture.
     case window(PixelRect)
 
     /// A window someone placed, confined to the frame — and stored as
     /// `.wholeFrame` when, confined, it turns out to be all of it.
     ///
-    /// `isIdentity` is read off the framing, so a full-frame rectangle stored
+    /// `isCropped` is read off the framing, so a full-frame rectangle stored
     /// *as* a rectangle counts as an edit: the clip rail marks the clip
     /// reframed, 回到整張畫面 offers to undo nothing, and export takes the window
     /// path, whose rounding is not the whole-frame path's — the one an untouched
@@ -274,19 +275,88 @@ nonisolated enum AspectLock: Hashable, Sendable {
     case free
 }
 
-/// Which part of one clip's picture is kept. The default value is the editor's
-/// only historical behaviour — the whole frame — and `isIdentity` is how export
-/// proves nothing has moved.
+/// A clip's picture turned a quarter at a time, clockwise.
+///
+/// Quarter turns only, because they are the turns that move pixels without
+/// resampling them: a turned frame holds exactly the pixels it held before,
+/// just in other places. That keeps the editor's one rule intact — every
+/// geometry value is an exact pixel count — and it is the whole of what a
+/// sideways phone clip needs.
+///
+/// The turn comes first, before the crop. The window is drawn on the turned
+/// picture and measured in its pixels, so "the source" in every geometry
+/// function below means the source *as turned* — see
+/// `ClipItem.orientedPixelSize`. Only the code that touches a decoded frame
+/// (ffmpeg's chain, the players, the bitmaps) ever sees it unturned.
+nonisolated enum ClipRotation: Int, CaseIterable, Sendable {
+    case upright = 0
+    /// A quarter turn clockwise: the picture's left edge ends up on top.
+    case clockwise = 1
+    case upsideDown = 2
+    /// A quarter turn counterclockwise: the left edge ends up at the bottom.
+    case counterclockwise = 3
+
+    /// Clockwise in degrees, for saying how far a clip has been turned.
+    var degrees: Int { rawValue * 90 }
+
+    /// A quarter turn either way stands the picture on its side.
+    var swapsAxes: Bool { rawValue % 2 == 1 }
+
+    /// `quarterTurns` further clockwise; negative goes the other way.
+    func turned(by quarterTurns: Int) -> ClipRotation {
+        ClipRotation(rawValue: ((rawValue + quarterTurns) % 4 + 4) % 4) ?? .upright
+    }
+
+    /// A picture of `size` once turned.
+    func turning(_ size: PixelSize) -> PixelSize {
+        swapsAxes ? PixelSize(width: size.height, height: size.width) : size
+    }
+
+    /// Where `rect`, in a picture of `size`, lands once the picture is turned.
+    ///
+    /// Exact: the same pixels, in their new places. A rectangle inside the
+    /// picture stays inside it, which is why a crop can simply go round with
+    /// the picture rather than being re-derived and re-clamped.
+    func turning(_ rect: PixelRect, in size: PixelSize) -> PixelRect {
+        switch self {
+        case .upright:
+            return rect
+        case .clockwise:
+            return PixelRect(x: size.height - rect.y - rect.height, y: rect.x,
+                             width: rect.height, height: rect.width)
+        case .upsideDown:
+            return PixelRect(x: size.width - rect.x - rect.width,
+                             y: size.height - rect.y - rect.height,
+                             width: rect.width, height: rect.height)
+        case .counterclockwise:
+            return PixelRect(x: rect.y, y: size.width - rect.x - rect.width,
+                             width: rect.height, height: rect.width)
+        }
+    }
+}
+
+/// Which part of one clip's picture is kept, and which way up. The default
+/// value is the editor's only historical behaviour — the whole frame, as the
+/// file plays it — and `isIdentity` is how export proves nothing has moved.
 nonisolated struct ClipGeometry: Equatable, Sendable {
+    /// Applied before everything else: `framing` is in pixels of the turned
+    /// picture.
+    var rotation: ClipRotation = .upright
     var framing: ClipFraming = .wholeFrame
     /// Not part of the output: it only constrains dragging. Stored per clip so
     /// switching between clips does not silently change what a drag will do.
     var aspectLock: AspectLock = .free
 
-    var isIdentity: Bool { framing == .wholeFrame }
+    /// Neither turned nor cropped.
+    var isIdentity: Bool { rotation == .upright && !isCropped }
+
+    /// Something of the picture is cut away. The turn is not a crop: putting
+    /// the whole frame back leaves it turned.
+    var isCropped: Bool { framing != .wholeFrame }
 
     /// The rectangle the user is working with, materialising the whole frame
-    /// when they first take hold of it.
+    /// when they first take hold of it. `source` is the picture the window is
+    /// drawn on — already turned.
     ///
     /// Deliberately needs nothing but the source. The output size is derived
     /// from this rectangle, so anything that consulted the canvas here would be
@@ -299,6 +369,30 @@ nonisolated struct ClipGeometry: Equatable, Sendable {
             return PixelRect(x: 0, y: 0,
                              width: max(1, source.width), height: max(1, source.height))
         }
+    }
+
+    /// This framing with the picture turned `quarterTurns` further clockwise.
+    /// `source` is the picture *before* any turn, as the file plays it.
+    ///
+    /// Everything goes round together. The crop keeps the same pixels, so a
+    /// clip can be cropped first and stood upright afterwards without losing
+    /// the work; and a ratio lock describes that rectangle's shape, so it
+    /// turns with it — 16:9 becomes 9:16 — rather than snapping the turned
+    /// rectangle back to the old shape on the next drag.
+    func turned(by quarterTurns: Int, source: PixelSize) -> ClipGeometry {
+        let turn = ClipRotation.upright.turned(by: quarterTurns)
+        guard turn != .upright else { return self }
+        var result = self
+        result.rotation = rotation.turned(by: quarterTurns)
+        // Without a probed size there is no picture to turn the window in;
+        // a window cannot have been placed against one either.
+        if case .window(let rect) = framing, source.isUsable {
+            result.framing = .window(turn.turning(rect, in: rotation.turning(source)))
+        }
+        if turn.swapsAxes, case .ratio(let width, let height) = aspectLock {
+            result.aspectLock = .ratio(width: height, height: width)
+        }
+        return result
     }
 }
 
@@ -344,7 +438,12 @@ struct ClipItem: Identifiable, Equatable {
     var videoPadDuration: Double = 0
 
     var isImage: Bool { kind == .image }
+    /// The frame as the file plays it — display matrix applied, nothing of
+    /// this clip's own geometry. What the players and decoders hand back.
     var sourcePixelSize: PixelSize { PixelSize(width: naturalWidth, height: naturalHeight) }
+    /// The picture the crop is drawn on: the source, turned. Every window,
+    /// clamp and ratio is in these pixels.
+    var orientedPixelSize: PixelSize { geometry.rotation.turning(sourcePixelSize) }
     /// What the recording is multiplied by on the way out — nothing when there
     /// is no track, or it has been muted or detached onto the audio track.
     var effectiveAudioGain: Double { hasAudio && !isAudioMuted ? audioGain : 0 }

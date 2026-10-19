@@ -68,8 +68,9 @@ struct AssemblyItem: Sendable {
     /// play. Included in `duration`; it raises the audio ceiling by the same
     /// amount, which is the whole point of the pad.
     var padDuration: Double = 0
-    /// Decoded frame size. `.zero` means probing never reported one, and the
-    /// geometry chain falls back to letting ffmpeg fit at runtime.
+    /// Decoded frame size, before the clip's own turn — `geometry.rotation`
+    /// is applied to it in the chain. `.zero` means probing never reported
+    /// one, and the geometry chain falls back to letting ffmpeg fit at runtime.
     var sourceSize: PixelSize = .zero
     var geometry = ClipGeometry()
     /// The clip's own sound on the way out. Zero is silence — the same exact
@@ -452,7 +453,8 @@ struct FFTools: Sendable {
 
     /// Source size + the user's framing + the canvas → the integers ffmpeg is
     /// told. Pure, and shared with the preview, so the two can never disagree
-    /// about where a clip sits.
+    /// about where a clip sits. `source` is the picture as turned — the one the
+    /// window is drawn on — and everything returned is in its pixels.
     ///
     /// The rounding here is copied from ffmpeg rather than chosen. `scale`'s
     /// `force_original_aspect_ratio` rescales with round-half-away-from-zero and
@@ -577,6 +579,21 @@ struct FFTools: Sendable {
         Int(x.rounded(.toNearestOrAwayFromZero))
     }
 
+    /// A clip's turn as ffmpeg spells it, or `nil` upright.
+    ///
+    /// All three move pixels without resampling them: `transpose` and the two
+    /// flips are the filters ffmpeg itself inserts to honour a display matrix,
+    /// and none of them blends a neighbour in. `rotate` would, which is why it
+    /// is not used even for the half turn.
+    nonisolated static func rotationFilter(_ rotation: ClipRotation) -> String? {
+        switch rotation {
+        case .upright: nil
+        case .clockwise: "transpose=clock"
+        case .upsideDown: "hflip,vflip"
+        case .counterclockwise: "transpose=cclock"
+        }
+    }
+
     /// The picture half of one item's filter chain, from decoded frame to a
     /// canvas-sized `yuv420p` image.
     nonisolated static func geometryChain(for item: AssemblyItem,
@@ -584,17 +601,23 @@ struct FFTools: Sendable {
         let W = canvas.width, H = canvas.height
         let scalerFlags = "flags=bicubic+accurate_rnd+bitexact:sws_dither=none"
         let delivery = canvas.deliveryPixelFormat
+        // The turn goes first, on the decoded frame: every number after it —
+        // the crop above all — is in pixels of the turned picture. An upright
+        // clip adds nothing, so its chain is the one it always had.
+        let turn = rotationFilter(item.geometry.rotation)
+        let source = item.geometry.rotation.turning(item.sourceSize)
 
         // Without a probed frame size there is nothing to compute a fit from.
         // Hand the job back to ffmpeg's runtime expression — byte for byte what
         // every export did before geometry existed.
-        guard item.sourceSize.isUsable else {
-            return "scale=\(W):\(H):force_original_aspect_ratio=decrease:\(scalerFlags)," +
+        guard source.isUsable else {
+            return (turn.map { $0 + "," } ?? "") +
+                   "scale=\(W):\(H):force_original_aspect_ratio=decrease:\(scalerFlags)," +
                    "format=yuv444p,pad=\(W):\(H):(ow-iw)/2:(oh-ih)/2," +
                    "setsar=1,fps=\(canvas.fps),format=\(delivery)"
         }
 
-        let placement = resolve(item.geometry, source: item.sourceSize, canvas: canvas)
+        let placement = resolve(item.geometry, source: source, canvas: canvas)
 
         // Nothing of the picture reaches the canvas. Its scaled size may well be
         // larger than the canvas, so `pad` would reject it outright — go
@@ -606,6 +629,7 @@ struct FFTools: Sendable {
         }
 
         var parts: [String] = []
+        if let turn { parts.append(turn) }
         if let crop = placement.sourceCrop {
             // The editor's integer crop is exact even when a source happens to
             // decode as yuv411p/yuv410p, whose chroma grid is wider than 2px.

@@ -901,7 +901,13 @@ private struct TimelineClipView: View {
         .accessibilityLabel(item.url.lastPathComponent)
         .accessibilityValue("\(String(format: "%.2f", item.displayDuration)) 秒")
         .contextMenu {
+            // Finder's rule: right-clicking inside the selection acts on all
+            // of it, anywhere else on just the clip under the pointer.
+            let targets = selected ? model.selectedIDs : [item.id]
+            Button("向右旋轉 90°") { model.rotateItems(targets, by: 1) }
+            Button("向左旋轉 90°") { model.rotateItems(targets, by: -1) }
             if item.trailingOverhangDuration > 1e-9 {
+                Divider()
                 Button("忽略尾端差異") {
                     model.dismissTrailingOverhang(for: item.id)
                 }
@@ -919,12 +925,14 @@ private struct TimelineClipView: View {
     private func mediaStrip(height laneHeight: CGFloat) -> some View {
         if item.isImage {
             TimelineImageStrip(url: item.url,
-                               source: item.sourcePixelSize,
+                               source: item.orientedPixelSize,
+                               rotation: item.geometry.rotation,
                                crop: model.visibleSourceRegion(for: item))
         } else {
             TimelineVideoStrip(
                 itemID: item.id,
-                source: item.sourcePixelSize,
+                source: item.orientedPixelSize,
+                rotation: item.geometry.rotation,
                 crop: model.visibleSourceRegion(for: item),
                 sourceRevision: model.videoSourceRevision(for: item.url),
                 thumbnailer: model.thumbnailer(for: item.url),
@@ -1336,7 +1344,9 @@ private struct TailChip: View {
 
 private struct TimelineImageStrip: View {
     let url: URL
+    /// The turned picture, which `crop` is in.
     let source: PixelSize
+    let rotation: ClipRotation
     let crop: PixelRect?
     @State private var image: NSImage?
 
@@ -1347,6 +1357,7 @@ private struct TimelineImageStrip: View {
                 if let image {
                     Image(nsImage: image)
                         .resizable()
+                        .turned(rotation)
                         .showingSourceRegion(crop, of: source, filling: geo.size)
                 } else {
                     ProgressView().controlSize(.small)
@@ -1404,7 +1415,10 @@ private struct TimelineRuler: View {
 /// horizontal room it switches to exact, individually aligned frame cells.
 private struct TimelineVideoStrip: View {
     let itemID: ClipItem.ID
+    /// The turned picture, which `crop` is in. The frames decode unturned and
+    /// are turned as they are drawn, so turning a clip never re-decodes it.
     let source: PixelSize
+    let rotation: ClipRotation
     let crop: PixelRect?
     let sourceRevision: Int
     let thumbnailer: Thumbnailer?
@@ -1426,6 +1440,7 @@ private struct TimelineVideoStrip: View {
             ExactFrameTimelineStrip(
                 itemID: itemID,
                 source: source,
+                rotation: rotation,
                 crop: crop,
                 sourceRevision: sourceRevision,
                 thumbnailer: thumbnailer,
@@ -1440,7 +1455,7 @@ private struct TimelineVideoStrip: View {
                 preferredFrame: preferredFrame
             )
         } else {
-            FilmstripStrip(source: source, crop: crop,
+            FilmstripStrip(source: source, rotation: rotation, crop: crop,
                            sourceRevision: sourceRevision,
                            thumbnailer: thumbnailer, grid: grid,
                            start: start, end: end,
@@ -1452,6 +1467,7 @@ private struct TimelineVideoStrip: View {
 private struct ExactFrameTimelineStrip: View {
     let itemID: ClipItem.ID
     let source: PixelSize
+    let rotation: ClipRotation
     let crop: PixelRect?
     let sourceRevision: Int
     let thumbnailer: Thumbnailer?
@@ -1537,7 +1553,7 @@ private struct ExactFrameTimelineStrip: View {
                 // overflow: a bare scaledToFill grows the enclosing stack to the
                 // overflow size, shifting the clipping window and pushing the
                 // badge out of view.
-                Image(decorative: image, scale: 1)
+                Image(decorative: image, scale: 1, orientation: rotation.imageOrientation)
                     .resizable()
                     .showingSourceRegion(crop, of: source,
                                          filling: CGSize(width: cellWidth(frameIndex) + 0.5,
@@ -1599,7 +1615,10 @@ private struct ExactFrameTimelineStrip: View {
 /// Thumbnails tiling a kept source range [start, end]. The requested times and
 /// rendered tile widths both scale with the clip, so the strip always fills it.
 struct FilmstripStrip: View {
+    /// The turned picture, which `crop` is in; the tiles decode unturned and
+    /// are turned as they are drawn.
     let source: PixelSize
+    let rotation: ClipRotation
     let crop: PixelRect?
     let sourceRevision: Int
     let thumbnailer: Thumbnailer?
@@ -1623,7 +1642,8 @@ struct FilmstripStrip: View {
                 ZStack {
                     Color.secondary.opacity(0.12)
                     if tiles.indices.contains(index), let image = tiles[index] {
-                        Image(decorative: image, scale: 1)
+                        Image(decorative: image, scale: 1,
+                              orientation: rotation.imageOrientation)
                             .resizable()
                             .showingSourceRegion(crop, of: source,
                                                  filling: CGSize(width: tileWidth,

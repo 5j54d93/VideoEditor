@@ -98,8 +98,9 @@ struct CropWorkspace<Picture: View>: View {
 
     private var clipPosition: String? {
         guard let index = model.items.firstIndex(where: { $0.id == item.id }) else { return nil }
-        return "片段 \(index + 1)／\(model.items.count) · "
-            + "\(item.sourcePixelSize.width)×\(item.sourcePixelSize.height)"
+        // The picture on the stage, which is the turned one.
+        let picture = item.orientedPixelSize
+        return "片段 \(index + 1)／\(model.items.count) · \(picture.width)×\(picture.height)"
     }
 
     // MARK: Stage
@@ -206,7 +207,9 @@ private struct WorkspaceStage<Picture: View>: View {
         // output size the two are the same rectangle, and a stored canvas
         // trailing the drag would read as a letterbox opening up mid-gesture.
         let canvas = model.displayedCanvas
-        CropStage(source: item.sourcePixelSize,
+        // The turned picture: the window is drawn on it, and the picture
+        // layer turns the decoded frame to match.
+        CropStage(source: item.orientedPixelSize,
                   window: model.displayedWindow(for: item),
                   canvasAspect: Double(canvas.width) / Double(max(1, canvas.height)),
                   lockedAspect: model.lockedAspect(for: item),
@@ -243,6 +246,8 @@ private struct CropNumbersRail: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
+                CropRotationSection(model: model, item: item)
+                Divider().opacity(0.4)
                 CropRatioSection(model: model, item: item)
                 Divider().opacity(0.4)
                 windowSection
@@ -257,7 +262,7 @@ private struct CropNumbersRail: View {
 
     /// The numbers follow a drag as it happens, so these read the draft.
     private var windowSection: some View {
-        let source = item.sourcePixelSize
+        let source = item.orientedPixelSize
         let window = model.displayedWindow(for: item)
         return VStack(alignment: .leading, spacing: 7) {
             RailLabel("畫面範圍（來源像素）")
@@ -282,7 +287,11 @@ private struct CropNumbersRail: View {
                         }
                     }
                 }
-                Text(verbatim: "來源 \(source.width)×\(source.height)")
+                // Turned, the numbers above are in the turned picture's pixels
+                // — say so, or a 1080-wide source reads as cropped to 1920.
+                Text(verbatim: item.geometry.rotation == .upright
+                     ? "來源 \(source.width)×\(source.height)"
+                     : "來源轉 \(item.geometry.rotation.degrees)° 後 \(source.width)×\(source.height)")
                     .font(.caption).foregroundStyle(.white.opacity(0.4)).monospacedDigit()
             } else {
                 Text("這個素材沒有回報畫面尺寸，無法調整構圖")
@@ -337,13 +346,49 @@ private struct CropNumbersRail: View {
             }
             if model.items.count > 1 {
                 PresetRow(title: "套用到全部 \(model.items.count) 段",
-                          detail: "把這塊裁切範圍複製到每一段") {
+                          detail: item.geometry.rotation == .upright
+                              ? "把這塊裁切範圍複製到每一段"
+                              : "把這段的旋轉和裁切範圍複製到每一段") {
                     model.applyGeometryToAllItems(from: item.id)
                 }
             }
+            // Only the crop: a turned clip stays turned. Turning it back is
+            // what the two buttons at the top are for.
             PresetRow(title: "回到整張畫面", detail: "取消這段的裁切",
-                      disabled: item.geometry.isIdentity) {
+                      disabled: !item.geometry.isCropped) {
                 model.resetGeometry(for: item.id)
+            }
+        }
+    }
+}
+
+/// Quarter turns. First in the rail because it comes first in the picture:
+/// the crop is drawn on whatever this leaves standing, and goes round with it.
+/// Its own view for the same reason as the ratio section below.
+private struct CropRotationSection: View {
+    let model: EditorModel
+    let item: ClipItem
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                RailLabel("旋轉")
+                Text(verbatim: "\(item.geometry.rotation.degrees)°")
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.6))
+            }
+            HStack(spacing: 6) {
+                RailButton(title: "向左", systemImage: "rotate.left", key: "⇧R") {
+                    model.rotateItems([item.id], by: -1)
+                }
+                .help("向左旋轉 90°（⇧R）")
+                RailButton(title: "向右", systemImage: "rotate.right", key: "R") {
+                    model.rotateItems([item.id], by: 1)
+                }
+                .help("向右旋轉 90°（R）")
+            }
+            if item.geometry.isCropped {
+                RailNote("裁切範圍會跟著畫面一起轉")
             }
         }
     }
@@ -369,6 +414,9 @@ private struct CropRatioSection: View {
                 Text("9:16").tag(AspectLock.ratio(width: 9, height: 16))
                 Text("1:1").tag(AspectLock.ratio(width: 1, height: 1))
                 Text("4:3").tag(AspectLock.ratio(width: 4, height: 3))
+                // A quarter turn swaps a lock with the rectangle it describes,
+                // so every ratio here needs its turned twin to land on.
+                Text("3:4").tag(AspectLock.ratio(width: 3, height: 4))
             }
             .labelsHidden()
             RailNote(item.geometry.aspectLock == .free
@@ -397,6 +445,35 @@ private struct RailNote: View {
             .font(.caption2)
             .foregroundStyle(.white.opacity(0.35))
             .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+/// A compact action in the rail, its shortcut beside it: two of these share a
+/// row where a `PresetRow` would take one each.
+private struct RailButton: View {
+    let title: String
+    let systemImage: String
+    let key: String
+    let action: () -> Void
+
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 5) {
+                Image(systemName: systemImage)
+                Text(title).font(.callout)
+                Spacer(minLength: 4)
+                KeyCapHint(key)
+            }
+            .padding(.horizontal, 9).padding(.vertical, 6)
+            .frame(maxWidth: .infinity)
+            .background(RoundedRectangle(cornerRadius: 6)
+                .fill(.white.opacity(hovering ? 0.10 : 0.05)))
+            .contentShape(RoundedRectangle(cornerRadius: 6))
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
     }
 }
 
@@ -464,7 +541,8 @@ private struct CropFrameScrubber: View {
                     .font(.caption2).foregroundStyle(.white.opacity(0.35))
             }
         } else {
-            FilmstripStrip(source: item.sourcePixelSize,
+            FilmstripStrip(source: item.orientedPixelSize,
+                           rotation: item.geometry.rotation,
                            crop: model.visibleSourceRegion(for: item),
                            sourceRevision: model.videoSourceRevision(for: item.url),
                            thumbnailer: model.thumbnailer(for: item.url),
@@ -552,10 +630,12 @@ private struct CropClipTile: View {
     private var thumbnail: some View {
         if clip.isImage {
             CropClipImageTile(url: clip.url,
-                              source: clip.sourcePixelSize,
+                              source: clip.orientedPixelSize,
+                              rotation: clip.geometry.rotation,
                               crop: model.visibleSourceRegion(for: clip))
         } else {
-            FilmstripStrip(source: clip.sourcePixelSize,
+            FilmstripStrip(source: clip.orientedPixelSize,
+                           rotation: clip.geometry.rotation,
                            crop: model.visibleSourceRegion(for: clip),
                            sourceRevision: model.videoSourceRevision(for: clip.url),
                            thumbnailer: model.thumbnailer(for: clip.url),
@@ -569,6 +649,7 @@ private struct CropClipTile: View {
 private struct CropClipImageTile: View {
     let url: URL
     let source: PixelSize
+    let rotation: ClipRotation
     let crop: PixelRect?
     @State private var image: NSImage?
 
@@ -579,6 +660,7 @@ private struct CropClipImageTile: View {
                 if let image {
                     Image(nsImage: image)
                         .resizable()
+                        .turned(rotation)
                         .showingSourceRegion(crop, of: source, filling: geo.size)
                 }
             }
