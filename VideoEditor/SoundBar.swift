@@ -399,3 +399,39 @@ enum SoundBarCursor {
         }
     }
 }
+
+extension SoundBarGeometry {
+    /// A clip's own sound, heard across the clip's whole span, black included:
+    /// the export shapes all of it.
+    init(original item: ClipItem, width: CGFloat, height: CGFloat, pointsPerSecond: CGFloat) {
+        self.init(width: width, height: height, heardWidth: width,
+                  pointsPerSecond: pointsPerSecond, gain: item.audioGain,
+                  fadeIn: item.audioFadeIn, fadeOut: item.audioFadeOut)
+    }
+
+    /// The parts of the bar a drag shapes rather than carries: both handles,
+    /// and a band along the line while there is a level to set. On a clip's
+    /// own sound everywhere else picks the clip up to reorder it, so this is
+    /// the shape its controls take hits in.
+    func controlsShape(isMuted: Bool) -> Path {
+        var handles = Path()
+        if heardWidth > 10 {
+            for zone in [Zone.fadeIn, .fadeOut] {
+                handles.addRect(CGRect(x: handleX(zone) - Self.handleReach, y: 0,
+                                       width: 2 * Self.handleReach, height: Self.handleStrip))
+            }
+        }
+        let corners = envelopeCorners
+        guard !isMuted, !corners.isEmpty else { return handles }
+        var band = Path()
+        band.move(to: CGPoint(x: corners[0].x, y: corners[0].y - Self.lineReach))
+        for corner in corners.dropFirst() {
+            band.addLine(to: CGPoint(x: corner.x, y: corner.y - Self.lineReach))
+        }
+        for corner in corners.reversed() {
+            band.addLine(to: CGPoint(x: corner.x, y: corner.y + Self.lineReach))
+        }
+        band.closeSubpath()
+        return handles.union(band)
+    }
+}

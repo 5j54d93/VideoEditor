@@ -957,6 +957,49 @@ final class EditorModelTimelineTests: XCTestCase {
         XCTAssertEqual(model.items[0].audioGain, 1.46)
     }
 
+    /// A menu opened on a selection shapes all of it, each change one undo
+    /// step, and passes over what has no sound of its own.
+    func testShapingSeveralSoundsAtOnceIsOneStepEach() {
+        let (model, id) = trackModel()
+        let still = model.items[0].id
+        model.setAudioClipGain(0.5, for: id)
+        model.setAudioClipFades(in: 1, out: 2, for: id)
+        let shaped = model.audioClips[0]
+
+        model.setSoundMuted(true, pieces: [id], clips: [still])
+        XCTAssertTrue(model.audioClips[0].isMuted)
+        XCTAssertFalse(model.items[0].isAudioMuted, "A still has no sound to mute")
+        model.resetSoundGain(pieces: [id], clips: [])
+        model.removeSoundFades(pieces: [id], clips: [])
+        XCTAssertEqual(model.audioClips[0].gain, 1)
+        XCTAssertEqual(model.audioClips[0].fadeIn, 0)
+        XCTAssertEqual(model.audioClips[0].fadeOut, 0)
+
+        model.undo()
+        model.undo()
+        model.undo()
+        XCTAssertEqual(model.audioClips[0], shaped)
+    }
+
+    /// The same for a clip's own sound.
+    func testAClipsOwnSoundMutesFromItsMenu() {
+        let video = LibraryAsset(
+            url: URL(fileURLWithPath: "/fixtures/menu-mute.mp4"),
+            kind: .video, width: 640, height: 480,
+            duration: 1, fps: 25, fpsRational: "25",
+            hasAudio: true, frameTimes: [0, 0.96], frameEndTime: 1,
+            audioStartTime: 0, audioDuration: 1)
+        let model = EditorModel()
+        model.library = [video]
+        model.insertLibraryAsset(video.id)
+        let id = model.items[0].id
+
+        model.setSoundMuted(true, pieces: [], clips: [id])
+        XCTAssertTrue(model.items[0].isAudioMuted)
+        model.undo()
+        XCTAssertFalse(model.items[0].isAudioMuted)
+    }
+
     func testSelectAllThenDeleteClearsTheTimelineAsOneUndoStep() {
         let image = LibraryAsset(
             url: URL(fileURLWithPath: "/fixtures/still.png"),

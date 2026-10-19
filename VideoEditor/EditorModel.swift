@@ -1260,6 +1260,68 @@ final class EditorModel {
         items[index].audioFadeOut = newOut
     }
 
+    // Several pieces of sound at once: a selection, or what a menu was opened
+    // on — Finder's rule, as the rotation menu has it.
+
+    /// The four things every piece of sound carries, whichever kind it is.
+    private struct SoundShaping: Equatable {
+        var gain: Double
+        var isMuted: Bool
+        var fadeIn: Double
+        var fadeOut: Double
+    }
+
+    /// Change pieces of the track and clips' own sound together, as one undo
+    /// step, and none when nothing changes. A clip with no sound of its own is
+    /// passed over, as is a still.
+    private func changeSound(pieces: Set<AudioClip.ID>, clips: Set<ClipItem.ID>,
+                             pausing: Bool = true, _ change: (inout SoundShaping) -> Void) {
+        var newClips = audioClips
+        for index in newClips.indices where pieces.contains(newClips[index].id) {
+            let clip = newClips[index]
+            var shaping = SoundShaping(gain: clip.gain, isMuted: clip.isMuted,
+                                       fadeIn: clip.fadeIn, fadeOut: clip.fadeOut)
+            change(&shaping)
+            newClips[index].gain = Self.storedGain(shaping.gain)
+            newClips[index].isMuted = shaping.isMuted
+            (newClips[index].fadeIn, newClips[index].fadeOut) = Self.storedFades(
+                in: shaping.fadeIn, out: shaping.fadeOut, length: clip.duration,
+                was: (clip.fadeIn, clip.fadeOut))
+        }
+        var newItems = items
+        for index in newItems.indices where clips.contains(newItems[index].id) {
+            let item = newItems[index]
+            guard item.hasAudio, !item.isImage else { continue }
+            var shaping = SoundShaping(gain: item.audioGain, isMuted: item.isAudioMuted,
+                                       fadeIn: item.audioFadeIn, fadeOut: item.audioFadeOut)
+            change(&shaping)
+            newItems[index].audioGain = Self.storedGain(shaping.gain)
+            newItems[index].isAudioMuted = shaping.isMuted
+            (newItems[index].audioFadeIn, newItems[index].audioFadeOut) = Self.storedFades(
+                in: shaping.fadeIn, out: shaping.fadeOut, length: item.displayDuration,
+                was: (item.audioFadeIn, item.audioFadeOut))
+        }
+        guard newClips != audioClips || newItems != items else { return }
+        if pausing { pauseTimelinePlayback() }
+        registerUndo()
+        audioClips = newClips
+        items = newItems
+        applyOriginalAudioGain()
+    }
+
+    func setSoundMuted(_ muted: Bool, pieces: Set<AudioClip.ID>, clips: Set<ClipItem.ID>) {
+        changeSound(pieces: pieces, clips: clips) { $0.isMuted = muted }
+    }
+
+    /// Back to the recording's own level, 100%.
+    func resetSoundGain(pieces: Set<AudioClip.ID>, clips: Set<ClipItem.ID>) {
+        changeSound(pieces: pieces, clips: clips) { $0.gain = 1 }
+    }
+
+    func removeSoundFades(pieces: Set<AudioClip.ID>, clips: Set<ClipItem.ID>) {
+        changeSound(pieces: pieces, clips: clips) { $0.fadeIn = 0; $0.fadeOut = 0 }
+    }
+
     /// A level as it is kept: within what the mix allows, in whole percents —
     /// the number every label reads and the one the export writes.
     static func storedGain(_ gain: Double) -> Double {

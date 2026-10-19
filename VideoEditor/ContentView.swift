@@ -160,19 +160,13 @@ struct ContentView: View {
     /// height than the preview.
     private var bottomPane: some View {
         VStack(spacing: 0) {
-            // One row for whatever is being adjusted: a selected piece of the
-            // track first, since selecting it is the latest thing said.
-            if let clip = model.selectedAudioClip {
-                audioClipControls(clip)
+            // A still's display time is the one setting left above the
+            // timeline. Sound is set on its bars, where it is drawn — a row
+            // here used to carry it, and the timeline jumped every time the
+            // selection made the row come or go.
+            if model.selectedAudioClip == nil, let item = model.activeItem, item.isImage {
+                imageControls(item)
                 Divider()
-            } else if let item = model.activeItem {
-                if item.isImage {
-                    imageControls(item)
-                    Divider()
-                } else if item.hasAudio {
-                    originalAudioControls(item)
-                    Divider()
-                }
             }
             TimelineView(model: model)
                 // The toolbar row is the first thing in the timeline, and the
@@ -381,110 +375,6 @@ struct ContentView: View {
             Spacer()
         }
         .padding(.horizontal, 14).padding(.vertical, 10)
-    }
-
-    // MARK: Audio rows
-
-    /// A clip's own sound: how loud, whether at all, how it comes in and goes
-    /// out, and whether it should become a piece of the track in its own right.
-    private func originalAudioControls(_ item: ClipItem) -> some View {
-        HStack(spacing: 14) {
-            Image(systemName: "waveform").foregroundStyle(.secondary)
-            Text("原音").font(.callout)
-            muteButton(item.isAudioMuted) {
-                model.setOriginalAudioMuted(!item.isAudioMuted, for: item.id)
-            }
-            gainSlider(item.audioGain, key: "original-gain:\(item.id)") {
-                model.setOriginalAudioGain($0, for: item.id)
-            }
-            .disabled(item.isAudioMuted)
-            fadeSlider("淡入", value: item.audioFadeIn, maximum: item.displayDuration,
-                       key: "original-fade:\(item.id)") {
-                model.setOriginalAudioFades(in: $0, out: item.audioFadeOut, for: item.id)
-            }
-            fadeSlider("淡出", value: item.audioFadeOut, maximum: item.displayDuration,
-                       key: "original-fade:\(item.id)") {
-                model.setOriginalAudioFades(in: item.audioFadeIn, out: $0, for: item.id)
-            }
-            Button("分離原音") { model.detachOriginalAudio(from: item.id) }
-                .disabled(item.isAudioMuted)
-                .help("把這段的原音變成音訊軌上獨立的一段：可以移動、裁切、分割；影片本身則靜音")
-            Spacer()
-        }
-        .controlSize(.small)
-        .padding(.horizontal, 14).padding(.vertical, 8)
-    }
-
-    /// A piece of the track. Position and cutting live on the timeline itself;
-    /// this row carries what a bar cannot show.
-    private func audioClipControls(_ clip: AudioClip) -> some View {
-        HStack(spacing: 14) {
-            Image(systemName: "music.note").foregroundStyle(.secondary)
-            Text(clip.name)
-                .font(.callout).lineLimit(1).truncationMode(.middle)
-                .frame(maxWidth: 180, alignment: .leading)
-            Text("\(timeFieldText(clip.timelineStart)) 起")
-                .font(.system(.caption, design: .monospaced))
-                .foregroundStyle(.secondary)
-            muteButton(clip.isMuted) { model.setAudioClipMuted(!clip.isMuted, for: clip.id) }
-            gainSlider(clip.gain, key: "audio-gain:\(clip.id)") {
-                model.setAudioClipGain($0, for: clip.id)
-            }
-            .disabled(clip.isMuted)
-            fadeSlider("淡入", value: clip.fadeIn, maximum: clip.duration,
-                       key: "audio-fade:\(clip.id)") {
-                model.setAudioClipFades(in: $0, out: clip.fadeOut, for: clip.id)
-            }
-            fadeSlider("淡出", value: clip.fadeOut, maximum: clip.duration,
-                       key: "audio-fade:\(clip.id)") {
-                model.setAudioClipFades(in: clip.fadeIn, out: $0, for: clip.id)
-            }
-            Spacer()
-        }
-        .controlSize(.small)
-        .padding(.horizontal, 14).padding(.vertical, 8)
-    }
-
-    private func muteButton(_ muted: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: muted ? "speaker.slash.fill" : "speaker.wave.2.fill")
-                .frame(width: 16)
-        }
-        .help(muted ? "取消靜音" : "靜音")
-    }
-
-    /// A level and its readout. Every pixel of travel is a value, and the
-    /// session keeps the whole drag to one undo step.
-    private func gainSlider(_ value: Double, key: String,
-                            set: @escaping @MainActor (Double) -> Void) -> some View {
-        HStack(spacing: 6) {
-            Text("音量").font(.callout).foregroundStyle(.secondary)
-            Slider(value: Binding(get: { value }, set: set),
-                   in: 0...EditorModel.maximumAudioGain,
-                   onEditingChanged: { editing in
-                       if editing { model.beginContinuousEdit(key) } else { model.endContinuousEdit(key) }
-                   })
-            .frame(width: 130)
-            Text("\(Int((value * 100).rounded()))%")
-                .font(.system(.callout, design: .monospaced))
-                .frame(width: 44, alignment: .leading)
-        }
-    }
-
-    private func fadeSlider(_ title: String, value: Double, maximum: Double, key: String,
-                            set: @escaping @MainActor (Double) -> Void) -> some View {
-        HStack(spacing: 6) {
-            Text(title).font(.callout).foregroundStyle(.secondary)
-            Slider(value: Binding(get: { value }, set: set),
-                   in: 0...max(0.1, min(5, maximum)),
-                   onEditingChanged: { editing in
-                       if editing { model.beginContinuousEdit(key) } else { model.endContinuousEdit(key) }
-                   })
-            .frame(width: 80)
-            Text(String(format: "%.1f 秒", value))
-                .font(.system(.callout, design: .monospaced))
-                .frame(width: 44, alignment: .leading)
-        }
     }
 
     // MARK: Export progress / result sheet

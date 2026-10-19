@@ -12,7 +12,9 @@ import UniformTypeIdentifiers
 
 private enum TimelineLaneMetrics {
     static let spacing: CGFloat = 2
-    static let audioHeight: CGFloat = 28
+    /// A clip's own sound, the lower part of the clip: its level line and fade
+    /// handles need the same room as a piece of the track.
+    static let audioHeight: CGFloat = 36
     /// The audio track under the clip row: one lane per overlapping clip. Tall
     /// enough for a level line, a pair of fade handles and a label to each
     /// have room of their own.
@@ -37,7 +39,9 @@ struct TimelineView: View {
     static let headerSpacing: CGFloat = 7
 
     private let rulerHeight: CGFloat = 24
-    private let baseTrackHeight: CGFloat = 100
+    /// The picture keeps its 70 points; the clip's own sound below it takes
+    /// the rest.
+    private let baseTrackHeight: CGFloat = 108
     private let trackCornerRadius: CGFloat = 7
 
     @State private var scrollPosition = ScrollPosition(x: 0)
@@ -419,6 +423,10 @@ struct TimelineView: View {
                 upper: Double((scrollOffset + viewportWidth) / scale)
             )
         )
+        // What a clip's own fade handles are pulled onto: the cuts and the
+        // ends of every piece of the track.
+        let soundSnapTimes = layout.boundaries
+            + track.entries.flatMap { [$0.clip.timelineStart, $0.clip.timelineEnd] }
         return ZStack(alignment: .topLeading) {
             RoundedRectangle(cornerRadius: trackCornerRadius)
                 .fill(Color.gray.opacity(0.1))
@@ -443,7 +451,8 @@ struct TimelineView: View {
                     TimelineClipView(model: model, item: entry.item,
                                      timelineStart: entry.start,
                                      visibleTimelineRange: visibleTimelineRange,
-                                     pointsPerSecond: scale, height: baseTrackHeight)
+                                     pointsPerSecond: scale, height: baseTrackHeight,
+                                     snapTimes: soundSnapTimes)
                 }
             }
             .frame(width: clipsWidth, height: baseTrackHeight, alignment: .leading)
@@ -537,6 +546,15 @@ struct TimelineView: View {
                            at: CGPoint(x: value.location.x - CGFloat(onTrack.timelineStart) * scale,
                                        y: value.location.y - geometry.laneTop(lane)),
                            scale: scale, movieDuration: layout.totalDuration) {
+                        return
+                    }
+                    if onClips, let itemID = layout.itemID(at: time),
+                       let entry = layout.entries.first(where: { $0.id == itemID }),
+                       originalSoundControlClick(
+                           on: entry.item,
+                           at: CGPoint(x: value.location.x - CGFloat(entry.start) * scale,
+                                       y: value.location.y - originalAudioLaneTop(geometry)),
+                           scale: scale) {
                         return
                     }
                     if NSEvent.modifierFlags.contains(.command) {
@@ -724,6 +742,30 @@ struct TimelineView: View {
         return true
     }
 
+    /// The same, on a clip's own sound: the lower part of the clip, which has
+    /// no ends of its own to trim.
+    private func originalSoundControlClick(on item: ClipItem, at point: CGPoint,
+                                           scale: CGFloat) -> Bool {
+        guard !item.isImage, item.hasAudio,
+              point.y >= 0, point.y <= TimelineLaneMetrics.audioHeight else { return false }
+        let bar = SoundBarGeometry(original: item, width: CGFloat(item.displayDuration) * scale,
+                                   height: TimelineLaneMetrics.audioHeight, pointsPerSecond: scale)
+        let option = NSEvent.modifierFlags.contains(.option)
+        switch bar.zone(at: point, isMuted: item.isAudioMuted, trims: false) {
+        case .mute:
+            model.setOriginalAudioMuted(!item.isAudioMuted, for: item.id)
+        case .level where option:
+            model.setOriginalAudioGain(1, for: item.id)
+        case .fadeIn where option:
+            model.setOriginalAudioFades(in: 0, out: item.audioFadeOut, for: item.id)
+        case .fadeOut where option:
+            model.setOriginalAudioFades(in: item.audioFadeIn, out: 0, for: item.id)
+        default:
+            return false
+        }
+        return true
+    }
+
     /// The audio track: every piece of sound in its lane, under the clip row.
     private func audioTrack(track: AudioTrackLayout, layout: TimelineLayout, scale: CGFloat,
                             geometry: TrackGeometry, visibleTimelineRange: ClosedRange<Double>,
@@ -884,9 +926,27 @@ private struct TimelineClipView: View {
     let visibleTimelineRange: ClosedRange<Double>
     let pointsPerSecond: CGFloat
     let height: CGFloat
+    /// Moments a fade handle on the clip's own sound is pulled onto: the cuts
+    /// and the ends of the track's pieces.
+    let snapTimes: [Double]
 
     /// The clip's own sound, read once per file off the main thread.
     @State private var peaks: AudioPeaks?
+    /// A drag on the clip's own line or one of its handles, with what it has
+    /// set so far; the model hears of it once, on release.
+    @State private var soundDrag: SoundDrag?
+    /// The control of the clip's own sound under the pointer.
+    @State private var soundHover: SoundBarGeometry.Zone?
+
+    private struct SoundDrag {
+        let zone: SoundBarGeometry.Zone
+        var gain: Double
+        var fadeIn: Double
+        var fadeOut: Double
+        /// Where the level drag last changed gear, as on a piece of the track.
+        var levelBase: (gain: Double, rise: CGFloat, fine: Bool)?
+        var readoutX: CGFloat
+    }
 
     private var selected: Bool { model.selectedIDs.contains(item.id) }
     private var dragPayload: String {
@@ -939,12 +999,34 @@ private struct TimelineClipView: View {
                         lineWidth: selected ? 2.5 : 1)
                 .padding(.horizontal, edgeInset)
         }
+        .overlay(alignment: .topLeading) {
+            // Over the picture, just above its sound: the clip clips what is
+            // inside it, and this has to be seen.
+            if let soundDrag {
+                SoundReadout(text: soundReadout(soundDrag))
+                    .offset(x: soundDrag.readoutX + 10,
+                            y: videoLaneHeight + TimelineLaneMetrics.spacing - 22)
+            }
+        }
         .accessibilityLabel(item.url.lastPathComponent)
         .accessibilityValue("\(String(format: "%.2f", item.displayDuration)) 秒")
         .contextMenu {
             // Finder's rule: right-clicking inside the selection acts on all
             // of it, anywhere else on just the clip under the pointer.
             let targets = selected ? model.selectedIDs : [item.id]
+            if !item.isImage, item.hasAudio {
+                let sounds = model.items.filter { targets.contains($0.id) && $0.hasAudio }
+                Button(item.isAudioMuted ? "取消原音靜音" : "原音靜音") {
+                    model.setSoundMuted(!item.isAudioMuted, pieces: [], clips: targets)
+                }
+                Button("原音音量重設為 100%") { model.resetSoundGain(pieces: [], clips: targets) }
+                    .disabled(sounds.allSatisfy { $0.audioGain == 1 })
+                Button("移除原音淡入淡出") { model.removeSoundFades(pieces: [], clips: targets) }
+                    .disabled(sounds.allSatisfy { $0.audioFadeIn == 0 && $0.audioFadeOut == 0 })
+                Button("分離原音") { model.detachOriginalAudio(from: item.id) }
+                    .disabled(item.isAudioMuted)
+                Divider()
+            }
             Button("向右旋轉 90°") { model.rotateItems(targets, by: 1) }
             Button("向左旋轉 90°") { model.rotateItems(targets, by: -1) }
             if item.trailingOverhangDuration > 1e-9 {
@@ -1072,6 +1154,22 @@ private struct TimelineClipView: View {
                     .offset(x: contentWidth)
                     .allowsHitTesting(false)
             }
+
+            if item.hasAudio { originalSoundControls }
+        }
+        .onContinuousHover { phase in
+            guard item.hasAudio else { return }
+            switch phase {
+            case .active(let point):
+                guard soundDrag == nil else { return }
+                let zone = originalGeometry.zone(at: point, isMuted: item.isAudioMuted, trims: false)
+                if zone != soundHover { soundHover = zone }
+                // The body of the bar carries the clip, as the picture does.
+                (zone == .body ? NSCursor.arrow : SoundBarCursor.cursor(for: zone)).set()
+            case .ended:
+                soundHover = nil
+                NSCursor.arrow.set()
+            }
         }
         .accessibilityLabel(!item.hasAudio ? "沒有原始音訊"
                             : item.isAudioMuted ? "原始音訊已靜音" : "原始音訊")
@@ -1081,6 +1179,19 @@ private struct TimelineClipView: View {
         .task(id: item.hasAudio ? item.url : nil) {
             peaks = item.hasAudio ? await AudioWaveformStore.shared.peaks(for: item.url) : nil
         }
+    }
+
+    /// The clip's own sound as drawn: a drag in hand applied.
+    private var originalGeometry: SoundBarGeometry {
+        var geometry = SoundBarGeometry(original: item, width: width,
+                                        height: TimelineLaneMetrics.audioHeight,
+                                        pointsPerSecond: pointsPerSecond)
+        if let soundDrag {
+            geometry.gain = soundDrag.gain
+            geometry.fadeIn = soundDrag.fadeIn
+            geometry.fadeOut = soundDrag.fadeOut
+        }
+        return geometry
     }
 
     /// The clip's own sound, drawn the way the track's pieces are. Its span is
@@ -1097,20 +1208,91 @@ private struct TimelineClipView: View {
         // Muted — or detached onto the track, which mutes — draws like no
         // sound at all: the bar shows what will be heard from the clip itself.
         return SoundBar(kind: .original,
-                        geometry: SoundBarGeometry(width: width,
-                                                   height: TimelineLaneMetrics.audioHeight,
-                                                   heardWidth: width,
-                                                   pointsPerSecond: pointsPerSecond,
-                                                   gain: item.audioGain,
-                                                   fadeIn: item.audioFadeIn,
-                                                   fadeOut: item.audioFadeOut),
+                        geometry: originalGeometry,
                         isMuted: item.isAudioMuted,
                         label: item.isAudioMuted ? "原音已靜音" : "原音",
                         peaks: peaks,
                         peaksOffset: item.inPoint - item.audioStartTime,
                         soundRange: soundFrom...max(soundFrom, soundTo),
                         visibleRange: firstVisible...max(firstVisible, lastVisible),
-                        showsLevel: false)
+                        showsHandles: selected || soundHover != nil || soundDrag != nil,
+                        hot: soundDrag?.zone ?? soundHover)
+    }
+
+    /// Where a drag shapes the clip's own sound instead of picking the clip
+    /// up: the handles, and a band along the line. Laid over the surface that
+    /// carries the clip, so it takes those hits first and leaves it all others.
+    private var originalSoundControls: some View {
+        Color.clear
+            .frame(width: max(0.01, width), height: TimelineLaneMetrics.audioHeight)
+            .contentShape(originalGeometry.controlsShape(isMuted: item.isAudioMuted))
+            .gesture(originalSoundDrag)
+    }
+
+    private var originalSoundDrag: some Gesture {
+        DragGesture(minimumDistance: 3, coordinateSpace: .local)
+            .onChanged { value in
+                let fine = NSEvent.modifierFlags.contains(.command)
+                let stored = SoundBarGeometry(original: item, width: width,
+                                              height: TimelineLaneMetrics.audioHeight,
+                                              pointsPerSecond: pointsPerSecond)
+                if soundDrag == nil {
+                    let zone = stored.zone(at: value.startLocation, isMuted: item.isAudioMuted,
+                                           trims: false)
+                    guard [SoundBarGeometry.Zone.level, .fadeIn, .fadeOut].contains(zone) else { return }
+                    soundDrag = SoundDrag(zone: zone, gain: item.audioGain, fadeIn: item.audioFadeIn,
+                                          fadeOut: item.audioFadeOut, readoutX: value.location.x)
+                    model.beginContinuousEdit(soundEditKey(zone))
+                }
+                guard var drag = soundDrag else { return }
+                if drag.zone == .level {
+                    let rise = -value.translation.height
+                    if drag.levelBase == nil {
+                        drag.levelBase = (item.audioGain, 0, fine)
+                    } else if drag.levelBase?.fine != fine {
+                        drag.levelBase = (drag.gain, rise, fine)
+                    }
+                    let base = drag.levelBase ?? (item.audioGain, 0, fine)
+                    drag.gain = stored.gain(from: base.gain, rise: rise - base.rise, fine: fine)
+                } else {
+                    var current = stored
+                    current.fadeIn = drag.fadeIn
+                    current.fadeOut = drag.fadeOut
+                    let origin = CGFloat(timelineStart) * pointsPerSecond
+                    let snaps = fine ? [] : (snapTimes + [model.timelineTime])
+                        .map { CGFloat($0) * pointsPerSecond - origin }
+                    if drag.zone == .fadeIn {
+                        drag.fadeIn = current.fade(.fadeIn, handleAt: value.location.x, snaps: snaps)
+                    } else {
+                        drag.fadeOut = current.fade(.fadeOut, handleAt: value.location.x, snaps: snaps)
+                    }
+                }
+                drag.readoutX = value.location.x
+                soundDrag = drag
+            }
+            .onEnded { _ in
+                guard let drag = soundDrag else { return }
+                soundDrag = nil
+                if drag.zone == .level {
+                    model.setOriginalAudioGain(drag.gain, for: item.id)
+                } else {
+                    model.setOriginalAudioFades(in: drag.fadeIn, out: drag.fadeOut, for: item.id)
+                }
+                model.endContinuousEdit(soundEditKey(drag.zone))
+            }
+    }
+
+    private func soundEditKey(_ zone: SoundBarGeometry.Zone) -> String {
+        zone == .level ? "original-gain:\(item.id)" : "original-fade:\(item.id)"
+    }
+
+    private func soundReadout(_ drag: SoundDrag) -> String {
+        switch drag.zone {
+        case .fadeIn: String(format: "原音淡入 %.2f 秒", drag.fadeIn)
+        case .fadeOut: String(format: "原音淡出 %.2f 秒", drag.fadeOut)
+        default: "原音 \(Int((drag.gain * 100).rounded()))%"
+            + (drag.levelBase?.fine == true ? " · 微調" : "")
+        }
     }
 }
 
@@ -1197,11 +1379,20 @@ private struct TimelineAudioClipView: View {
         }
         .gesture(dragGesture(width: width))
         .contextMenu {
+            // Finder's rule, as on a clip: inside the selection the menu acts
+            // on all of it, anywhere else on just this piece.
+            let pieces = selected ? model.selectedAudioIDs : [clip.id]
+            let shaped = model.audioClips.filter { pieces.contains($0.id) }
+            Button(clip.isMuted ? "取消靜音" : "靜音") {
+                model.setSoundMuted(!clip.isMuted, pieces: pieces, clips: [])
+            }
+            Button("音量重設為 100%") { model.resetSoundGain(pieces: pieces, clips: []) }
+                .disabled(shaped.allSatisfy { $0.gain == 1 })
+            Button("移除淡入淡出") { model.removeSoundFades(pieces: pieces, clips: []) }
+                .disabled(shaped.allSatisfy { $0.fadeIn == 0 && $0.fadeOut == 0 })
+            Divider()
             Button("在播放頭分割") { model.splitAudioClip(clip.id, at: model.timelineTime) }
                 .disabled(!canSplitAtPlayhead)
-            Button(clip.isMuted ? "取消靜音" : "靜音") {
-                model.setAudioClipMuted(!clip.isMuted, for: clip.id)
-            }
             Divider()
             Button("刪除", role: .destructive) {
                 model.selectAudioClip(clip.id)
