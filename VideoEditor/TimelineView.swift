@@ -10,7 +10,7 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
-private enum TimelineLaneMetrics {
+enum TimelineLaneMetrics {
     static let spacing: CGFloat = 2
     /// A clip's own sound, the lower part of the clip: its level line and fade
     /// handles need the same room as a piece of the track.
@@ -29,6 +29,18 @@ private enum TimelineLaneMetrics {
     /// A band may never swallow the clip it spills onto.
     static let tailBandCoverage: CGFloat = 0.7
     static let tailChipHeight: CGFloat = 19
+    /// A clip's corners, and the seam left between two clips at every cut.
+    static let clipCornerRadius: CGFloat = 5
+    static let clipSeam: CGFloat = 3
+
+    /// How far a clip's drawing stands in from its time span on either side:
+    /// half the seam, so the cut sits in the seam's middle, and less on a
+    /// sliver of a clip, so it never masks itself away. Only the drawing
+    /// stands in — the clip still owns its whole span for hit-testing, so the
+    /// time↔x mapping stays exact.
+    static func clipInset(forWidth width: CGFloat) -> CGFloat {
+        min(clipSeam / 2, width / 6)
+    }
 }
 
 struct TimelineView: View {
@@ -944,11 +956,9 @@ private struct TimelineClipView: View {
     /// The part of the clip that has real frames behind it. Anything past this
     /// is the black pad, which the filmstrip must not try to fill.
     private var contentWidth: CGFloat { CGFloat(item.contentDuration) * pointsPerSecond }
-    /// Horizontal breathing room so every cut reads as a visible seam between
-    /// clips. Shrinks on sliver-thin clips so they never mask themselves away.
-    /// Only the drawn content is inset — the clip still owns its full time span
-    /// for hit-testing, so the time↔x mapping stays exact.
-    private var edgeInset: CGFloat { min(2, width / 6) }
+    /// Horizontal breathing room so every cut reads as a seam between clips.
+    /// See `TimelineLaneMetrics.clipInset`.
+    private var edgeInset: CGFloat { TimelineLaneMetrics.clipInset(forWidth: width) }
     private var visibleLocalRange: ClosedRange<Double>? {
         let lower = max(0, visibleTimelineRange.lowerBound - timelineStart)
         let upper = min(item.contentDuration, visibleTimelineRange.upperBound - timelineStart)
@@ -976,12 +986,15 @@ private struct TimelineClipView: View {
         }
         .frame(width: width, height: height)
         .clipped()
-        .mask(Rectangle().padding(.horizontal, edgeInset))
+        .mask(RoundedRectangle(cornerRadius: TimelineLaneMetrics.clipCornerRadius)
+            .padding(.horizontal, edgeInset))
         .contentShape(Rectangle())
         .overlay {
-            Rectangle()
-                .stroke(selected ? Color.accentColor : Color.white.opacity(0.22),
-                        lineWidth: selected ? 2.5 : 1)
+            // Inside the clip's edge, so the seam stays open even between two
+            // selected clips; the selection in the system's own accent.
+            RoundedRectangle(cornerRadius: TimelineLaneMetrics.clipCornerRadius)
+                .strokeBorder(selected ? Color.accentColor : Color.white.opacity(0.22),
+                              lineWidth: selected ? 2.5 : 1)
                 .padding(.horizontal, edgeInset)
         }
         .overlay(alignment: .topLeading) {
