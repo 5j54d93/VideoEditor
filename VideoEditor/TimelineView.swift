@@ -922,7 +922,6 @@ private struct TimelineClipView: View {
     @State private var soundDrag: SoundDrag?
     /// The control of the clip's own sound under the pointer.
     @State private var soundHover: SoundBarGeometry.Zone?
-    @State private var showsSoundPanel = false
 
     private struct SoundDrag {
         let zone: SoundBarGeometry.Zone
@@ -1009,7 +1008,7 @@ private struct TimelineClipView: View {
                     .disabled(sounds.allSatisfy { $0.audioGain == 1 })
                 Button("移除原音淡入淡出") { model.removeSoundFades(pieces: [], clips: targets) }
                     .disabled(sounds.allSatisfy { $0.audioFadeIn == 0 && $0.audioFadeOut == 0 })
-                Button("原音音量與淡入淡出…") { showsSoundPanel = true }
+                Button("原音音量與淡入淡出…") { model.openSoundPanel(forClip: item.id) }
                 Button("分離原音") { model.detachOriginalAudio(from: item.id) }
                     .disabled(item.isAudioMuted)
                 Divider()
@@ -1157,9 +1156,6 @@ private struct TimelineClipView: View {
                 soundHover = nil
                 NSCursor.arrow.set()
             }
-        }
-        .popover(isPresented: $showsSoundPanel, arrowEdge: .bottom) {
-            SoundShapingPanel(model: model, target: .original(item.id))
         }
         .accessibilityLabel(!item.hasAudio ? "沒有原始音訊"
                             : item.isAudioMuted ? "原始音訊已靜音" : "原始音訊")
@@ -1346,7 +1342,6 @@ private struct TimelineAudioClipView: View {
     @State private var hoverZone: SoundBarGeometry.Zone?
     /// What the drag in hand is setting, and where along the bar to say it.
     @State private var readout: (text: String, x: CGFloat)?
-    @State private var showsPanel = false
 
     private var selected: Bool { model.selectedAudioIDs.contains(clip.id) }
     private var canSplitAtPlayhead: Bool {
@@ -1401,7 +1396,7 @@ private struct TimelineAudioClipView: View {
                 .disabled(shaped.allSatisfy { $0.gain == 1 })
             Button("移除淡入淡出") { model.removeSoundFades(pieces: pieces, clips: []) }
                 .disabled(shaped.allSatisfy { $0.fadeIn == 0 && $0.fadeOut == 0 })
-            Button("音量與淡入淡出…") { showsPanel = true }
+            Button("音量與淡入淡出…") { model.openSoundPanel(forPiece: clip.id) }
             Divider()
             Button("在播放頭分割") { model.splitAudioClip(clip.id, at: model.timelineTime) }
                 .disabled(!canSplitAtPlayhead)
@@ -1410,9 +1405,6 @@ private struct TimelineAudioClipView: View {
                 model.selectAudioClip(clip.id)
                 model.removeSelectedItems()
             }
-        }
-        .popover(isPresented: $showsPanel, arrowEdge: .bottom) {
-            SoundShapingPanel(model: model, target: .piece(clip.id))
         }
         .task(id: clip.url) { peaks = await AudioWaveformStore.shared.peaks(for: clip.url) }
         .accessibilityLabel("音訊 \(clip.name)")

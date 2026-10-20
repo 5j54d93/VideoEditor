@@ -445,9 +445,9 @@ func soundAccessibilityValue(gain: Double, isMuted: Bool, fadeIn: Double, fadeOu
 }
 
 /// The exact numbers, for when a drag is not precise enough: the toolbar's
-/// 聲音 panel for one piece of the track or one clip's own sound, and the
-/// popover a bar's 音量與淡入淡出… opens. Every slider drag is one undo step,
-/// however many values it sends.
+/// 聲音 panel for one piece of the track or one clip's own sound, which a bar's
+/// 音量與淡入淡出… also opens. Every slider drag is one undo step, however many
+/// values it sends.
 struct SoundShapingPanel: View {
     enum Target: Equatable {
         case piece(AudioClip.ID)

@@ -56,7 +56,9 @@ struct ContentView: View {
             // The workspace carries its own bar, and every window control here
             // either duplicates it or acts on a pane nobody can currently see.
             if model.hasProject && !model.isGeometryEditing {
-                // The six adjustments, over the picture they change.
+                // The adjustments, over the picture they change, and shipping
+                // apart from them on the right: the two are different kinds of
+                // act, one adjusting the project and one producing a file.
                 ToolbarItemGroup(placement: .primaryAction) {
                     ForEach(EditorModel.Adjustment.allCases) { tool in
                         AdjustmentToolButton(model: model, tool: tool) { frame in
@@ -71,38 +73,6 @@ struct ContentView: View {
                     Color.clear.frame(width: toolGap, height: 1)
                 }
                 .sharedBackgroundVisibility(.hidden)
-                ToolbarSpacer(.fixed, placement: .primaryAction)
-                // Editing comes before shipping, and the two are different kinds
-                // of act — one adjusts the project, one produces a file — so the
-                // spacer keeps them in separate groups rather than one cluster.
-                //
-                // A crop icon opens the crop workspace. It used to open a side
-                // pane that merely *contained* a way in, which put a step
-                // between the button and the thing it is a picture of.
-                ToolbarItem(placement: .primaryAction) {
-                    Button { model.beginGeometryEditing() } label: {
-                        Label("裁切", systemImage: "crop")
-                            .labelStyle(.iconOnly)
-                    }
-                    .buttonBorderShape(.circle)
-                    .disabled(model.activeItem == nil)
-                    .help(model.activeItem == nil
-                          ? "先在時間軸上選一段影片" : "裁切選取的片段（C）")
-                }
-                // Beside the crop, in the same group: both decide what the
-                // picture is, and a sideways clip is fixed without opening
-                // anything. ⇧ turns it the other way, as it does on the key.
-                ToolbarItem(placement: .primaryAction) {
-                    Button { rotateKey() } label: {
-                        Label("旋轉", systemImage: "rotate.right")
-                            .labelStyle(.iconOnly)
-                    }
-                    .buttonBorderShape(.circle)
-                    .disabled(model.rotationTargets.isEmpty)
-                    .help(model.rotationTargets.isEmpty
-                          ? "先在時間軸上選一段影片"
-                          : "向右旋轉 90°（R）；按住 ⇧ 向左旋轉（⇧R）")
-                }
                 ToolbarSpacer(.fixed, placement: .primaryAction)
                 ToolbarItem(placement: .primaryAction) {
                     Button { startExport() } label: {
@@ -208,14 +178,10 @@ struct ContentView: View {
     /// height than the preview.
     private var bottomPane: some View {
         VStack(spacing: 0) {
-            // A still's display time is the one setting left above the
-            // timeline. Sound is set on its bars, where it is drawn — a row
-            // here used to carry it, and the timeline jumped every time the
-            // selection made the row come or go.
-            if model.selectedAudioClip == nil, let item = model.activeItem, item.isImage {
-                imageControls(item)
-                Divider()
-            }
+            // Nothing comes and goes above the timeline: a still's display
+            // time is the toolbar's 片長 now, and sound is set on its bars.
+            // Each used to be a row here, and the timeline jumped every time
+            // the selection made one appear.
             TimelineView(model: model)
                 // The toolbar row is the first thing in the timeline, and the
                 // pane's inset is the air above it — match it to the 7pt the
@@ -399,32 +365,6 @@ struct ContentView: View {
         .allowsHitTesting(false)
     }
 
-    private func imageControls(_ item: ClipItem) -> some View {
-        HStack(spacing: 12) {
-            Image(systemName: "photo").foregroundStyle(.secondary)
-            Text("圖片顯示秒數").font(.callout)
-            Slider(
-                value: Binding(
-                    get: { item.displayDuration },
-                    set: { model.setImageDuration($0, for: item.id) }
-                ),
-                in: 0.2...20,
-                onEditingChanged: { isEditing in
-                    if isEditing {
-                        model.beginImageDurationEditing(for: item.id)
-                    } else {
-                        model.endImageDurationEditing(for: item.id)
-                    }
-                }
-            )
-                .frame(width: 260)
-            Text(String(format: "%.1f 秒", item.displayDuration))
-                .font(.system(.callout, design: .monospaced)).frame(width: 64, alignment: .leading)
-            Spacer()
-        }
-        .padding(.horizontal, 14).padding(.vertical, 10)
-    }
-
     // MARK: Export progress / result sheet
 
     @ViewBuilder
@@ -539,8 +479,7 @@ struct ContentView: View {
         }
     }
 
-    /// R turns clockwise, ⇧R the other way — on the key and on the toolbar's
-    /// button alike.
+    /// R turns clockwise, ⇧R the other way.
     ///
     /// ⇧ comes off the event being handled, not the keyboard's state now: a
     /// quick ⇧R can let go of ⇧ before the shortcut fires, and reading the

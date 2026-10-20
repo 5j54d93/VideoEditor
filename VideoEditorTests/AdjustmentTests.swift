@@ -97,6 +97,31 @@ final class AdjustmentTests: XCTestCase {
         XCTAssertFalse(model.canAdjust(.tail))
     }
 
+    /// A bar's 音量與淡入淡出… opens the toolbar's 聲音 panel on what was
+    /// right-clicked: that clip alone, unless it was part of the selection.
+    func testTheSoundMenuItemOpensTheToolbarPanelOnWhatWasClicked() {
+        let (model, video, still) = project()
+        model.selectOnly(still)
+        model.openSoundPanel(forClip: video)
+        XCTAssertEqual(model.selectedIDs, [video])
+        XCTAssertEqual(model.openAdjustment, .sound)
+
+        model.openAdjustment = nil
+        model.selectOnly(video)
+        model.toggleSelection(still)
+        model.openSoundPanel(forClip: video)
+        XCTAssertEqual(model.selectedIDs, [video, still], "Inside the selection, the selection stays")
+
+        let music = LibraryAsset(url: URL(fileURLWithPath: "/fixtures/music.m4a"), kind: .audio, duration: 10)
+        model.library.append(music)
+        model.insertLibraryAsset(music.id)
+        let piece = model.audioClips[0].id
+        model.selectOnly(video)
+        model.openSoundPanel(forPiece: piece)
+        XCTAssertEqual(model.selectedAudioIDs, [piece])
+        XCTAssertTrue(model.selectedIDs.isEmpty)
+    }
+
     /// 進入裁切 opens the workspace on the clip its panel describes, taking the
     /// playhead there first, and the panel goes with the toolbar.
     func testEnteringTheCropFromItsPanelGoesToTheClipItDescribes() {

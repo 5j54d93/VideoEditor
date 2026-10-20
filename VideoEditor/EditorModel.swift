@@ -2681,6 +2681,19 @@ final class EditorModel {
         beginGeometryEditing()
     }
 
+    /// A clip menu's 音量與淡入淡出…: the toolbar's 聲音 panel, on the clip
+    /// right-clicked — on the whole selection when the click landed inside it.
+    func openSoundPanel(forClip id: ClipItem.ID) {
+        if !selectedIDs.contains(id) { selectOnly(id) }
+        openAdjustment = .sound
+    }
+
+    /// The same from a piece of the track's menu.
+    func openSoundPanel(forPiece id: AudioClip.ID) {
+        if !selectedAudioIDs.contains(id) { selectAudioClip(id) }
+        openAdjustment = .sound
+    }
+
     /// One undo step per call, and never one for a no-op: the inspector's number
     /// fields re-send their value on every keystroke and on focus changes.
     private func updateGeometry(for id: ClipItem.ID,
