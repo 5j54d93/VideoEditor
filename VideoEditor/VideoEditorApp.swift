@@ -46,6 +46,83 @@ struct VideoEditorApp: App {
                     .keyboardShortcut("a", modifiers: .command)
                     .disabled(model.isTextEditing)
             }
+            // Every edit with its key, where the menu bar shows it. A key with
+            // no ⌘ or ⌃ reaches the window first, whose hidden buttons take it
+            // (or the field being typed in does), so for those the menu is the
+            // list and the fallback; ⌃= ⌃− ⌃⇧S reach the menu first. Either way
+            // a press lands on the same model call. An item greys out wherever
+            // its key has nothing to act on: while a field takes typing, under
+            // a sheet (the menu bar stays live there), and for the timeline's
+            // edits while reframing.
+            //
+            // ↑ ↓ are left off. The arrows reach the menu first, and an item
+            // still takes its key while greyed out, so listed here they would
+            // stop nudging the crop, moving the caret in a field and browsing
+            // the Open panel.
+            CommandMenu("剪輯") {
+                let blocked = model.isTextEditing || model.isSheetPresented
+                let timelineBlocked = blocked || model.isGeometryEditing
+                Button("分割") { onTimeline { model.splitAtPlayhead() } }
+                    .keyboardShortcut("s", modifiers: [])
+                    .disabled(timelineBlocked || !model.canSplitAtPlayhead)
+                Button("刪除左側") { onTimeline { model.deleteBeforePlayhead() } }
+                    .keyboardShortcut("q", modifiers: [])
+                    .disabled(timelineBlocked || !model.canDeleteBeforePlayhead)
+                Button("刪除右側") { onTimeline { model.deleteAfterPlayhead() } }
+                    .keyboardShortcut("w", modifiers: [])
+                    .disabled(timelineBlocked || !model.canDeleteAfterPlayhead)
+                Button("刪除") { onTimeline { model.deleteSelection() } }
+                    .keyboardShortcut(.delete, modifiers: [])
+                    .disabled(timelineBlocked || !model.canDeleteSelection)
+                Divider()
+                // These two stay live while reframing: C closes the workspace,
+                // R turns the clip in it.
+                Button(model.isGeometryEditing ? "完成裁切" : "裁切…") {
+                    unlessBusy { model.toggleGeometryEditing() }
+                }
+                .keyboardShortcut("c", modifiers: [])
+                .disabled(blocked || (model.activeItem == nil && !model.isGeometryEditing))
+                Button("向右旋轉 90°") { unlessBusy { model.rotate(by: 1) } }
+                    .keyboardShortcut("r", modifiers: [])
+                    .disabled(blocked || model.rotationTargets.isEmpty)
+                Button("向左旋轉 90°") { unlessBusy { model.rotate(by: -1) } }
+                    .keyboardShortcut("r", modifiers: .shift)
+                    .disabled(blocked || model.rotationTargets.isEmpty)
+                Divider()
+                Button(model.soundTargetsAreQuiet ? "取消靜音" : "靜音") {
+                    onTimeline { model.toggleMuteForSoundTargets() }
+                }
+                .keyboardShortcut("m", modifiers: [])
+                .disabled(timelineBlocked || !model.canShapeSoundTargets)
+                Button("音量 +5%") { onTimeline { model.nudgeGainForSoundTargets(by: 0.05) } }
+                    .keyboardShortcut("=", modifiers: .control)
+                    .disabled(timelineBlocked || !model.canShapeSoundTargets)
+                Button("音量 −5%") { onTimeline { model.nudgeGainForSoundTargets(by: -0.05) } }
+                    .keyboardShortcut("-", modifiers: .control)
+                    .disabled(timelineBlocked || !model.canShapeSoundTargets)
+                Button("分離原音") { onTimeline { model.detachSoundTarget() } }
+                    .keyboardShortcut("s", modifiers: [.control, .shift])
+                    .disabled(timelineBlocked || !model.canDetachSoundTarget)
+                Divider()
+                Button("符合視窗") { onTimeline { model.requestTimelineAutoFit() } }
+                    .keyboardShortcut("z", modifiers: .shift)
+                    .disabled(timelineBlocked || !model.hasProject)
+            }
         }
+    }
+
+    /// An item is only as current as the last time SwiftUI updated its menu,
+    /// and a key can reach it before the next update; so each action checks
+    /// again as it runs. Nothing happens while a field takes typing, or while
+    /// a sheet or a panel such as Open stands over the editor.
+    private func unlessBusy(_ action: () -> Void) {
+        guard !model.isTextEditing, !model.isSheetPresented, NSApp.modalWindow == nil else { return }
+        action()
+    }
+
+    /// The same, and timeline edits also stand aside while the preview is a
+    /// reframing surface, as they do on the window's keys.
+    private func onTimeline(_ action: () -> Void) {
+        unlessBusy { if !model.isGeometryEditing { action() } }
     }
 }

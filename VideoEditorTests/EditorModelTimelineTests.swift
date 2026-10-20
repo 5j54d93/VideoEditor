@@ -858,6 +858,7 @@ final class EditorModelTimelineTests: XCTestCase {
         model.insertLibraryAsset(video.id)
         let id = model.items[0].id
         model.setOriginalAudioGain(0.5, for: id)
+        XCTAssertTrue(model.canDetachSoundTarget, "⌃⇧S reaches the clip under the playhead")
 
         model.detachOriginalAudio(from: id)
 
@@ -942,6 +943,26 @@ final class EditorModelTimelineTests: XCTestCase {
 
         model.seekTimeline(to: 0.5)
         XCTAssertTrue(model.canSplitAtPlayhead)
+    }
+
+    /// What the 剪輯 menu offers, and what it calls an item, follows what the
+    /// key would do.
+    func testTheEditMenuFollowsWhatTheKeysWouldDo() {
+        let (model, piece) = trackModel()
+        XCTAssertTrue(model.canShapeSoundTargets)
+        XCTAssertFalse(model.soundTargetsAreQuiet)
+        model.toggleMuteForSoundTargets()
+        XCTAssertTrue(model.soundTargetsAreQuiet, "Muted, the item offers to bring it back")
+        XCTAssertFalse(model.canDetachSoundTarget, "A piece of the track has no picture to come off")
+
+        model.selectOnly(model.items[0].id)
+        XCTAssertFalse(model.canShapeSoundTargets, "A still has no sound to shape")
+
+        model.selectAudioClip(piece)
+        XCTAssertTrue(model.canDeleteSelection)
+        model.deleteSelection()
+        XCTAssertTrue(model.audioClips.isEmpty, "⌫ on the timeline takes the selected sound")
+        XCTAssertFalse(model.canDeleteSelection, "Nothing left selected, nothing for ⌫ to take")
     }
 
     /// A slider drag is one undo step, however many values it sends.

@@ -1349,13 +1349,35 @@ final class EditorModel {
         return ([], [active.id])
     }
 
+    /// Whether anything the sound keys reach is still heard.
+    private var soundTargetsSounding: Bool {
+        let (pieces, clips) = soundTargets
+        return audioClips.contains { pieces.contains($0.id) && !$0.isMuted }
+            || items.contains { clips.contains($0.id) && $0.hasAudio && !$0.isImage && !$0.isAudioMuted }
+    }
+
+    /// Whether the sound keys reach any sound at all — a still has none.
+    var canShapeSoundTargets: Bool {
+        let (pieces, clips) = soundTargets
+        return !pieces.isEmpty || items.contains { clips.contains($0.id) && $0.hasAudio && !$0.isImage }
+    }
+
+    /// Whether M would bring the sound back rather than quiet it, which is
+    /// what the menu item has to say.
+    var soundTargetsAreQuiet: Bool { canShapeSoundTargets && !soundTargetsSounding }
+
+    /// Whether ⌃⇧S has one clip with sound of its own to take off its picture.
+    var canDetachSoundTarget: Bool {
+        let clips = soundTargets.clips
+        guard clips.count == 1, let item = items.first(where: { clips.contains($0.id) }) else { return false }
+        return !item.isImage && item.hasAudio && !item.isAudioMuted
+    }
+
     /// M. Everything targeted goes quiet, unless all of it already is; then it
     /// all comes back.
     func toggleMuteForSoundTargets() {
         let (pieces, clips) = soundTargets
-        let sounding = audioClips.contains { pieces.contains($0.id) && !$0.isMuted }
-            || items.contains { clips.contains($0.id) && $0.hasAudio && !$0.isImage && !$0.isAudioMuted }
-        setSoundMuted(sounding, pieces: pieces, clips: clips)
+        setSoundMuted(soundTargetsSounding, pieces: pieces, clips: clips)
     }
 
     /// ⌃= and ⌃−, five percent a press.
@@ -1821,6 +1843,22 @@ final class EditorModel {
             times.append(end)
         }
         return times
+    }
+
+    /// Whether ⌫ has anything to take. The two panes never both hold a
+    /// selection, so whichever does is what goes.
+    var canDeleteSelection: Bool {
+        !selectedIDs.isEmpty || !selectedAudioIDs.isEmpty || !selectedLibraryIDs.isEmpty
+    }
+
+    /// ⌫: what the pane being worked in has selected — clips and sound on the
+    /// timeline, assets in the library.
+    func deleteSelection() {
+        if timelineHasFocus {
+            removeSelectedItems()
+        } else {
+            removeSelectedLibraryAssets()
+        }
     }
 
     /// ↑: back to the start of the clip the playhead is in, or to the one

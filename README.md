@@ -87,6 +87,8 @@ The guarantee is intentionally scoped to the **same bundled toolchain and CPU ar
 
 ## Keyboard Shortcuts
 
+The edits are in the **剪輯** menu too, each beside its key; an item greys out wherever its key would have nothing to act on. <kbd>↑</kbd> <kbd>↓</kbd> stay off it, so the arrows still move the caret in a field, browse the Open panel and nudge the crop.
+
 | Key | Action |
 | --- | --- |
 | <kbd>Space</kbd> | Play／pause |

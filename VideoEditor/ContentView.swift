@@ -431,15 +431,8 @@ struct ContentView: View {
                 .keyboardShortcut("s", modifiers: [])
             Button("") { whileEditing { model.requestTimelineAutoFit() } }
                 .keyboardShortcut("z", modifiers: .shift)
-            Button("") {
-                whileEditing {
-                    if model.timelineHasFocus {
-                        model.removeSelectedItems()
-                    } else {
-                        model.removeSelectedLibraryAssets()
-                    }
-                }
-            }.keyboardShortcut(.delete, modifiers: [])
+            Button("") { whileEditing { model.deleteSelection() } }
+                .keyboardShortcut(.delete, modifiers: [])
 
             Button("") { model.toggleGeometryEditing() }.keyboardShortcut("c", modifiers: [])
             // Sound, on what R would turn: the selection, or the clip under the
