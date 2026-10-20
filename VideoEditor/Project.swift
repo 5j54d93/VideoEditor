@@ -438,6 +438,7 @@ struct ClipItem: Identifiable, Equatable {
     var videoPadDuration: Double = 0
 
     var isImage: Bool { kind == .image }
+    var name: String { url.lastPathComponent }
     /// The frame as the file plays it — display matrix applied, nothing of
     /// this clip's own geometry. What the players and decoders hand back.
     var sourcePixelSize: PixelSize { PixelSize(width: naturalWidth, height: naturalHeight) }

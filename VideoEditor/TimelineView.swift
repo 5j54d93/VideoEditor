@@ -1606,14 +1606,11 @@ private struct TailChip: View {
     let model: EditorModel
     let item: ClipItem
 
-    private var sourceName: String { item.tailSource == .container ? "容器" : "原音" }
+    private var sourceName: String { item.tailSourceName }
     private var canExtend: Bool {
         item.videoPadCandidate >= EditorModel.minimumWorthwhilePad
     }
-    private var amount: String {
-        let ms = item.trailingOverhangDuration * 1_000
-        return ms >= 100 ? String(format: "%.0f ms", ms) : String(format: "%.1f ms", ms)
-    }
+    private var amount: String { item.tailAmountText }
 
     var body: some View {
         HStack(spacing: 5) {

@@ -444,9 +444,10 @@ func soundAccessibilityValue(gain: Double, isMuted: Bool, fadeIn: Double, fadeOu
     return parts.joined(separator: "，")
 }
 
-/// The exact numbers, for when a drag is not precise enough: the sliders the
-/// row above the timeline used to carry, opened from a bar's menu instead.
-/// Every slider drag is one undo step, however many values it sends.
+/// The exact numbers, for when a drag is not precise enough: the toolbar's
+/// 聲音 panel for one piece of the track or one clip's own sound, and the
+/// popover a bar's 音量與淡入淡出… opens. Every slider drag is one undo step,
+/// however many values it sends.
 struct SoundShapingPanel: View {
     enum Target: Equatable {
         case piece(AudioClip.ID)
@@ -455,6 +456,8 @@ struct SoundShapingPanel: View {
 
     let model: EditorModel
     let target: Target
+    /// Nothing is selected, so this is the sound of the clip under the playhead.
+    var isUnderPlayhead = false
 
     private struct Values {
         let title: String
@@ -474,7 +477,7 @@ struct SoundShapingPanel: View {
                           fadeIn: clip.fadeIn, fadeOut: clip.fadeOut, length: clip.duration)
         case .original(let id):
             guard let item = model.items.first(where: { $0.id == id }) else { return nil }
-            return Values(title: "原音 · \(item.url.lastPathComponent)", gain: item.audioGain,
+            return Values(title: item.url.lastPathComponent, gain: item.audioGain,
                           isMuted: item.isAudioMuted, fadeIn: item.audioFadeIn,
                           fadeOut: item.audioFadeOut, length: item.displayDuration)
         }
@@ -483,9 +486,7 @@ struct SoundShapingPanel: View {
     var body: some View {
         if let values {
             VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 8) {
-                    Text(values.title).font(.headline).lineLimit(1).truncationMode(.middle)
-                    Spacer(minLength: 0)
+                AdjustmentHeader(tool: .sound, subject: values.title, isUnderPlayhead: isUnderPlayhead) {
                     Button { setMuted(!values.isMuted) } label: {
                         Image(systemName: values.isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
                             .frame(width: 16)
@@ -505,9 +506,7 @@ struct SoundShapingPanel: View {
                     setFades(values.fadeIn, fadeOut)
                 }
             }
-            .controlSize(.small)
-            .padding(14)
-            .frame(width: 300)
+            .adjustmentPanelFrame()
         }
     }
 

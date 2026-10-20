@@ -14,6 +14,11 @@ struct ContentView: View {
     @State private var exportSheet = false
     @State private var selectAllKey = SelectAllKeyMonitor()
     @State private var viewport = StageViewport()
+    /// The preview's middle, and each adjustment tool's, in window points: the
+    /// tools are moved until the two meet. See `AdjustmentAlignment`.
+    @State private var previewMidX: CGFloat?
+    @State private var toolMidX: [EditorModel.Adjustment: CGFloat] = [:]
+    @State private var toolGap: CGFloat = 0
 
     var body: some View {
         VStack(spacing: 0) {
@@ -51,6 +56,22 @@ struct ContentView: View {
             // The workspace carries its own bar, and every window control here
             // either duplicates it or acts on a pane nobody can currently see.
             if model.hasProject && !model.isGeometryEditing {
+                // The six adjustments, over the picture they change.
+                ToolbarItemGroup(placement: .primaryAction) {
+                    ForEach(EditorModel.Adjustment.allCases) { tool in
+                        AdjustmentToolButton(model: model, tool: tool) { frame in
+                            toolMidX[tool] = frame.midX
+                            alignTools()
+                        }
+                    }
+                }
+                ToolbarSpacer(.fixed, placement: .primaryAction)
+                // Widened until the tools' middle meets the preview's.
+                ToolbarItem(placement: .primaryAction) {
+                    Color.clear.frame(width: toolGap, height: 1)
+                }
+                .sharedBackgroundVisibility(.hidden)
+                ToolbarSpacer(.fixed, placement: .primaryAction)
                 // Editing comes before shipping, and the two are different kinds
                 // of act — one adjusts the project, one produces a file — so the
                 // spacer keeps them in separate groups rather than one cluster.
@@ -104,7 +125,15 @@ struct ContentView: View {
             model.isSheetPresented = presented
             // A hover already under way when the sheet rises would otherwise
             // linger until the pointer next moves.
-            if presented { model.clearTimelineHover() }
+            if presented {
+                model.clearTimelineHover()
+                model.openAdjustment = nil
+            }
+        }
+        // A panel whose tool has nothing left to act on goes: a still's
+        // 片長 when the playhead runs on into a video, 尾端 once it is dismissed.
+        .onChange(of: model.openAdjustment.map { model.canAdjust($0) } ?? true) { _, applies in
+            if !applies { model.openAdjustment = nil }
         }
     }
 
@@ -119,6 +148,17 @@ struct ContentView: View {
     private func startExport() {
         model.exportResult = nil               // reopen in setup state, not last result
         exportSheet = true
+    }
+
+    /// Moves the tools a step towards the preview's middle once both are known.
+    /// Every gap change moves the tools, so the old positions go with it and
+    /// the next step waits for the new ones.
+    private func alignTools() {
+        guard let target = previewMidX, let first = toolMidX[.crop], let last = toolMidX[.info] else { return }
+        let gap = AdjustmentAlignment.gap(current: toolGap, groupMidX: (first + last) / 2, targetMidX: target)
+        guard gap != toolGap else { return }
+        toolMidX = [:]
+        toolGap = gap
     }
 
     // MARK: Toolbar / empty
@@ -144,6 +184,10 @@ struct ContentView: View {
                     .frame(minWidth: 230, idealWidth: 300, maxWidth: 460)
                 preview
                     .frame(maxWidth: .infinity, minHeight: 160, maxHeight: .infinity)
+                    .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).midX } action: { midX in
+                        previewMidX = midX
+                        alignTools()
+                    }
                     // Darker than the canvas is black, so the canvas reads as an
                     // object sitting on the pane rather than as the pane itself.
                     .background(Color(white: 0.13))

@@ -2290,6 +2290,8 @@ final class EditorModel {
 
     func beginGeometryEditing() {
         guard activeItem != nil else { return }
+        // The workspace takes the toolbar, and the panel hanging from it.
+        openAdjustment = nil
         pauseTimelinePlayback()
         clearTimelineHover()
         if !isGeometryEditing { geometrySession = (snapshot(), undoStack.count) }
@@ -2603,6 +2605,80 @@ final class EditorModel {
             items[index].geometry = items[index].geometry
                 .turned(by: quarterTurns, source: items[index].sourcePixelSize)
         }
+    }
+
+    // MARK: Adjustments
+
+    /// The toolbar's six adjustments, in the order they stand there.
+    enum Adjustment: CaseIterable, Identifiable {
+        case crop, rotate, sound, length, tail, info
+        var id: Self { self }
+    }
+
+    /// What the toolbar's adjustments act on, by the rule R and M follow: the
+    /// selected pieces of the track, else the selected clips, else the clip
+    /// under the playhead. Both lists are in timeline order.
+    struct AdjustmentSubject: Equatable {
+        var clips: [ClipItem.ID] = []
+        var pieces: [AudioClip.ID] = []
+        /// Nothing is selected: the one clip is there because the playhead is.
+        var isUnderPlayhead = false
+    }
+
+    var adjustmentSubject: AdjustmentSubject {
+        if !selectedAudioIDs.isEmpty {
+            return AdjustmentSubject(pieces: audioClips.map(\.id).filter { selectedAudioIDs.contains($0) })
+        }
+        if !selectedIDs.isEmpty {
+            return AdjustmentSubject(clips: items.map(\.id).filter { selectedIDs.contains($0) })
+        }
+        guard let active = activeItem else { return AdjustmentSubject() }
+        return AdjustmentSubject(clips: [active.id], isUnderPlayhead: true)
+    }
+
+    /// The one clip a panel describes. 裁切, 片長, 尾端 and 資訊 take one at a
+    /// time, so a subject of sound, or of several clips, has none.
+    var adjustedClip: ClipItem? {
+        let subject = adjustmentSubject
+        guard subject.pieces.isEmpty, subject.clips.count == 1 else { return nil }
+        return items.first { $0.id == subject.clips[0] }
+    }
+
+    /// The one piece of the track a panel describes, likewise.
+    var adjustedPiece: AudioClip? {
+        let subject = adjustmentSubject
+        guard subject.pieces.count == 1 else { return nil }
+        return audioClips.first { $0.id == subject.pieces[0] }
+    }
+
+    /// The subject's clips that carry sound of their own to shape.
+    var adjustedSoundClips: [ClipItem.ID] {
+        let clips = adjustmentSubject.clips
+        return items.filter { clips.contains($0.id) && !$0.isImage && $0.hasAudio }.map(\.id)
+    }
+
+    /// Whether a tool has anything to act on. One that has not greys out, and
+    /// stays where it is.
+    func canAdjust(_ adjustment: Adjustment) -> Bool {
+        switch adjustment {
+        case .crop: adjustedClip != nil
+        case .rotate: !adjustmentSubject.clips.isEmpty
+        case .sound: !adjustmentSubject.pieces.isEmpty || !adjustedSoundClips.isEmpty
+        case .length: adjustedClip?.isImage == true
+        case .tail: (adjustedClip?.trailingOverhangDuration ?? 0) > 1e-9
+        case .info: adjustedClip != nil || adjustedPiece != nil
+        }
+    }
+
+    /// The panel standing open under its tool. One at a time; `nil` when none.
+    var openAdjustment: Adjustment?
+
+    /// 裁切's 進入裁切: the workspace opens on the clip the panel describes,
+    /// the playhead brought to it first when it stood in another.
+    func beginGeometryEditing(on id: ClipItem.ID) {
+        guard items.contains(where: { $0.id == id }) else { return }
+        if activeItemID != id { selectItem(id) }
+        beginGeometryEditing()
     }
 
     /// One undo step per call, and never one for a no-op: the inspector's number
