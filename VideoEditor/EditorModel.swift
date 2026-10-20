@@ -1797,6 +1797,48 @@ final class EditorModel {
     var canDeleteBeforePlayhead: Bool { activeInteriorEdit != nil }
     var canDeleteAfterPlayhead: Bool { activeInteriorEdit != nil }
 
+    /// Whether S has something to cut: the selected piece of the track with
+    /// the playhead inside it, or the clip under the playhead away from its
+    /// ends — the same tests `splitAtPlayhead` makes.
+    var canSplitAtPlayhead: Bool {
+        if let clip = selectedAudioClip {
+            return timelineTime > clip.timelineStart + AudioClip.minimumDuration
+                && timelineTime < clip.timelineEnd - AudioClip.minimumDuration
+        }
+        return activeInteriorEdit != nil
+    }
+
+    /// Where one clip ends and the next begins, with the movie's start and end:
+    /// the moments ↑ and ↓ move the playhead between.
+    var cutTimes: [Double] {
+        var times = [0.0]
+        var end = 0.0
+        for item in items {
+            end += item.displayDuration
+            times.append(end)
+        }
+        return times
+    }
+
+    /// ↑: back to the start of the clip the playhead is in, or to the one
+    /// before when it already sits on a cut.
+    func jumpToPreviousCut() {
+        let now = timelineTime
+        seekTimeline(to: cutTimes.last { $0 < now - 1e-6 } ?? 0)
+    }
+
+    /// ↓: on to the start of the next clip, and past the last one to the
+    /// movie's end, where the playhead parks on the exclusive boundary.
+    func jumpToNextCut() {
+        let now = timelineTime
+        guard let cut = cutTimes.first(where: { $0 > now + 1e-6 }),
+              cut < totalOutputDuration - 1e-9 else {
+            seekTimelineToEnd()
+            return
+        }
+        seekTimeline(to: cut)
+    }
+
     /// Ripple-trim the active clip from its previous edit point to the playhead.
     func deleteBeforePlayhead() {
         guard let edit = activeInteriorEdit else { return }

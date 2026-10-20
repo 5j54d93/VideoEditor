@@ -901,6 +901,49 @@ final class EditorModelTimelineTests: XCTestCase {
         XCTAssertFalse(model.isSourceMedia(music.url))
     }
 
+    /// ↑ and ↓ move the playhead between cuts: back to the start of the clip it
+    /// is in, or of the one before when it already sits on a cut; on to the
+    /// next clip's start, and past the last one to the movie's end.
+    func testTheArrowsJumpBetweenCuts() {
+        func video(_ name: String) -> LibraryAsset {
+            LibraryAsset(url: URL(fileURLWithPath: "/fixtures/\(name).mp4"),
+                         kind: .video, width: 640, height: 480,
+                         duration: 1, fps: 25, fpsRational: "25",
+                         hasAudio: true, frameTimes: [0, 0.96], frameEndTime: 1,
+                         audioStartTime: 0, audioDuration: 1)
+        }
+        let first = video("cut-a"), last = video("cut-b")
+        let still = LibraryAsset(url: URL(fileURLWithPath: "/fixtures/cut-still.png"),
+                                 kind: .image, width: 640, height: 480)
+        let model = EditorModel()
+        model.library = [first, still, last]
+        model.imageDefaultDuration = 3
+        model.insertLibraryAsset(first.id)
+        model.insertLibraryAsset(still.id)
+        model.insertLibraryAsset(last.id)
+        XCTAssertEqual(model.cutTimes, [0, 1, 4, 5])
+
+        model.seekTimeline(to: 2.5)
+        XCTAssertFalse(model.canSplitAtPlayhead, "A still has no frames to cut between")
+        model.jumpToPreviousCut()
+        XCTAssertEqual(model.timelineTime, 1, accuracy: 1e-9, "Back to the start of the clip it is in")
+        model.jumpToPreviousCut()
+        XCTAssertEqual(model.timelineTime, 0, accuracy: 1e-9, "On a cut, back to the one before")
+        model.jumpToPreviousCut()
+        XCTAssertEqual(model.timelineTime, 0, accuracy: 1e-9)
+
+        model.jumpToNextCut()
+        XCTAssertEqual(model.timelineTime, 1, accuracy: 1e-9)
+        model.jumpToNextCut()
+        XCTAssertEqual(model.timelineTime, 4, accuracy: 1e-9)
+        model.jumpToNextCut()
+        XCTAssertEqual(model.timelineTime, model.totalOutputDuration, accuracy: 1e-9,
+                       "Past the last clip, the movie's end")
+
+        model.seekTimeline(to: 0.5)
+        XCTAssertTrue(model.canSplitAtPlayhead)
+    }
+
     /// A slider drag is one undo step, however many values it sends.
     func testAGainDragIsOneUndoStep() {
         let (model, id) = trackModel()

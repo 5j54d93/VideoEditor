@@ -254,129 +254,127 @@ struct TimelineView: View {
         }
     }
 
-    /// Single toolbar row: transport / editing controls on the left, zoom on the
-    /// right.
+    /// The row over the timeline. The transport sits in its middle, beside the
+    /// time it reads, which keeps the picture above at its whole height; the
+    /// three edits a mouse reaches for most are icons on the left, each with
+    /// its key beside it, and the zoom and the tails are on the right.
+    /// Everything else this row used to carry is on the clips, in their menus
+    /// and on the keys.
     private func header(layout: TimelineLayout) -> some View {
-        HStack(spacing: 9) {
-            Button { model.togglePlay() } label: {
-                HStack(spacing: 5) {
-                    Image(systemName: "playpause.fill")
-                    KeyCapHint("Space")
-                }
+        HStack(spacing: 8) {
+            HStack(spacing: 6) {
+                Button { model.deleteBeforePlayhead() } label: { editIcon("delete.left", key: "Q") }
+                    .disabled(!model.canDeleteBeforePlayhead)
+                    .help("刪除播放頭至前一個分割點之間的內容（Q）")
+                    .accessibilityLabel("刪除左側")
+                Button { model.splitAtPlayhead() } label: { editIcon("scissors", key: "S") }
+                    .disabled(!model.canSplitAtPlayhead)
+                    .help("在播放頭分割成兩段；選著一段音訊時分割的是那段音訊（S）")
+                    .accessibilityLabel("分割")
+                Button { model.deleteAfterPlayhead() } label: { editIcon("delete.right", key: "W") }
+                    .disabled(!model.canDeleteAfterPlayhead)
+                    .help("刪除播放頭至下一個分割點之間的內容（W）")
+                    .accessibilityLabel("刪除右側")
             }
-            .help("播放／暫停（空白鍵）")
+            .frame(maxWidth: .infinity, alignment: .leading)
 
-            if model.activeItem?.isImage == false {
-                Button { model.deleteBeforePlayhead() } label: {
+            transport(totalDuration: layout.totalDuration)
+
+            HStack(spacing: 8) {
+                tailMenu
+                Image(systemName: "minus.magnifyingglass").foregroundStyle(.secondary)
+                Slider(value: Binding(
+                    get: { model.timelineZoomLevel },
+                    set: { newLevel in
+                        // Zoom about the playhead: keep it at the same viewport x while
+                        // the scale changes; if it's off-screen, bring it to centre.
+                        let oldScale = CGFloat(model.timelinePointsPerSecond)
+                        model.timelineZoomLevel = newLevel
+                        let newScale = CGFloat(model.timelinePointsPerSecond)
+                        guard newScale != oldScale else { return }
+                        let playheadX = CGFloat(model.timelineTime) * oldScale - scrollOffset
+                        let anchorX = (playheadX >= 0 && playheadX <= viewportWidth)
+                            ? playheadX : viewportWidth / 2
+                        scrollPosition.scrollTo(
+                            x: max(0, CGFloat(model.timelineTime) * newScale - anchorX))
+                    }
+                ), in: 0...1)
+                .frame(width: 130)
+                .help("時間軸縮放")
+                Image(systemName: "plus.magnifyingglass").foregroundStyle(.secondary)
+                Button {
+                    fitTimelineToViewport(totalDuration: layout.totalDuration)
+                } label: {
                     HStack(spacing: 5) {
-                        Label("刪除左側", systemImage: "delete.left")
-                        KeyCapHint("Q")
+                        Text("符合視窗")
+                        KeyCapHint("⇧Z")
                     }
                 }
-                .disabled(!model.canDeleteBeforePlayhead)
-                .help("刪除播放頭至前一個分割點之間的內容（Q）")
-                Button { model.splitAtPlayhead() } label: {
-                    HStack(spacing: 5) {
-                        Label("分割", systemImage: "scissors")
-                        KeyCapHint("S")
-                    }
-                }
-                .help("在播放頭分割成兩段；選著一段音訊時分割的是那段音訊（S）")
-                Button { model.deleteAfterPlayhead() } label: {
-                    HStack(spacing: 5) {
-                        Label("刪除右側", systemImage: "delete.right")
-                        KeyCapHint("W")
-                    }
-                }
-                .disabled(!model.canDeleteAfterPlayhead)
-                .help("刪除播放頭至下一個分割點之間的內容（W）")
-
-                if let item = model.activeItem, item.trailingOverhangDuration > 1e-9 {
-                    Button { model.dismissTrailingOverhang(for: item.id) } label: {
-                        Label("忽略尾端", systemImage: "checkmark.circle")
-                    }
-                    .help("輸出本來就會切齊影像尾端，這只會讓提示消失")
-                    if model.canExtendVideoToAudioTail {
-                        Button { model.extendVideoToAudioTail(for: item.id) } label: {
-                            Label("延長影像", systemImage: "rectangle.portrait.arrowtriangle.2.outward")
-                        }
-                        .help("在尾端補上真正的黑畫面，讓這段原音留在成品裡")
-                    }
-                }
+                .disabled(layout.totalDuration <= 0)
+                .help("自動調整縮放，讓整個成品剛好塞進時間軸的可視寬度，並捲回開頭（⇧Z）")
             }
-
-            if model.clipsWithTrailingOverhang > 1 {
-                Button { model.dismissAllTrailingOverhangs() } label: {
-                    Label("忽略全部尾端（\(model.clipsWithTrailingOverhang)）",
-                          systemImage: "checkmark.circle.badge.questionmark")
-                }
-                .help("一次確認所有片段的尾端差異；不會改變輸出")
-            }
-
-            // The clip row's split button already cuts a selected piece of the
-            // track; this one stands in only when that row has nothing to show.
-            if model.activeItem?.isImage != false, model.selectedAudioClip != nil {
-                Button { model.splitAtPlayhead() } label: {
-                    HStack(spacing: 5) {
-                        Label("分割", systemImage: "scissors")
-                        KeyCapHint("S")
-                    }
-                }
-                .help("在播放頭把選取的音訊分成兩段（S）")
-            }
-
-            let selectedCount = model.selectedIDs.count + model.selectedAudioIDs.count
-            if selectedCount > 0 {
-                Button(role: .destructive) { model.removeSelectedItems() } label: {
-                    HStack(spacing: 5) {
-                        Label(selectedCount > 1 ? "刪除 \(selectedCount) 段" : "刪除片段",
-                              systemImage: "trash")
-                        KeyCapHint("⌫")
-                    }
-                }
-                .help("從成品時間軸與輸出中移除選取的片段（⌫）")
-            }
-
-            Text(headerInfo(layout: layout))
-                .font(.system(.caption2, design: .monospaced))
-                .foregroundStyle(.tertiary)
-                .lineLimit(1)
-
-            Spacer()
-
-            Image(systemName: "minus.magnifyingglass").foregroundStyle(.secondary)
-            Slider(value: Binding(
-                get: { model.timelineZoomLevel },
-                set: { newLevel in
-                    // Zoom about the playhead: keep it at the same viewport x while
-                    // the scale changes; if it's off-screen, bring it to centre.
-                    let oldScale = CGFloat(model.timelinePointsPerSecond)
-                    model.timelineZoomLevel = newLevel
-                    let newScale = CGFloat(model.timelinePointsPerSecond)
-                    guard newScale != oldScale else { return }
-                    let playheadX = CGFloat(model.timelineTime) * oldScale - scrollOffset
-                    let anchorX = (playheadX >= 0 && playheadX <= viewportWidth)
-                        ? playheadX : viewportWidth / 2
-                    scrollPosition.scrollTo(
-                        x: max(0, CGFloat(model.timelineTime) * newScale - anchorX))
-                }
-            ), in: 0...1)
-            .frame(width: 150)
-            .help("時間軸縮放")
-            Image(systemName: "plus.magnifyingglass").foregroundStyle(.secondary)
-            Button {
-                fitTimelineToViewport(totalDuration: layout.totalDuration)
-            } label: {
-                HStack(spacing: 5) {
-                    Text("符合視窗")
-                    KeyCapHint("⇧Z")
-                }
-            }
-            .disabled(layout.totalDuration <= 0)
-            .help("自動調整縮放，讓整個成品剛好塞進時間軸的可視寬度，並捲回開頭（⇧Z）")
+            .frame(maxWidth: .infinity, alignment: .trailing)
         }
         .buttonStyle(.bordered)
         .controlSize(.small)
+    }
+
+    /// One of the edits on the left: its icon, with its key beside it the way
+    /// 符合視窗 carries ⇧Z.
+    private func editIcon(_ symbol: String, key: String) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: symbol)
+            KeyCapHint(key)
+        }
+    }
+
+    /// Previous cut, play, next cut, and where the playhead is in the movie.
+    private func transport(totalDuration: Double) -> some View {
+        HStack(spacing: 4) {
+            Button { model.jumpToPreviousCut() } label: { Image(systemName: "backward.end.fill") }
+                .buttonStyle(.borderless)
+                .disabled(totalDuration <= 0)
+                .help("前一個剪點（↑）")
+            Button { model.togglePlay() } label: {
+                Image(systemName: model.isTimelinePlaying ? "pause.fill" : "play.fill")
+                    .frame(width: 18)
+            }
+            .disabled(totalDuration <= 0)
+            .help("播放／暫停（空白鍵）")
+            Button { model.jumpToNextCut() } label: { Image(systemName: "forward.end.fill") }
+                .buttonStyle(.borderless)
+                .disabled(totalDuration <= 0)
+                .help("下一個剪點（↓）")
+            Text("\(timelineClockText(model.timelineTime)) / \(timelineClockText(totalDuration))")
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .padding(.leading, 6)
+                .accessibilityLabel("播放頭位置")
+        }
+        .fixedSize()
+    }
+
+    /// The clips whose sound or container outlives their last frame: one menu,
+    /// to go and look at a tail or to retire them all. Dismissing one alone,
+    /// or padding its picture, is on the tail's own chip and the clip's menu.
+    @ViewBuilder
+    private var tailMenu: some View {
+        let tails = model.items.filter { $0.trailingOverhangDuration > 1e-9 }
+        if !tails.isEmpty {
+            Menu {
+                ForEach(tails) { item in
+                    Button("放大到「\(item.url.lastPathComponent)」的尾端") { model.zoomToTail(for: item.id) }
+                }
+                Divider()
+                Button("忽略全部尾端（\(tails.count)）") { model.dismissAllTrailingOverhangs() }
+            } label: {
+                Label("尾端 \(tails.count)", systemImage: "waveform.badge.exclamationmark")
+                    .foregroundStyle(.orange)
+            }
+            .fixedSize()
+            .help("有 \(tails.count) 段的原音或容器比最後一格影像長；輸出會切齊影像尾端")
+        }
     }
 
     private func fitTimelineToViewport(width: CGFloat? = nil, totalDuration: Double) {
@@ -398,19 +396,6 @@ struct TimelineView: View {
         viewportWidth = width
         guard pendingAutoFit, width > 0 else { return }
         fitTimelineToViewport(width: width, totalDuration: totalDuration)
-    }
-
-    private func headerInfo(layout: TimelineLayout) -> String {
-        var s = "\(layout.entries.count) 段 · \(timelineClockText(layout.totalDuration))"
-        if model.hasProject {
-            let c = model.canvas
-            let fps = c.fpsValue == c.fpsValue.rounded()
-                ? String(format: "%.0f", c.fpsValue)
-                : String(format: "%.3f", c.fpsValue)
-            s += " · 畫布 \(c.width)×\(c.height) @ \(fps)fps"
-        }
-        if !model.audioClips.isEmpty { s += " · 音訊 \(model.audioClips.count) 段" }
-        return s
     }
 
     private func canvas(layout: TimelineLayout, track: AudioTrackLayout, width: CGFloat,

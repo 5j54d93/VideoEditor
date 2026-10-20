@@ -37,6 +37,9 @@ struct ContentView: View {
                 .allowsHitTesting(!sheetPresented)
         }
         .frame(minWidth: 1120, minHeight: 760)
+        // What the movie is, under the window's title: the row over the
+        // timeline used to say it, and that row now carries the transport.
+        .navigationSubtitle(projectSummary)
         .onAppear {
             selectAllKey.install {
                 guard !model.isTextEditing else { return false }
@@ -463,7 +466,22 @@ struct ContentView: View {
         .opacity(0).frame(width: 0, height: 0).accessibilityHidden(true)
     }
 
-    /// Arrows step frames normally and nudge the framing while reframing.
+    /// The canvas, the clips, the length and the sound on the track, or nothing
+    /// before there is a project.
+    private var projectSummary: String {
+        guard model.hasProject else { return "" }
+        let canvas = model.canvas
+        let fps = canvas.fpsValue == canvas.fpsValue.rounded()
+            ? String(format: "%.0f", canvas.fpsValue)
+            : String(format: "%.3f", canvas.fpsValue)
+        var summary = "\(canvas.width)×\(canvas.height) @ \(fps)fps · \(model.items.count) 段 · "
+            + timeFieldText(model.totalOutputDuration)
+        if !model.audioClips.isEmpty { summary += " · 音訊 \(model.audioClips.count) 段" }
+        return summary
+    }
+
+    /// Arrows step frames and ↑ ↓ move between cuts; while reframing, all four
+    /// nudge the framing.
     ///
     /// Shift is read from the event rather than distinguished by a second
     /// `keyboardShortcut`: with both `[]` and `.shift` registered for one key,
@@ -476,6 +494,10 @@ struct ContentView: View {
             model.nudgeGeometry(dx: dx, dy: dy, coarse: coarse)
         } else if dy == 0 {
             model.stepFrame(dx * (coarse ? 10 : 1))
+        } else if dy < 0 {
+            model.jumpToPreviousCut()
+        } else {
+            model.jumpToNextCut()
         }
     }
 

@@ -16,6 +16,10 @@ struct KeyCapHint: View {
     /// The compact default suits toolbar-sized buttons; larger labels pass
     /// their own font so the hint matches the text it sits next to.
     var font: Font = .system(size: 9, weight: .medium, design: .rounded)
+    /// A greyed-out button greys its hint as well. The hint sets its own
+    /// colour, which a disabled button does not touch, so on its own it would
+    /// stay at full strength beside the dimmed label.
+    @Environment(\.isEnabled) private var isEnabled
 
     init(_ key: String, prominent: Bool = false,
          font: Font = .system(size: 9, weight: .medium, design: .rounded)) {
@@ -29,6 +33,7 @@ struct KeyCapHint: View {
             .font(font)
             .foregroundStyle(prominent ? AnyShapeStyle(.white.opacity(0.85))
                                        : AnyShapeStyle(.secondary))
+            .opacity(isEnabled ? 1 : 0.4)
             .accessibilityHidden(true)   // the shortcut itself already announces
     }
 }
