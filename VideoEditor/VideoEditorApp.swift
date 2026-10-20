@@ -11,6 +11,13 @@ import SwiftUI
 struct VideoEditorApp: App {
     @State private var model = EditorModel()
 
+    /// Dark whatever the system is set to, sheets, panels and menus included.
+    /// The preview and the crop workspace were dark already: a picture is
+    /// judged against dark, which is why iMovie and Final Cut Pro are too.
+    init() {
+        NSApplication.shared.appearance = NSAppearance(named: .darkAqua)
+    }
+
     var body: some Scene {
         WindowGroup {
             ContentView(model: model)

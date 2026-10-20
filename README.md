@@ -85,6 +85,7 @@ The guarantee is intentionally scoped to the **same bundled toolchain and CPU ar
 - **SwiftUI + Observation**：a single `@Observable` `EditorModel` on the main actor, with `async`／`await` throughout and every `ffmpeg`／`ffprobe` invocation off the main thread. Export progress is parsed from ffmpeg's own `-progress pipe:1` stream, and task cancellation terminates the process through a lock-guarded box that closes the register／cancel race.
 - **Frame decoding that stays out of the way**：filmstrip tiles decode with per-tile bounded tolerances（an unbounded decode snaps to a keyframe, and x264 puts keyframes on scene changes, which would show the *next* scene）, while exact cells submit every visible cache miss as one source-time-ordered AVFoundation batch. Both caches evict a slice at a time so a hover sweep never triggers a wall of re-decodes.
 - **Zero third-party Swift dependencies**：SwiftUI, AVFoundation／AVKit, CryptoKit, Observation and Synchronization only.
+- **Dark, always**：the whole app is dark whatever the system is set to — sheets, panels and menus included — because a picture is judged against dark, as in iMovie and Final Cut Pro.
 - **繁體中文 UI**.
 
 ## Keyboard Shortcuts
