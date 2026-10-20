@@ -162,6 +162,9 @@ final class EditorModel {
     // True while a time/frame text field has keyboard focus, so single-key
     // shortcuts (space, q, w, s, i, o, delete…) don't fire mid-typing.
     var isTextEditing = false
+    /// True while a sheet stands over the editor. The menu bar stays live under
+    /// a sheet, so its keys check this before reaching past it to the editor.
+    var isSheetPresented = false
 
     private var players: [URL: AVPlayer] = [:]
     private var thumbnailerCache: [URL: Thumbnailer] = [:]

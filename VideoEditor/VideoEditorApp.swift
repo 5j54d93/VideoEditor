@@ -16,6 +16,14 @@ struct VideoEditorApp: App {
             ContentView(model: model)
         }
         .commands {
+            // The library's header and its empty state both offer this; the
+            // key lives here, once, where the menu bar shows it. Like the
+            // header's button, it is out of reach under a sheet.
+            CommandGroup(after: .newItem) {
+                Button("加入素材…") { model.pickAndImport() }
+                    .keyboardShortcut("i", modifiers: .command)
+                    .disabled(model.isSheetPresented)
+            }
             // Own the Edit menu's undo/redo so ⌘Z drives the project history
             // (the default responder-chain items would swallow the shortcut).
             // While a time/frame field has focus the items disable themselves,

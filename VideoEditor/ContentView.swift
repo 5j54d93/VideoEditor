@@ -101,6 +101,7 @@ struct ContentView: View {
             if msg != nil { exportSheet = false }   // let the error sheet stand alone
         }
         .onChange(of: sheetPresented) { _, presented in
+            model.isSheetPresented = presented
             // A hover already under way when the sheet rises would otherwise
             // linger until the pointer next moves.
             if presented { model.clearTimelineHover() }

@@ -70,9 +70,16 @@ struct LibraryPanel: View {
                 ProgressView().controlSize(.small)
             }
             if !model.library.isEmpty {
-                Button { model.pickAndImport() } label: { Image(systemName: "plus") }
-                    .keyboardShortcut("i", modifiers: .command)
-                    .help("加入素材（影片、圖片、音檔）（⌘I）")
+                // Worded, beside a plus: what it does is add to this grid, and
+                // a lone "+" did not say what it adds. ⌘I belongs to the File
+                // menu's item, so it is registered once and shown there.
+                Button { model.pickAndImport() } label: {
+                    Label("加入素材", systemImage: "plus")
+                }
+                .labelStyle(.titleAndIcon)
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help("加入素材（影片、圖片、音檔）（⌘I）")
             }
         }
         .padding(.horizontal, 10)
@@ -486,7 +493,6 @@ private struct EmptyLibraryButton: View {
             .padding([.horizontal, .bottom], 10).padding(.top, 2)
         }
         .buttonStyle(.plain)
-        .keyboardShortcut("i", modifiers: .command)
         .onHover { hovering = $0 }
         .help("加入素材（影片、圖片、音檔）（⌘I）")
     }

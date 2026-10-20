@@ -19,7 +19,7 @@ A native macOS video editor built with SwiftUI that cuts on **real** frames and 
 
 ## Media Library
 
-Drop videos, images and audio files anywhere in the window — or press <kbd>⌘</kbd><kbd>I</kbd> — and they land in the left sidebar as a card grid with thumbnails, duration badges and vitals.
+Drop videos, images and audio files anywhere in the window — or use **＋ 加入素材** in the library's header, or **File ▸ 加入素材…**（<kbd>⌘</kbd><kbd>I</kbd>）— and they land in the left sidebar as a card grid with thumbnails, duration badges and vitals.
 
 - **Probed once**：every file is inspected on import（dimensions, exact frame rate, per-frame timestamps）, so dragging the same asset onto the timeline ten times never re-probes it.
 - **Search and filter**：filter by name, or narrow the grid to videos／images／audio only.
