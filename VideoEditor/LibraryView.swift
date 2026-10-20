@@ -37,7 +37,7 @@ struct LibraryPanel: View {
                     EmptyLibraryButton { model.pickAndImport() }
                 }
             } else {
-                searchBar
+                filterBar
                     .padding(.horizontal, 10)
                     .padding(.vertical, 8)
                 if filteredAssets.isEmpty {
@@ -86,45 +86,64 @@ struct LibraryPanel: View {
         .padding(.vertical, 8)
     }
 
-    private var searchBar: some View {
-        HStack(spacing: 6) {
-            HStack(spacing: 5) {
-                Image(systemName: "magnifyingglass")
-                    .font(.caption).foregroundStyle(.secondary)
-                TextField("搜尋素材", text: $model.librarySearchText)
-                    .textFieldStyle(.plain)
-                    .font(.callout)
-                    .focused($searchFocused)
-                if !model.librarySearchText.isEmpty {
-                    Button { model.librarySearchText = "" } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .help("清除搜尋")
-                }
+    /// The search and the kinds on one line, so narrowing the grid takes no
+    /// more room than searching it did. The kinds are in plain sight — a filter
+    /// in a menu was a filter nobody knew was on — and give up their names for
+    /// their icons where the library is too narrow for both.
+    private var filterBar: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 8) {
+                searchField.frame(minWidth: 150)
+                kindPicker(iconsOnly: false)
             }
-            .padding(.horizontal, 7).padding(.vertical, 4)
-            .background(RoundedRectangle(cornerRadius: 7).fill(Color.gray.opacity(0.09)))
+            HStack(spacing: 8) {
+                searchField.frame(minWidth: 90)
+                kindPicker(iconsOnly: true)
+            }
+        }
+    }
 
-            Menu {
-                Picker("種類", selection: $model.libraryKindFilter) {
-                    Text("全部").tag(AssetKind?.none)
-                    Label("影片", systemImage: "film").tag(AssetKind?.some(.video))
-                    Label("圖片", systemImage: "photo").tag(AssetKind?.some(.image))
-                    Label("音檔", systemImage: "music.note").tag(AssetKind?.some(.audio))
+    private var searchField: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "magnifyingglass")
+                .font(.caption).foregroundStyle(.secondary)
+            TextField("搜尋素材", text: $model.librarySearchText)
+                .textFieldStyle(.plain)
+                .font(.callout)
+                .focused($searchFocused)
+            if !model.librarySearchText.isEmpty {
+                Button { model.librarySearchText = "" } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
-                .pickerStyle(.inline)
-            } label: {
-                Image(systemName: model.libraryKindFilter == nil
-                      ? "line.3.horizontal.decrease.circle"
-                      : "line.3.horizontal.decrease.circle.fill")
+                .buttonStyle(.plain)
+                .help("清除搜尋")
             }
-            .menuStyle(.button)
-            .buttonStyle(.borderless)
-            .menuIndicator(.hidden)
-            .fixedSize()
-            .help("篩選素材種類")
+        }
+        .padding(.horizontal, 7).padding(.vertical, 4)
+        .background(RoundedRectangle(cornerRadius: 7).fill(Color.gray.opacity(0.09)))
+    }
+
+    private func kindPicker(iconsOnly: Bool) -> some View {
+        Picker("種類", selection: $model.libraryKindFilter) {
+            kindLabel("全部", "square.grid.2x2", iconsOnly: iconsOnly).tag(AssetKind?.none)
+            kindLabel("影片", "film", iconsOnly: iconsOnly).tag(AssetKind?.some(.video))
+            kindLabel("圖片", "photo", iconsOnly: iconsOnly).tag(AssetKind?.some(.image))
+            kindLabel("音檔", "music.note", iconsOnly: iconsOnly).tag(AssetKind?.some(.audio))
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .controlSize(.small)
+        .fixedSize()
+        .help("依種類篩選：全部、影片、圖片、音檔")
+    }
+
+    @ViewBuilder
+    private func kindLabel(_ title: String, _ symbol: String, iconsOnly: Bool) -> some View {
+        if iconsOnly {
+            Label(title, systemImage: symbol).labelStyle(.iconOnly)
+        } else {
+            Text(title)
         }
     }
 
