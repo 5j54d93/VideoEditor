@@ -505,6 +505,8 @@ struct TimelineView: View {
                 layout.insertionIndex(at: location.x, scale: scale)
             },
             dropTime: { location in Double(location.x / scale) },
+            // The caret is up exactly while a drag is over the timeline.
+            isTargeted: { dropInsertionIndex != nil },
             setIndicator: { dropInsertionIndex = $0 },
             autoScroll: { location in updateDropAutoScroll(pointerX: location.x) },
             stopAutoScroll: { stopDropAutoScroll() },
@@ -2024,6 +2026,9 @@ private struct TimelineInsertionDropDelegate: DropDelegate {
     /// The moment under the pointer, for what lands on the track rather than
     /// in the clip order.
     let dropTime: (CGPoint) -> Double
+    /// Whether a drag is over the timeline: from `dropEntered` until
+    /// `dropExited` or `performDrop`.
+    let isTargeted: () -> Bool
     let setIndicator: (Int?) -> Void
     let autoScroll: (CGPoint) -> Void
     let stopAutoScroll: () -> Void
@@ -2038,8 +2043,15 @@ private struct TimelineInsertionDropDelegate: DropDelegate {
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
-        setIndicator(insertionIndex(info.location))
-        autoScroll(info.location)
+        // SwiftUI calls this once more after `performDrop`, while AppKit
+        // concludes the drop. The drag is over by then: taken as a move, it
+        // put the caret back and restarted the edge scroll, which nothing was
+        // left to stop — a drop near either edge left the timeline creeping
+        // on its own the moment a zoom gave it room.
+        if isTargeted() {
+            setIndicator(insertionIndex(info.location))
+            autoScroll(info.location)
+        }
         return DropProposal(operation: .move)
     }
 
