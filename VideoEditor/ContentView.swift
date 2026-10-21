@@ -34,12 +34,6 @@ struct ContentView: View {
                 // the player layer underneath; laying the workspace over the top
                 // leaves both exactly where they were for the return trip.
                 .overlay { reframingLayer }
-                // A sheet stops clicks and keys reaching the window beneath it,
-                // but AppKit keeps delivering pointer tracking there, so hover
-                // callbacks under the sheet — the timeline's scrub preview above
-                // all — carry on running. Take the editor out of hit testing for
-                // as long as any sheet stands over it.
-                .allowsHitTesting(!sheetPresented)
         }
         .frame(minWidth: 1120, minHeight: 760)
         // What the movie is, under the window's title: the row over the
@@ -147,12 +141,17 @@ struct ContentView: View {
     // MARK: Editor
 
     /// 素材庫｜預覽 在上、時間軸吃滿整個下方；兩條分割線都可拖。
+    ///
+    /// Each pane is a hosting view of its own, tracking the pointer for
+    /// itself, so each keeps it off on its own while a sheet is up.
     private var editor: some View {
         VSplitView {
             HSplitView {
                 LibraryPanel(model: model)
+                    .keepsPointerOff(sheetPresented)
                     .frame(minWidth: 230, idealWidth: 300, maxWidth: 460)
                 preview
+                    .keepsPointerOff(sheetPresented)
                     .frame(maxWidth: .infinity, minHeight: 160, maxHeight: .infinity)
                     .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).midX } action: { midX in
                         previewMidX = midX
@@ -168,6 +167,7 @@ struct ContentView: View {
             }
             .frame(maxWidth: .infinity, minHeight: 200, maxHeight: .infinity)
             bottomPane
+                .keepsPointerOff(sheetPresented)
                 .frame(maxWidth: .infinity, minHeight: 250, maxHeight: .infinity)
         }
         .background { shortcutButtons }
@@ -251,6 +251,7 @@ struct ContentView: View {
                 cropPicture(item, thumbnailer: thumbnailer, sourceRevision: sourceRevision,
                             pointsPerSourcePixel: scale)
             }
+            .keepsPointerOff(sheetPresented)
             .transition(.opacity)
             .onAppear { viewport = StageViewport() }
             // Retargeting to another clip keeps the session but not the zoom:
@@ -516,6 +517,27 @@ struct ContentView: View {
             if !urls.isEmpty { model.importAssets(urls) }
         }
         return true
+    }
+}
+
+private extension View {
+    /// Cover the view with something that takes the pointer while `active`, so
+    /// nothing under it hovers — the timeline's scrub preview above all.
+    ///
+    /// A sheet stops clicks and keys reaching the window beneath it, but AppKit
+    /// goes on delivering pointer tracking there. `allowsHitTesting(false)` did
+    /// not stop that hover, and laid over the split views it had SwiftUI wrap
+    /// them, for as long as it held, in a view that loses the toolbar's inset:
+    /// the library and the preview rode up under the toolbar every time a sheet
+    /// came down. The cover is always there and only starts taking the pointer,
+    /// so nothing under it is rebuilt or moved.
+    func keepsPointerOff(_ active: Bool) -> some View {
+        overlay {
+            Color.clear
+                .contentShape(Rectangle())
+                .allowsHitTesting(active)
+                .accessibilityHidden(true)
+        }
     }
 }
 
