@@ -303,9 +303,9 @@ struct CropStage<Content: View>: View {
                         .frame(width: interior.width, height: interior.height)
                         .placed(at: interior.origin, in: geo.size)
                         .pointingCursor(isDragging ? .closedHand : .openHand)
-                        .gesture(dragGesture(scale: scale, pane: geo.size, handle: nil) { origin, dx, dy, _ in
-                            PixelRect(x: origin.x + dx, y: origin.y + dy,
-                                      width: origin.width, height: origin.height)
+                        .gesture(dragGesture(scale: scale, pane: geo.size) { origin, dx, dy, _ in
+                            (PixelRect(x: origin.x + dx, y: origin.y + dy,
+                                       width: origin.width, height: origin.height), nil)
                         })
                 }
 
@@ -608,30 +608,38 @@ struct CropStage<Content: View>: View {
     /// several times the size of the stage and starts well outside it; a hit
     /// area cut to that shape reaches past the stage and over the window's own
     /// buttons, where it silently eats the click meant for 完成 and drags the
-    /// picture instead.
+    /// picture instead. One with nothing left on the pane is emptied rather
+    /// than taken away — see `target`.
     @ViewBuilder
     private func handles(windowRect: CGRect, scale: CGFloat, pane: CGSize) -> some View {
         ForEach(CropHandle.edges, id: \.self) { handle in
-            if let strip = onPane(edgeStrip(handle, in: windowRect), pane) {
-                Color.clear
-                    .contentShape(Rectangle())
-                    .frame(width: strip.width, height: strip.height)
-                    .placed(at: strip.origin, in: pane)
-                    .pointingCursor(handle.cursor)
-                    .gesture(resizeGesture(handle, scale: scale, pane: pane))
-            }
+            target(onPane(edgeStrip(handle, in: windowRect), pane), in: pane)
+                .pointingCursor(handle.cursor)
+                .gesture(resizeGesture(handle, scale: scale, pane: pane))
         }
         // After the edges, so a corner grab always wins the overlap.
         ForEach(CropHandle.corners, id: \.self) { handle in
-            if let box = onPane(cornerBox(handle, in: windowRect), pane) {
-                Color.clear
-                    .contentShape(Rectangle())
-                    .frame(width: box.width, height: box.height)
-                    .placed(at: box.origin, in: pane)
-                    .pointingCursor(handle.cursor)
-                    .gesture(resizeGesture(handle, scale: scale, pane: pane))
-            }
+            target(onPane(cornerBox(handle, in: windowRect), pane), in: pane)
+                .pointingCursor(handle.cursor)
+                .gesture(resizeGesture(handle, scale: scale, pane: pane))
         }
+    }
+
+    /// A handle's hit area: empty, rather than gone, while none of it is on
+    /// the pane.
+    ///
+    /// A drag can carry its own handle off the stage. Past the opposite edge,
+    /// the handle being dragged is the one sitting on the edge that holds
+    /// still, and zoomed in, auto-pan can scroll that edge out of view while
+    /// the drag goes on. SwiftUI cancels the gesture of a view that goes away,
+    /// and a cancelled drag never reaches `onEnded` — the stage would be left
+    /// holding a drag that never finishes.
+    private func target(_ rect: CGRect?, in pane: CGSize) -> some View {
+        let rect = rect ?? .zero
+        return Color.clear
+            .contentShape(Rectangle())
+            .frame(width: rect.width, height: rect.height)
+            .placed(at: rect.origin, in: pane)
     }
 
     /// The part of `rect` that is actually on the stage, or `nil` when none of
@@ -736,10 +744,13 @@ struct CropStage<Content: View>: View {
     }
 
     private func resizeGesture(_ handle: CropHandle, scale: CGFloat, pane: CGSize) -> some Gesture {
-        dragGesture(scale: scale, pane: pane, handle: handle) { origin, dx, dy, mods in
-            handle.resize(origin, dx: dx, dy: dy,
-                          lockedAspect: effectiveAspect(origin, modifiers: mods),
-                          fromCentre: mods.contains(.option))
+        dragGesture(scale: scale, pane: pane) { origin, dx, dy, mods in
+            let fromCentre = mods.contains(.option)
+            return (handle.resize(origin, dx: dx, dy: dy,
+                                  lockedAspect: effectiveAspect(origin, modifiers: mods),
+                                  fromCentre: fromCentre, in: source),
+                    handle.held(afterDragging: origin, dx: dx, dy: dy,
+                                fromCentre: fromCentre, in: source))
         }
     }
 
@@ -785,9 +796,13 @@ struct CropStage<Content: View>: View {
 
     @State private var lastPan: CGSize = .zero
 
-    private func dragGesture(scale: CGFloat, pane: CGSize, handle: CropHandle?,
-                             _ transform: @escaping (PixelRect, Int, Int,
-                                                     NSEvent.ModifierFlags) -> PixelRect)
+    /// `transform` gives the rectangle a drag asks for, and the handle whose
+    /// edges it is carrying for snapping to pull — `nil` for a move, which
+    /// carries all four. Past the opposite edge that is no longer the handle
+    /// the drag began on, but the one across from it.
+    private func dragGesture(scale: CGFloat, pane: CGSize,
+                             _ transform: @escaping (PixelRect, Int, Int, NSEvent.ModifierFlags)
+                                 -> (rect: PixelRect, held: CropHandle?))
     -> some Gesture {
         DragGesture(minimumDistance: 0)
             .onChanged { value in
@@ -805,7 +820,8 @@ struct CropStage<Content: View>: View {
                 let dx = Int((value.translation.width * step).rounded())
                 let dy = Int((value.translation.height * step).rounded())
                 let proposed = transform(origin, dx, dy, modifiers)
-                onChange(snapping(proposed, handle: handle, step: step, modifiers: modifiers))
+                onChange(snapping(proposed.rect, handle: proposed.held, step: step,
+                                  modifiers: modifiers))
                 autoPan(towards: value.location, in: pane, scale: scale)
             }
             .onEnded { _ in
@@ -946,17 +962,32 @@ enum CropHandle: CaseIterable {
         return .frameResize(position: position, directions: .all)
     }
 
-    /// The rect this drag asks for, in source pixels. Clamping into something
-    /// the exporter can render belongs to the model, which owns what a legal
-    /// window is.
+    /// The rect this drag asks for, in source pixels and inside `source`.
+    ///
+    /// Whatever the handle does not carry holds still, and the edge it does
+    /// carry goes wherever the pointer goes — across the opposite edge too,
+    /// where the rectangle simply turns inside out around it. It used to
+    /// collapse there instead: the width went negative, and the model, making
+    /// a legal window out of that, left a sliver two pixels wide — stuck to
+    /// the opposite edge, or trailing the pointer, depending on the side being
+    /// dragged.
+    ///
+    /// The frame is applied here rather than left to the model, for the same
+    /// reason. The model can only make a window legal by sliding it, and
+    /// sliding a resized one moves the edge that was holding still — an edge
+    /// run off the picture stopped at the border while the opposite one set off
+    /// the other way. A dragged edge stops at the border of the picture now,
+    /// and nothing else moves, the way the marquee does it.
     ///
     /// With a locked ratio the horizontal drag leads and the other axis follows,
     /// anchored at the corner opposite the one being held — so the corner under
     /// the pointer tracks it and the rest of the rectangle grows away from it.
+    /// At the border both axes stop together, so the ratio survives it.
     ///
     /// `fromCentre` (⌥) mirrors every edge the handle moves, so the rectangle
     /// grows around its middle instead of away from the opposite corner. It is
-    /// how you resize a crop you have already centred on a subject.
+    /// how you resize a crop you have already centred on a subject. What holds
+    /// still is then the centre line, so that is where an edge crosses over.
     ///
     /// Mirroring is why a centred resize moves the width in twos: the grabbed
     /// edge follows the pointer and the opposite one answers it, so the width
@@ -966,79 +997,145 @@ enum CropHandle: CaseIterable {
     /// the drag mapping refuses. Odd sizes come from a single edge, or from the
     /// numbers rail.
     func resize(_ rect: PixelRect, dx: Int, dy: Int, lockedAspect: Double?,
-                fromCentre: Bool = false) -> PixelRect {
-        var result = rect
-        if movesLeftEdge { result.x += dx; result.width -= dx }
-        if movesRightEdge { result.width += dx }
-        if movesTopEdge { result.y += dy; result.height -= dy }
-        if movesBottomEdge { result.height += dy }
+                fromCentre: Bool = false, in source: PixelSize) -> PixelRect {
+        guard source.isUsable else { return rect }
+        var (x, y) = runs(rect, dx: dx, dy: dy, fromCentre: fromCentre, in: source)
 
-        if fromCentre {
-            if movesLeftEdge || movesRightEdge {
-                let delta = movesLeftEdge ? -dx : dx
-                result.x = rect.x - delta
-                result.width = max(2, rect.width + delta * 2)
-            }
-            if movesTopEdge || movesBottomEdge {
-                let delta = movesTopEdge ? -dy : dy
-                result.y = rect.y - delta
-                result.height = max(2, rect.height + delta * 2)
-            }
-            guard let aspect = lockedAspect, aspect > 0 else { return result }
-            // Keep the centre fixed while the ratio re-derives the short axis.
-            let centreX = rect.x + rect.width / 2
-            let centreY = rect.y + rect.height / 2
-            let width: Int, height: Int
-            if abs(dx) >= abs(dy) {
-                width = max(2, result.width)
-                height = max(2, Int((Double(width) / aspect).rounded()))
+        if let aspect = lockedAspect, aspect > 0 {
+            // An edge leads on the axis it owns, and the other one is derived
+            // around the rectangle's own centre line; hinging the whole shape
+            // off one corner instead would make dragging the right edge also
+            // walk the rectangle downwards. A corner takes whichever axis the
+            // pointer moved further on, so a diagonal drag feels like it is
+            // following the hand rather than one chosen axis.
+            let widthLeads = isCorner ? abs(dx) >= abs(dy) : movesLeftEdge || movesRightEdge
+            // Held to its own room and to what the other axis's room allows
+            // it, which is what keeps the ratio exact when a drag runs into the
+            // border, instead of the rectangle quietly squashing against it.
+            if widthLeads {
+                x.length = max(2, min(x.length, x.room, Int(Double(y.room) * aspect)))
+                y.length = max(2, Int((Double(x.length) / aspect).rounded()))
             } else {
-                height = max(2, result.height)
-                width = max(2, Int((Double(height) * aspect).rounded()))
+                y.length = max(2, min(y.length, y.room, Int(Double(x.room) / aspect)))
+                x.length = max(2, Int((Double(y.length) * aspect).rounded()))
             }
-            return PixelRect(x: centreX - width / 2, y: centreY - height / 2,
-                             width: width, height: height)
+        }
+        return PixelRect(x: x.start, y: y.start, width: x.length, height: y.length)
+    }
+
+    /// The handle a drag that started on this one is holding by now. Once it
+    /// has carried an edge across the opposite one — or, with ⌥, across the
+    /// centre line — the edge under the pointer belongs to the handle on the
+    /// far side.
+    func held(afterDragging rect: PixelRect, dx: Int, dy: Int, fromCentre: Bool,
+              in source: PixelSize) -> CropHandle {
+        guard source.isUsable else { return self }
+        let (x, y) = runs(rect, dx: dx, dy: dy, fromCentre: fromCentre, in: source)
+        return mirrored(horizontally: x.isCrossed, vertically: y.isCrossed)
+    }
+
+    /// The handle in this one's place on a rectangle turned inside out, across
+    /// one axis or both.
+    func mirrored(horizontally: Bool, vertically: Bool) -> CropHandle {
+        let unit = CGPoint(x: horizontally ? 1 - self.unit.x : self.unit.x,
+                           y: vertically ? 1 - self.unit.y : self.unit.y)
+        return Self.allCases.first { $0.unit == unit } ?? self
+    }
+
+    private func runs(_ rect: PixelRect, dx: Int, dy: Int, fromCentre: Bool,
+                      in source: PixelSize) -> (x: Run, y: Run) {
+        (Run(from: rect.x, length: rect.width, by: dx,
+             movingStart: movesLeftEdge, movingEnd: movesRightEdge,
+             fromCentre: fromCentre, within: source.width),
+         Run(from: rect.y, length: rect.height, by: dy,
+             movingStart: movesTopEdge, movingEnd: movesBottomEdge,
+             fromCentre: fromCentre, within: source.height))
+    }
+
+    /// One axis of a resize, measured from whatever holds still on it.
+    ///
+    /// That is the edge opposite the one being dragged, or the centre line —
+    /// with ⌥, and on an axis the handle does not carry at all, which is the
+    /// line a locked ratio derives that axis around. The dragged edge can end
+    /// up on either side of it.
+    private struct Run {
+        enum Pivot {
+            case edge(Int)
+            /// Doubled, so that a centre line falling between two pixels is
+            /// still a whole number.
+            case centre(doubled: Int)
         }
 
-        guard let aspect = lockedAspect, aspect > 0 else { return result }
+        let pivot: Pivot
+        /// +1 when the run goes from the pivot towards larger coordinates.
+        let direction: Int
+        /// Whether the dragged edge has gone across the pivot, turning the run
+        /// round to its other side.
+        let isCrossed: Bool
+        var length: Int
+        /// The longest run the frame has room for, the way this one goes.
+        let room: Int
+        let limit: Int
 
-        // An edge handle under a locked ratio: the axis it owns leads, and the
-        // other one is derived around the rectangle's own centre line. Falling
-        // through to the corner logic below would instead hinge the whole shape
-        // off one corner, so dragging the right edge would also walk the
-        // rectangle downwards.
-        if !isCorner {
-            if movesLeftEdge || movesRightEdge {
-                let width = max(2, result.width)
-                let height = max(2, Int((Double(width) / aspect).rounded()))
-                return PixelRect(x: result.x,
-                                 y: rect.y + (rect.height - height) / 2,
-                                 width: width, height: height)
+        init(from start: Int, length: Int, by delta: Int,
+             movingStart: Bool, movingEnd: Bool, fromCentre: Bool, within limit: Int) {
+            self.limit = limit
+            guard movingStart || movingEnd else {
+                pivot = .centre(doubled: 2 * start + length)
+                direction = 1
+                isCrossed = false
+                self.length = length
+                room = limit
+                return
             }
-            let height = max(2, result.height)
-            let width = max(2, Int((Double(height) * aspect).rounded()))
-            return PixelRect(x: rect.x + (rect.width - width) / 2,
-                             y: result.y,
-                             width: width, height: height)
+            // The way the run goes before any crossing: from the pivot towards
+            // the edge being dragged.
+            let outward = movingEnd ? 1 : -1
+            // A dragged edge stops at the border of the picture.
+            let edge = min(max(0, (movingEnd ? start + length : start) + delta), limit)
+            let pivot: Pivot
+            let reach: Int   // the run's length, negative once across the pivot
+            if fromCentre {
+                let doubled = 2 * start + length
+                pivot = .centre(doubled: doubled)
+                reach = (2 * edge - doubled) * outward
+            } else {
+                let anchor = movingEnd ? start : start + length
+                pivot = .edge(anchor)
+                reach = (edge - anchor) * outward
+            }
+            // Across only once a whole minimum window fits past the pivot.
+            // Short of that the run keeps its two pixels on the side it started
+            // from, which is also the side sure to have room for them.
+            let isCrossed = reach <= -2
+            let direction = isCrossed ? -outward : outward
+            let room: Int
+            switch pivot {
+            case .edge(let anchor):
+                room = direction > 0 ? limit - anchor : anchor
+            case .centre(let doubled):
+                room = min(doubled, 2 * limit - doubled)
+            }
+            self.pivot = pivot
+            self.direction = direction
+            self.isCrossed = isCrossed
+            self.room = room
+            self.length = min(max(2, abs(reach)), room)
         }
 
-        // Take whichever axis the pointer moved further on, so a diagonal drag
-        // feels like it is following the hand rather than one chosen axis.
-        let width: Int
-        let height: Int
-        if abs(dx) >= abs(dy) {
-            width = max(2, result.width)
-            height = max(2, Int((Double(width) / aspect).rounded()))
-        } else {
-            height = max(2, result.height)
-            width = max(2, Int((Double(height) * aspect).rounded()))
+        /// Where a run of the current length begins. Kept on the frame, which
+        /// only ever moves a run the handle is not carrying: centring the axis
+        /// a locked ratio derives can reach past the border.
+        var start: Int {
+            let start: Int
+            switch pivot {
+            case .edge(let anchor):
+                start = direction > 0 ? anchor : anchor - length
+            case .centre(let doubled):
+                start = (doubled - length) / 2
+            }
+            return min(max(0, start), limit - length)
         }
-        // Re-anchor: the far edges stay where they were.
-        let anchorX = movesLeftEdge ? rect.x + rect.width : rect.x
-        let anchorY = movesTopEdge ? rect.y + rect.height : rect.y
-        return PixelRect(x: movesLeftEdge ? anchorX - width : anchorX,
-                         y: movesTopEdge ? anchorY - height : anchorY,
-                         width: width, height: height)
     }
 
     var movesLeftEdge: Bool { self == .topLeft || self == .left || self == .bottomLeft }

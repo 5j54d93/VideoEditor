@@ -18,15 +18,16 @@ final class CropDragTests: XCTestCase {
         Int((points * StageViewport.sourcePixelsPerPoint(scale: scale)).rounded())
     }
 
-    /// Every width a handle can be dragged to, from a whole-frame start, with a
-    /// pointer that reports whole points.
+    /// Every width a handle can be dragged to, from `width` with room to spare
+    /// either side of it, with a pointer that reports whole points.
     private func reachableWidths(_ handle: CropHandle, from width: Int,
                                  scale: CGFloat, fromCentre: Bool = false) -> Set<Int> {
         var widths: Set<Int> = []
         for points in stride(from: CGFloat(-40), through: 40, by: 1) {
-            let moved = handle.resize(PixelRect(x: 0, y: 0, width: width, height: 1080),
+            let moved = handle.resize(PixelRect(x: width / 2, y: 0, width: width, height: 1080),
                                       dx: delta(points: points, scale: scale),
-                                      dy: 0, lockedAspect: nil, fromCentre: fromCentre)
+                                      dy: 0, lockedAspect: nil, fromCentre: fromCentre,
+                                      in: PixelSize(width: width * 2, height: 1080))
             widths.insert(moved.width)
         }
         return widths
@@ -85,7 +86,7 @@ final class CropDragTests: XCTestCase {
         XCTAssertFalse(widths.contains(where: { $0 % 2 != 0 }))
         XCTAssertEqual(CropHandle.right.resize(PixelRect(x: 100, y: 0, width: 200, height: 100),
                                                dx: 3, dy: 0, lockedAspect: nil,
-                                               fromCentre: true),
+                                               fromCentre: true, in: source),
                        PixelRect(x: 97, y: 0, width: 206, height: 100))
     }
 
@@ -243,7 +244,7 @@ final class CropDragTests: XCTestCase {
         let source = PixelSize(width: 1920, height: 1080)
         let dragged = CropHandle.right.resize(
             PixelRect(x: 0, y: 0, width: 1920, height: 1080),
-            dx: delta(points: -1, scale: 1), dy: 0, lockedAspect: nil)
+            dx: delta(points: -1, scale: 1), dy: 0, lockedAspect: nil, in: source)
 
         XCTAssertEqual(dragged.width, 1919)
         XCTAssertEqual(dragged.clampedWindow(in: source).width, 1919)

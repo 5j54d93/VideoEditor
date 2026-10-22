@@ -344,13 +344,13 @@ final class ClipGeometryTests: XCTestCase {
     func testHandlesMoveOnlyTheirOwnEdges() {
         let rect = PixelRect(x: 100, y: 100, width: 400, height: 300)
 
-        XCTAssertEqual(CropHandle.topLeft.resize(rect, dx: 20, dy: 10, lockedAspect: nil),
+        XCTAssertEqual(CropHandle.topLeft.resize(rect, dx: 20, dy: 10, lockedAspect: nil, in: frame),
                        PixelRect(x: 120, y: 110, width: 380, height: 290))
-        XCTAssertEqual(CropHandle.bottomRight.resize(rect, dx: 20, dy: 10, lockedAspect: nil),
+        XCTAssertEqual(CropHandle.bottomRight.resize(rect, dx: 20, dy: 10, lockedAspect: nil, in: frame),
                        PixelRect(x: 100, y: 100, width: 420, height: 310))
-        XCTAssertEqual(CropHandle.top.resize(rect, dx: 999, dy: 10, lockedAspect: nil),
+        XCTAssertEqual(CropHandle.top.resize(rect, dx: 999, dy: 10, lockedAspect: nil, in: frame),
                        PixelRect(x: 100, y: 110, width: 400, height: 290))
-        XCTAssertEqual(CropHandle.left.resize(rect, dx: 20, dy: 999, lockedAspect: nil),
+        XCTAssertEqual(CropHandle.left.resize(rect, dx: 20, dy: 999, lockedAspect: nil, in: frame),
                        PixelRect(x: 120, y: 100, width: 380, height: 300))
     }
 
@@ -358,12 +358,12 @@ final class ClipGeometryTests: XCTestCase {
     /// under the pointer is the one that moves.
     func testLockedHandleKeepsTheRatioAndTheFarCorner() {
         let rect = PixelRect(x: 100, y: 100, width: 400, height: 400)   // 1:1
-        let resized = CropHandle.bottomRight.resize(rect, dx: 100, dy: 0, lockedAspect: 1)
+        let resized = CropHandle.bottomRight.resize(rect, dx: 100, dy: 0, lockedAspect: 1, in: frame)
 
         XCTAssertEqual(resized, PixelRect(x: 100, y: 100, width: 500, height: 500))
 
         // Dragging the top-left corner moves the origin, not the far edges.
-        let fromTopLeft = CropHandle.topLeft.resize(rect, dx: 100, dy: 0, lockedAspect: 1)
+        let fromTopLeft = CropHandle.topLeft.resize(rect, dx: 100, dy: 0, lockedAspect: 1, in: frame)
         XCTAssertEqual(fromTopLeft.x + fromTopLeft.width, 500)
         XCTAssertEqual(fromTopLeft.y + fromTopLeft.height, 500)
         XCTAssertEqual(fromTopLeft.width, fromTopLeft.height)
@@ -384,28 +384,159 @@ final class ClipGeometryTests: XCTestCase {
 
         // Widen by 100 from the right: the height follows, and the rectangle
         // grows evenly above and below rather than hinging off the top edge.
-        let wider = CropHandle.right.resize(rect, dx: 100, dy: 0, lockedAspect: 1)
+        let wider = CropHandle.right.resize(rect, dx: 100, dy: 0, lockedAspect: 1, in: frame)
         XCTAssertEqual(wider, PixelRect(x: 100, y: 50, width: 500, height: 500))
 
         // The left edge tracks the pointer while the far edge stays put.
-        let fromLeft = CropHandle.left.resize(rect, dx: -100, dy: 0, lockedAspect: 1)
+        let fromLeft = CropHandle.left.resize(rect, dx: -100, dy: 0, lockedAspect: 1, in: frame)
         XCTAssertEqual(fromLeft.x, 0)
         XCTAssertEqual(fromLeft.x + fromLeft.width, 500)
         XCTAssertEqual(fromLeft.width, fromLeft.height)
 
         // A vertical edge leads on its own axis.
-        let taller = CropHandle.bottom.resize(rect, dx: 0, dy: 200, lockedAspect: 1)
+        let taller = CropHandle.bottom.resize(rect, dx: 0, dy: 200, lockedAspect: 1, in: frame)
         XCTAssertEqual(taller, PixelRect(x: 0, y: 100, width: 600, height: 600))
     }
 
     /// Unlocked, an edge moves only its own edge and nothing else.
     func testFreeEdgeHandleTouchesOneAxisOnly() {
         let rect = PixelRect(x: 100, y: 100, width: 400, height: 300)
-        let resized = CropHandle.right.resize(rect, dx: 60, dy: 40, lockedAspect: nil)
+        let resized = CropHandle.right.resize(rect, dx: 60, dy: 40, lockedAspect: nil, in: frame)
         XCTAssertEqual(resized, PixelRect(x: 100, y: 100, width: 460, height: 300))
     }
 
+    // MARK: Crossing the opposite edge
+
+    /// An edge dragged across the one opposite it keeps going, and the
+    /// rectangle turns inside out around the edge that held still. It used to
+    /// collapse there instead, to a sliver two pixels wide.
+    func testAnEdgeCarriesOnAcrossTheOppositeOne() {
+        let rect = PixelRect(x: 100, y: 100, width: 400, height: 300)
+
+        // Fifty past the opposite edge, from every side.
+        XCTAssertEqual(CropHandle.right.resize(rect, dx: -450, dy: 0, lockedAspect: nil, in: frame),
+                       PixelRect(x: 50, y: 100, width: 50, height: 300))
+        XCTAssertEqual(CropHandle.left.resize(rect, dx: 450, dy: 0, lockedAspect: nil, in: frame),
+                       PixelRect(x: 500, y: 100, width: 50, height: 300))
+        XCTAssertEqual(CropHandle.bottom.resize(rect, dx: 0, dy: -350, lockedAspect: nil, in: frame),
+                       PixelRect(x: 100, y: 50, width: 400, height: 50))
+        XCTAssertEqual(CropHandle.top.resize(rect, dx: 0, dy: 350, lockedAspect: nil, in: frame),
+                       PixelRect(x: 100, y: 400, width: 400, height: 50))
+
+        // A corner crosses each axis on its own.
+        XCTAssertEqual(CropHandle.bottomRight.resize(rect, dx: -450, dy: 0,
+                                                     lockedAspect: nil, in: frame),
+                       PixelRect(x: 50, y: 100, width: 50, height: 300))
+        XCTAssertEqual(CropHandle.bottomRight.resize(rect, dx: -450, dy: -350,
+                                                     lockedAspect: nil, in: frame),
+                       PixelRect(x: 50, y: 50, width: 50, height: 50))
+    }
+
+    /// All the way across, the edge under the pointer stays under it and the
+    /// opposite one never moves. The only give is the minimum window: within a
+    /// pixel of the opposite edge, the rectangle keeps the two it has to have.
+    func testTheDraggedEdgeFollowsThePointerAllTheWayAcross() {
+        let rect = PixelRect(x: 100, y: 100, width: 400, height: 300)
+        for dx in stride(from: 0, through: -500, by: -1) {
+            let pointer = rect.x + rect.width + dx
+            let moved = CropHandle.right.resize(rect, dx: dx, dy: 0, lockedAspect: nil, in: frame)
+            let edges = [moved.x, moved.x + moved.width]
+
+            XCTAssertTrue(edges.contains(rect.x), "the opposite edge moved at \(dx)")
+            if abs(pointer - rect.x) >= 2 {
+                XCTAssertTrue(edges.contains(pointer), "the edge left the pointer at \(dx)")
+            }
+        }
+    }
+
+    /// Past the opposite edge the drag is holding the handle on the far side,
+    /// whose edges are the ones snapping has to pull.
+    func testADragAcrossIsHoldingTheFarHandle() {
+        let rect = PixelRect(x: 100, y: 100, width: 400, height: 300)
+        func held(_ handle: CropHandle, dx: Int, dy: Int, fromCentre: Bool = false) -> CropHandle {
+            handle.held(afterDragging: rect, dx: dx, dy: dy, fromCentre: fromCentre, in: frame)
+        }
+
+        XCTAssertEqual(held(.right, dx: -100, dy: 0), .right)
+        XCTAssertEqual(held(.right, dx: -450, dy: 0), .left)
+        XCTAssertEqual(held(.top, dx: 999, dy: 350), .bottom)
+        XCTAssertEqual(held(.bottomRight, dx: -450, dy: 0), .bottomLeft)
+        XCTAssertEqual(held(.bottomRight, dx: -450, dy: -350), .topLeft)
+
+        // ⌥ holds the centre line still, so that is where the crossing is.
+        XCTAssertEqual(held(.right, dx: -150, dy: 0, fromCentre: true), .right)
+        XCTAssertEqual(held(.right, dx: -250, dy: 0, fromCentre: true), .left)
+    }
+
+    /// A locked corner crosses about the same still corner and keeps its ratio
+    /// on the far side; a locked edge still derives the other axis about the
+    /// centre line.
+    func testALockedDragCarriesOnAcrossWithItsRatio() {
+        let rect = PixelRect(x: 100, y: 100, width: 400, height: 400)   // 1:1
+
+        XCTAssertEqual(CropHandle.bottomRight.resize(rect, dx: -450, dy: 0,
+                                                     lockedAspect: 1, in: frame),
+                       PixelRect(x: 50, y: 100, width: 50, height: 50))
+        XCTAssertEqual(CropHandle.bottomRight.resize(rect, dx: -450, dy: -450,
+                                                     lockedAspect: 1, in: frame),
+                       PixelRect(x: 50, y: 50, width: 50, height: 50))
+        XCTAssertEqual(CropHandle.right.resize(rect, dx: -450, dy: 0, lockedAspect: 1, in: frame),
+                       PixelRect(x: 50, y: 275, width: 50, height: 50))
+    }
+
+    /// With ⌥ the edge crosses at the centre line, which is where the opposite
+    /// edge, answering it, crosses too.
+    func testACentredDragCrossesAtTheCentreLine() {
+        let rect = PixelRect(x: 100, y: 0, width: 200, height: 100)   // centred on 200
+
+        XCTAssertEqual(CropHandle.right.resize(rect, dx: -150, dy: 0, lockedAspect: nil,
+                                               fromCentre: true, in: frame),
+                       PixelRect(x: 150, y: 0, width: 100, height: 100))
+    }
+
+    // MARK: The border of the picture
+
+    /// A dragged edge stops at the border of the picture, and the opposite one
+    /// stays where it was. Left to the model, which can only make a window
+    /// legal by sliding it, an edge run off the picture stopped at the border
+    /// while the opposite one set off the other way.
+    func testAnEdgeStopsAtTheBorderAndTheOppositeOneHolds() {
+        let rect = PixelRect(x: 100, y: 100, width: 400, height: 300)
+
+        let outwards = CropHandle.left.resize(rect, dx: -300, dy: 0, lockedAspect: nil, in: frame)
+        XCTAssertEqual(outwards, PixelRect(x: 0, y: 100, width: 500, height: 300))
+        XCTAssertEqual(outwards.clampedWindow(in: frame), outwards)
+
+        // Across the opposite edge and on off the picture: the same border.
+        let across = CropHandle.right.resize(rect, dx: -2000, dy: 0, lockedAspect: nil, in: frame)
+        XCTAssertEqual(across, PixelRect(x: 0, y: 100, width: 100, height: 300))
+        XCTAssertEqual(across.clampedWindow(in: frame), across)
+    }
+
+    /// Against the border a locked corner shortens both axes together and the
+    /// far corner holds. The model used to clamp each axis on its own, which
+    /// squashed the ratio to the frame's and slid the far corner off its place.
+    func testALockedCornerStopsAtTheBorderWithItsRatio() {
+        let rect = PixelRect(x: 100, y: 100, width: 400, height: 400)   // 1:1
+
+        XCTAssertEqual(CropHandle.bottomRight.resize(rect, dx: 2000, dy: 0,
+                                                     lockedAspect: 1, in: frame),
+                       PixelRect(x: 100, y: 100, width: 980, height: 980))
+    }
+
+    /// ⌥ stops where the nearer border leaves no more room, still centred.
+    func testACentredDragStopsAtTheNearerBorder() {
+        let rect = PixelRect(x: 100, y: 0, width: 200, height: 100)   // centred on 200
+
+        XCTAssertEqual(CropHandle.right.resize(rect, dx: 500, dy: 0, lockedAspect: nil,
+                                               fromCentre: true, in: frame),
+                       PixelRect(x: 0, y: 0, width: 400, height: 100))
+    }
+
     // MARK: Helpers
+
+    /// The picture the handle tests drag inside.
+    private let frame = PixelSize(width: 1920, height: 1080)
 
     private func canvas(_ size: PixelSize) -> CanvasSpec {
         CanvasSpec(width: size.width, height: size.height, fps: "30", fpsValue: 30)
