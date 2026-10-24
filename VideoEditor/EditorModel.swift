@@ -1688,10 +1688,12 @@ final class EditorModel {
         imageDurationEditingSession = nil
     }
 
+    static let minimumStillDuration = 0.1
+
     func setImageDuration(_ seconds: Double, for id: ClipItem.ID) {
         pauseTimelinePlayback()
         guard let index = items.firstIndex(where: { $0.id == id }), items[index].isImage else { return }
-        let newValue = max(0.1, seconds)
+        let newValue = max(Self.minimumStillDuration, seconds)
         guard newValue != items[index].outPoint else { return }
         if var session = imageDurationEditingSession, session.itemID == id {
             if !session.hasRegisteredUndo {
@@ -1710,6 +1712,26 @@ final class EditorModel {
         // playhead included, and the playhead goes with that clip rather than
         // staying at a moment that now shows something else.
         syncTimelineTimeFromActive()
+    }
+
+    /// The length that ends a still where the track's sound ends — one
+    /// picture held for exactly a whole song, which no drag or slider can be
+    /// trusted to hit. `nil` when there is no sound, when it stops before the
+    /// still could begin, or when the still ends there already.
+    func stillLengthToSoundEnd(for id: ClipItem.ID) -> Double? {
+        guard let item = items.first(where: { $0.id == id }), item.isImage,
+              let start = timelineStart(for: id),
+              let soundEnd = audioClips.map(\.timelineEnd).max() else { return nil }
+        let length = soundEnd - start
+        guard length >= Self.minimumStillDuration,
+              abs(length - item.displayDuration) > 1e-9 else { return nil }
+        return length
+    }
+
+    /// Stretch or cut a still to end where the sound does, in one step.
+    func endStillWithSound(_ id: ClipItem.ID) {
+        guard let length = stillLengthToSoundEnd(for: id) else { return }
+        setImageDuration(length, for: id)
     }
 
     func setTrimStart(_ time: Double, for id: ClipItem.ID) {

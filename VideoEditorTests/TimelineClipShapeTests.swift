@@ -47,4 +47,24 @@ final class TimelineClipShapeTests: XCTestCase {
         XCTAssertEqual(StillLength.duration(from: 3, dragging: .trailing, by: 0.123_456), 3.12)
         XCTAssertEqual(StillLength.duration(from: 3, dragging: .leading, by: 0.006), 2.99)
     }
+
+    /// Within six points of where a piece of sound starts or ends, the end
+    /// lands on it exactly rather than on the nearest hundredth — however
+    /// odd the moment, and from either end. Further off, it is left alone.
+    func testAStillsEndIsPulledOntoTheEndsOfTheSound() {
+        let songEnd = 204.362_7
+        // A still from 1 s, its end dragged to 3 pt short of the song's end at 10 pt/s.
+        XCTAssertEqual(StillLength.duration(from: 3, dragging: .trailing, by: songEnd - 1 - 3 - 0.3,
+                                            start: 1, snaps: [0, songEnd], pointsPerSecond: 10),
+                       songEnd - 1, accuracy: 1e-12)
+        XCTAssertEqual(StillLength.duration(from: 3, dragging: .leading, by: -(songEnd - 1 - 3 + 0.4),
+                                            start: 1, snaps: [0, songEnd], pointsPerSecond: 10),
+                       songEnd - 1, accuracy: 1e-12)
+        XCTAssertEqual(StillLength.duration(from: 3, dragging: .trailing, by: songEnd - 1 - 3 - 0.7,
+                                            start: 1, snaps: [0, songEnd], pointsPerSecond: 10),
+                       202.66, accuracy: 1e-12, "Seven points off is not near enough")
+        XCTAssertEqual(StillLength.duration(from: 3, dragging: .leading, by: 2.95,
+                                            start: 1, snaps: [1], pointsPerSecond: 72),
+                       0.05, accuracy: 1e-12, "A moment at the still's own start is no end for it")
+    }
 }

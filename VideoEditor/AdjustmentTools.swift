@@ -397,6 +397,9 @@ private struct LengthAdjustment: View {
                         .font(.system(.callout, design: .monospaced))
                         .frame(width: 56, alignment: .trailing)
                 }
+                Button("與音訊同時結束") { model.endStillWithSound(item.id) }
+                    .disabled(model.stillLengthToSoundEnd(for: item.id) == nil)
+                    .help("讓這張圖片一直顯示到最後一段音訊結束，長短都會剛好")
             }
             .adjustmentPanelFrame()
         }

@@ -57,10 +57,19 @@ enum StillLength {
     /// The length a drag `reach` seconds along an end leaves. The end follows
     /// the pointer. The start cannot — the clip before holds it, as it holds
     /// every clip in the movie — so it gives the same length from the other
-    /// side: out longer, in shorter. In hundredths, as the clip reads it.
+    /// side: out longer, in shorter. In hundredths, as the clip reads it,
+    /// unless that puts the end within a few points of a moment in `snaps`:
+    /// then exactly there, so a still can end where a song does.
     static func duration(from original: Double, dragging edge: HorizontalEdge,
-                         by reach: Double) -> Double {
+                         by reach: Double, start: Double = 0, snaps: [Double] = [],
+                         pointsPerSecond: CGFloat = 1) -> Double {
         let seconds = edge == .trailing ? original + reach : original - reach
+        let end = start + seconds
+        if let nearest = snaps.min(by: { abs($0 - end) < abs($1 - end) }),
+           nearest > start,
+           abs(nearest - end) * Double(pointsPerSecond) <= Double(SoundBarGeometry.snapReach) {
+            return nearest - start
+        }
         return (seconds * 100).rounded() / 100
     }
 }
@@ -982,6 +991,8 @@ private struct TimelineClipView: View {
         let edge: HorizontalEdge
         let original: Double
         var readoutX: CGFloat
+        /// Whether the end sits exactly on a piece of sound's start or end.
+        var aligned = false
     }
 
     private struct SoundDrag {
@@ -1053,7 +1064,8 @@ private struct TimelineClipView: View {
         .overlay(alignment: .topLeading) {
             // Above the still, beside the pointer: how long it is now.
             if let lengthDrag {
-                SoundReadout(text: String(format: "片長 %.2f 秒", item.displayDuration))
+                SoundReadout(text: String(format: "片長 %.2f 秒", item.displayDuration)
+                                + (lengthDrag.aligned ? " · 對齊音訊" : ""))
                     .offset(x: lengthDrag.readoutX + 10, y: -22)
             }
         }
@@ -1084,6 +1096,13 @@ private struct TimelineClipView: View {
                 Button("原音音量與淡入淡出…") { model.openSoundPanel(forClip: item.id) }
                 Button("分離原音") { model.detachOriginalAudio(from: item.id) }
                     .disabled(item.isAudioMuted)
+                Divider()
+            }
+            if item.isImage {
+                // This still alone, wherever the click was: only one clip can
+                // end where the sound does.
+                Button("與音訊同時結束") { model.endStillWithSound(item.id) }
+                    .disabled(model.stillLengthToSoundEnd(for: item.id) == nil)
                 Divider()
             }
             Button("向右旋轉 90°") { model.rotateItems(targets, by: 1) }
@@ -1222,9 +1241,16 @@ private struct TimelineClipView: View {
                 }
                 guard var drag = lengthDrag else { return }
                 let reach = Double(value.translation.width / pointsPerSecond)
-                model.setImageDuration(StillLength.duration(from: drag.original, dragging: drag.edge,
-                                                            by: reach),
-                                       for: item.id)
+                // The track's sound stays where it is while the clips move,
+                // so its pieces' ends are what the still's end is pulled
+                // onto — a song's end above all. ⌘ drags freely.
+                let snaps = NSEvent.modifierFlags.contains(.command) ? []
+                    : model.audioClips.flatMap { [$0.timelineStart, $0.timelineEnd] }
+                let seconds = StillLength.duration(from: drag.original, dragging: drag.edge,
+                                                   by: reach, start: timelineStart, snaps: snaps,
+                                                   pointsPerSecond: pointsPerSecond)
+                model.setImageDuration(seconds, for: item.id)
+                drag.aligned = snaps.contains { abs($0 - (timelineStart + seconds)) < 1e-9 }
                 drag.readoutX = value.location.x - CGFloat(timelineStart) * pointsPerSecond
                 lengthDrag = drag
                 NSCursor.resizeLeftRight.set()

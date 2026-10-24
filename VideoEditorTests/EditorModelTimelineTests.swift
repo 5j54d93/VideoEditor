@@ -58,6 +58,39 @@ final class EditorModelTimelineTests: XCTestCase {
         XCTAssertEqual(model.timelineTime, 4, accuracy: 1e-9)
     }
 
+    /// A song alone on the track, then a still that should last exactly as
+    /// long as the song: one step does it, and one undo takes it back. With
+    /// no sound, sound that stops before the still begins, or a still that
+    /// already ends with it, there is nothing to do.
+    func testAStillCanEndExactlyWhereTheSoundDoes() {
+        let image = LibraryAsset(url: URL(fileURLWithPath: "/fixtures/still.png"),
+                                 kind: .image, width: 640, height: 480)
+        let song = LibraryAsset(url: URL(fileURLWithPath: "/fixtures/song.m4a"),
+                                kind: .audio, duration: 204.362_7)
+        let model = EditorModel()
+        model.library = [image, song]
+        model.imageDefaultDuration = 3
+        model.insertLibraryAsset(image.id)
+        XCTAssertNil(model.stillLengthToSoundEnd(for: model.items[0].id), "No sound to end with")
+        model.undo()
+
+        model.insertLibraryAsset(song.id)
+        model.insertLibraryAsset(image.id)
+        let still = model.items[0].id
+        model.endStillWithSound(still)
+        XCTAssertEqual(model.items[0].displayDuration, 204.362_7, accuracy: 1e-12)
+        XCTAssertEqual(model.totalOutputDuration, model.audioClips[0].timelineEnd, accuracy: 1e-12)
+        XCTAssertNil(model.stillLengthToSoundEnd(for: still), "It ends with the song already")
+
+        model.insertLibraryAsset(image.id)
+        XCTAssertNil(model.stillLengthToSoundEnd(for: model.items[1].id),
+                     "The song stops before the second still begins")
+
+        model.undo()
+        model.undo()
+        XCTAssertEqual(model.items.map(\.displayDuration), [3])
+    }
+
     /// The output frame is the crop, with nothing in between. This is the whole
     /// point of dropping the canvas: what you frame is what the file is.
     func testOutputFrameIsTheFirstClipsCrop() throws {
