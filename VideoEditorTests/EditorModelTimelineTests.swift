@@ -797,6 +797,30 @@ final class EditorModelTimelineTests: XCTestCase {
         XCTAssertEqual(model.items.count, 1)
     }
 
+    /// Before there is any picture there is nothing to put sound under, so a
+    /// drop starts it with the movie wherever it lands — where the library's
+    /// add puts it too. Once there is a picture, a drop puts it where it was
+    /// dropped.
+    func testSoundDroppedBeforeThereIsAPictureStartsWithTheMovie() {
+        let image = LibraryAsset(url: URL(fileURLWithPath: "/fixtures/still.png"),
+                                 kind: .image, width: 640, height: 480)
+        let music = LibraryAsset(url: URL(fileURLWithPath: "/fixtures/music.m4a"),
+                                 kind: .audio, duration: 10)
+        let model = EditorModel()
+        model.library = [image, music]
+        model.imageDefaultDuration = 3
+
+        model.insertAudioClip(from: music, at: 4.2)
+        model.insertAudioClip(from: music, at: 1.5)
+        model.insertLibraryAsset(music.id)
+        XCTAssertEqual(model.audioClips.map(\.timelineStart), [0, 0, 0],
+                       "Sound alone is no picture to place more sound against")
+
+        model.insertLibraryAsset(image.id)
+        model.insertAudioClip(from: music, at: 1.5)
+        XCTAssertEqual(model.audioClips.last?.timelineStart ?? -1, 1.5, accuracy: 1e-9)
+    }
+
     /// S cuts whatever is selected under the playhead. With sound selected
     /// that is the sound: the halves stay where they were on the movie, and
     /// the fades stay with the ends they belong to.

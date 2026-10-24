@@ -656,8 +656,9 @@ struct TimelineView: View {
     private func handleTimelineDrop(_ payload: String, at index: Int, time: Double) {
         if let assetID = libraryAssetID(payload) {
             if let asset = model.libraryAsset(assetID), asset.kind == .audio {
-                // Sound lands where it was dropped, not in a gap between
-                // clips: the track has no gaps to insert into.
+                // Sound lands where it was dropped — at the start, while there
+                // is no picture yet — not in a gap between clips: the track
+                // has no gaps to insert into.
                 model.insertAudioClip(from: asset, at: max(0, time))
             } else {
                 model.insertLibraryAsset(assetID, at: index)

@@ -1081,6 +1081,9 @@ final class EditorModel {
     /// Put a stretch of a file on the track at `start`. The movie's length is
     /// untouched: the track is heard under the picture, never appended to it,
     /// and sound that runs past the last frame simply is not in the file.
+    /// With no picture yet there is nothing to put it under, so it starts
+    /// where the movie will, wherever it was dropped — as it does from the
+    /// library's add, under a playhead that has nowhere else to be.
     @discardableResult
     func insertAudioClip(from asset: LibraryAsset, at start: Double) -> AudioClip.ID? {
         guard asset.kind == .audio, asset.duration > AudioClip.minimumDuration else { return nil }
@@ -1090,7 +1093,7 @@ final class EditorModel {
         let clip = AudioClip(url: normalizedSourceURL(asset.url),
                              audioEndTime: asset.duration,
                              inPoint: 0, outPoint: asset.duration,
-                             timelineStart: max(0, start))
+                             timelineStart: items.isEmpty ? 0 : max(0, start))
         audioClips.append(clip)
         selectAudioClip(clip.id)
         return clip.id
