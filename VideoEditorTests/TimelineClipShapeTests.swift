@@ -27,4 +27,24 @@ final class TimelineClipShapeTests: XCTestCase {
             XCTAssertGreaterThanOrEqual(inset, 0)
         }
     }
+
+    /// A still's ends are the sound bars' 8pt grips, but a short still keeps
+    /// half of itself between them, to be picked up and moved by.
+    func testAStillsEndsLeaveItAMiddleToCarryItBy() {
+        XCTAssertEqual(StillLength.grip(forWidth: 216), SoundBarGeometry.grip)
+        XCTAssertEqual(StillLength.grip(forWidth: 32), 8)
+        XCTAssertEqual(StillLength.grip(forWidth: 20), 5)
+        XCTAssertEqual(StillLength.grip(forWidth: 2), 0.5)
+    }
+
+    /// The end follows the pointer; the start gives the same length from the
+    /// other side, out longer and in shorter. Either way in hundredths.
+    func testEitherEndOfAStillSetsItsLengthOutLongerInShorter() {
+        XCTAssertEqual(StillLength.duration(from: 3, dragging: .trailing, by: 1.5), 4.5)
+        XCTAssertEqual(StillLength.duration(from: 3, dragging: .trailing, by: -1), 2)
+        XCTAssertEqual(StillLength.duration(from: 3, dragging: .leading, by: -1.5), 4.5)
+        XCTAssertEqual(StillLength.duration(from: 3, dragging: .leading, by: 1), 2)
+        XCTAssertEqual(StillLength.duration(from: 3, dragging: .trailing, by: 0.123_456), 3.12)
+        XCTAssertEqual(StillLength.duration(from: 3, dragging: .leading, by: 0.006), 2.99)
+    }
 }

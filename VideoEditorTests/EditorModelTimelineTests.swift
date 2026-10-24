@@ -30,6 +30,34 @@ final class EditorModelTimelineTests: XCTestCase {
                       "The slider ticks must not displace the preceding insert undo step")
     }
 
+    /// Stretching a still moves every clip after it, and a playhead parked in
+    /// one of them goes along, on the frame it was showing — not left at a
+    /// moment that now belongs to something else. The drag is one step.
+    func testAStillsLengthCarriesThePlayheadInALaterClipAlong() {
+        let image = LibraryAsset(url: URL(fileURLWithPath: "/fixtures/still.png"),
+                                 kind: .image, width: 640, height: 480)
+        let model = EditorModel()
+        model.library = [image]
+        model.imageDefaultDuration = 3
+        model.insertLibraryAsset(image.id)
+        model.insertLibraryAsset(image.id)
+        let first = model.items[0].id
+        model.seekTimeline(to: 4)
+        XCTAssertEqual(model.activeItemID, model.items[1].id)
+
+        model.beginImageDurationEditing(for: first)
+        model.setImageDuration(5, for: first)
+        model.setImageDuration(4.5, for: first)
+        model.endImageDurationEditing(for: first)
+
+        XCTAssertEqual(model.totalOutputDuration, 7.5, accuracy: 1e-9)
+        XCTAssertEqual(model.timelineTime, 5.5, accuracy: 1e-9,
+                       "A second into the second still, wherever that now is")
+        model.undo()
+        XCTAssertEqual(model.items[0].displayDuration, 3, accuracy: 1e-9)
+        XCTAssertEqual(model.timelineTime, 4, accuracy: 1e-9)
+    }
+
     /// The output frame is the crop, with nothing in between. This is the whole
     /// point of dropping the canvas: what you frame is what the file is.
     func testOutputFrameIsTheFirstClipsCrop() throws {

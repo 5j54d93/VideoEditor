@@ -1705,8 +1705,11 @@ final class EditorModel {
         items[index].outPoint = newValue
         if activeItemID == id {
             currentTime = min(currentTime, items[index].displayDuration)
-            syncTimelineTimeFromActive()
         }
+        // Every clip after the still moves with its end, the one under the
+        // playhead included, and the playhead goes with that clip rather than
+        // staying at a moment that now shows something else.
+        syncTimelineTimeFromActive()
     }
 
     func setTrimStart(_ time: Double, for id: ClipItem.ID) {

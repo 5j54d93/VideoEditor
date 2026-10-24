@@ -43,6 +43,28 @@ enum TimelineLaneMetrics {
     }
 }
 
+/// A still's ends, where a drag sets how long it is shown. Kept out of the
+/// view so the arithmetic can be asserted without a window, as the sound
+/// bars' is.
+enum StillLength {
+    /// How far in from either end a drag sets the length rather than carrying
+    /// the clip: the sound bars' grip, but never more than a quarter of a
+    /// short still, so there is always a middle to pick it up by.
+    static func grip(forWidth width: CGFloat) -> CGFloat {
+        min(SoundBarGeometry.grip, width / 4)
+    }
+
+    /// The length a drag `reach` seconds along an end leaves. The end follows
+    /// the pointer. The start cannot — the clip before holds it, as it holds
+    /// every clip in the movie — so it gives the same length from the other
+    /// side: out longer, in shorter. In hundredths, as the clip reads it.
+    static func duration(from original: Double, dragging edge: HorizontalEdge,
+                         by reach: Double) -> Double {
+        let seconds = edge == .trailing ? original + reach : original - reach
+        return (seconds * 100).rounded() / 100
+    }
+}
+
 struct TimelineView: View {
     let model: EditorModel
 
@@ -950,6 +972,17 @@ private struct TimelineClipView: View {
     @State private var soundDrag: SoundDrag?
     /// The control of the clip's own sound under the pointer.
     @State private var soundHover: SoundBarGeometry.Zone?
+    /// A drag on either end of a still, setting how long it is shown. Unlike
+    /// a drag on the sound, every step goes to the model as it happens: the
+    /// clips after the still move with its end, and they are laid out from
+    /// the model. It is still one undo step.
+    @State private var lengthDrag: LengthDrag?
+
+    private struct LengthDrag {
+        let edge: HorizontalEdge
+        let original: Double
+        var readoutX: CGFloat
+    }
 
     private struct SoundDrag {
         let zone: SoundBarGeometry.Zone
@@ -1016,6 +1049,13 @@ private struct TimelineClipView: View {
                 .strokeBorder(selected ? Color.accentColor : Color.white.opacity(0.22),
                               lineWidth: selected ? 2.5 : 1)
                 .padding(.horizontal, edgeInset)
+        }
+        .overlay(alignment: .topLeading) {
+            // Above the still, beside the pointer: how long it is now.
+            if let lengthDrag {
+                SoundReadout(text: String(format: "片長 %.2f 秒", item.displayDuration))
+                    .offset(x: lengthDrag.readoutX + 10, y: -22)
+            }
         }
         .overlay(alignment: .topLeading) {
             // Over the picture, just above its sound: the clip clips what is
@@ -1136,9 +1176,64 @@ private struct TimelineClipView: View {
                 .frame(width: max(0.01, width), height: laneHeight)
                 .contentShape(Rectangle())
                 .draggable(pickUp())
+
+            if item.isImage { lengthGrips(height: laneHeight) }
         }
         .frame(width: width, height: laneHeight)
         .clipped()
+    }
+
+    /// A still's ends, where a drag sets how long it is shown. Laid over the
+    /// surface that carries the clip, so they take their hits first and the
+    /// middle still picks the clip up.
+    private func lengthGrips(height laneHeight: CGFloat) -> some View {
+        let grip = StillLength.grip(forWidth: width)
+        return ZStack(alignment: .topLeading) {
+            lengthGrip(.leading, width: grip, height: laneHeight)
+            lengthGrip(.trailing, width: grip, height: laneHeight)
+                .offset(x: width - grip)
+        }
+        .frame(width: width, height: laneHeight, alignment: .topLeading)
+    }
+
+    private func lengthGrip(_ edge: HorizontalEdge, width grip: CGFloat,
+                            height laneHeight: CGFloat) -> some View {
+        Color.clear
+            .frame(width: max(0.01, grip), height: laneHeight)
+            .contentShape(Rectangle())
+            .onContinuousHover { phase in
+                switch phase {
+                case .active: NSCursor.resizeLeftRight.set()
+                case .ended: if lengthDrag == nil { NSCursor.arrow.set() }
+                }
+            }
+            .gesture(lengthDragGesture(edge))
+    }
+
+    /// Measured in the canvas, not the grip: the end's grip rides along with
+    /// the end, and against it the pointer would hardly seem to move.
+    private func lengthDragGesture(_ edge: HorizontalEdge) -> some Gesture {
+        DragGesture(minimumDistance: 3, coordinateSpace: .named("outputTimelineCanvas"))
+            .onChanged { value in
+                if lengthDrag == nil {
+                    lengthDrag = LengthDrag(edge: edge, original: item.displayDuration, readoutX: 0)
+                    if !selected { model.selectOnly(item.id) }
+                    model.beginImageDurationEditing(for: item.id)
+                }
+                guard var drag = lengthDrag else { return }
+                let reach = Double(value.translation.width / pointsPerSecond)
+                model.setImageDuration(StillLength.duration(from: drag.original, dragging: drag.edge,
+                                                            by: reach),
+                                       for: item.id)
+                drag.readoutX = value.location.x - CGFloat(timelineStart) * pointsPerSecond
+                lengthDrag = drag
+                NSCursor.resizeLeftRight.set()
+            }
+            .onEnded { _ in
+                lengthDrag = nil
+                model.endImageDurationEditing(for: item.id)
+                NSCursor.arrow.set()
+            }
     }
 
     private var originalAudioLane: some View {
