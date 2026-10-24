@@ -211,14 +211,18 @@ struct TimelineView: View {
     var body: some View {
         let layout = TimelineLayout(items: model.items)
         let track = AudioTrackLayout(clips: model.audioClips)
+        // The movie's end, or the end of sound that runs on past it: what the
+        // timeline scrolls to and what fitting it to the pane takes in.
+        let contentEnd = model.timelineContentEnd
         VStack(alignment: .leading, spacing: Self.headerSpacing) {
-            header(layout: layout)
+            header(layout: layout, contentEnd: contentEnd)
 
             GeometryReader { geo in
                 let scale = CGFloat(model.timelinePointsPerSecond)
                 let clipsWidth = CGFloat(layout.totalDuration) * scale
                 let trailingWorkspace = max(360, geo.size.width * 0.72)
-                let contentWidth = max(geo.size.width, clipsWidth + trailingWorkspace)
+                let contentWidth = max(geo.size.width,
+                                       CGFloat(contentEnd) * scale + trailingWorkspace)
                 let geometry = TrackGeometry(paneHeight: geo.size.height, rulerHeight: rulerHeight,
                                              clipRowHeight: baseTrackHeight,
                                              audioLanes: track.laneCount)
@@ -242,11 +246,10 @@ struct TimelineView: View {
                     scrollOffset = newValue
                 }
                 .onAppear {
-                    updateViewportWidth(geo.size.width,
-                                        totalDuration: layout.totalDuration)
+                    updateViewportWidth(geo.size.width, contentEnd: contentEnd)
                 }
                 .onChange(of: geo.size.width) { _, w in
-                    updateViewportWidth(w, totalDuration: layout.totalDuration)
+                    updateViewportWidth(w, contentEnd: contentEnd)
                 }
                 .onChange(of: model.timelineZoomRequest) { _, request in
                     guard let request else { return }
@@ -261,7 +264,7 @@ struct TimelineView: View {
             }
             .frame(minHeight: baseTrackHeight + rulerHeight, maxHeight: .infinity, alignment: .top)
             .onChange(of: model.timelineAutoFitRequestID) { _, _ in
-                fitTimelineToViewport(totalDuration: layout.totalDuration)
+                fitTimelineToViewport(contentEnd: contentEnd)
             }
         }
     }
@@ -272,7 +275,7 @@ struct TimelineView: View {
     /// its key beside it, and the zoom and the tails are on the right.
     /// Everything else this row used to carry is on the clips, in their menus
     /// and on the keys.
-    private func header(layout: TimelineLayout) -> some View {
+    private func header(layout: TimelineLayout, contentEnd: Double) -> some View {
         HStack(spacing: 8) {
             HStack(spacing: 6) {
                 Button { model.deleteBeforePlayhead() } label: { editIcon("delete.left", key: "Q") }
@@ -315,15 +318,15 @@ struct TimelineView: View {
                 .help("時間軸縮放")
                 Image(systemName: "plus.magnifyingglass").foregroundStyle(.secondary)
                 Button {
-                    fitTimelineToViewport(totalDuration: layout.totalDuration)
+                    fitTimelineToViewport(contentEnd: contentEnd)
                 } label: {
                     HStack(spacing: 5) {
                         Text("符合視窗")
                         KeyCapHint("⇧Z")
                     }
                 }
-                .disabled(layout.totalDuration <= 0)
-                .help("自動調整縮放，讓整個成品剛好塞進時間軸的可視寬度，並捲回開頭（⇧Z）")
+                .disabled(contentEnd <= 0)
+                .help("自動調整縮放，讓整個成品（音訊比畫面長時算到音訊結尾）剛好塞進時間軸的可視寬度，並捲回開頭（⇧Z）")
             }
             .frame(maxWidth: .infinity, alignment: .trailing)
         }
@@ -389,25 +392,25 @@ struct TimelineView: View {
         }
     }
 
-    private func fitTimelineToViewport(width: CGFloat? = nil, totalDuration: Double) {
+    private func fitTimelineToViewport(width: CGFloat? = nil, contentEnd: Double) {
         let measuredWidth = width ?? viewportWidth
         guard measuredWidth > 0 else {
             pendingAutoFit = true
             return
         }
         pendingAutoFit = false
-        guard totalDuration > 0 else { return }
-        model.setTimelineScale(Double(max(120, measuredWidth - 24)) / totalDuration)
+        guard contentEnd > 0 else { return }
+        model.setTimelineScale(Double(max(120, measuredWidth - 24)) / contentEnd)
         // Scroll after the zoom change has re-laid the content: in the same
         // update the target is clamped against the old width and the viewport
         // stays where it was.
         DispatchQueue.main.async { scrollPosition.scrollTo(x: 0) }
     }
 
-    private func updateViewportWidth(_ width: CGFloat, totalDuration: Double) {
+    private func updateViewportWidth(_ width: CGFloat, contentEnd: Double) {
         viewportWidth = width
         guard pendingAutoFit, width > 0 else { return }
-        fitTimelineToViewport(width: width, totalDuration: totalDuration)
+        fitTimelineToViewport(width: width, contentEnd: contentEnd)
     }
 
     private func canvas(layout: TimelineLayout, track: AudioTrackLayout, width: CGFloat,

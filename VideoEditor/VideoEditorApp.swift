@@ -113,7 +113,7 @@ struct VideoEditorApp: App {
                 Divider()
                 Button("符合視窗") { onTimeline { model.requestTimelineAutoFit() } }
                     .keyboardShortcut("z", modifiers: .shift)
-                    .disabled(timelineBlocked || !model.hasProject)
+                    .disabled(timelineBlocked || model.timelineContentEnd <= 0)
             }
         }
     }

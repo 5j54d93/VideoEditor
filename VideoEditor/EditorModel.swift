@@ -307,6 +307,14 @@ final class EditorModel {
                                       timelineMaxPointsPerSecond)
     }
 
+    /// Where the last thing on the timeline ends: the movie's last frame, or
+    /// sound that runs on past it. The timeline scrolls this far and 符合視窗
+    /// fits it, so a song longer than the picture can be seen — and trimmed —
+    /// to its end.
+    var timelineContentEnd: Double {
+        audioClips.reduce(totalOutputDuration) { max($0, $1.timelineEnd) }
+    }
+
     func fitTimeline(in viewportWidth: CGFloat) {
         guard totalOutputDuration > 0 else { return }
         setTimelineScale(Double(max(1, viewportWidth)) / totalOutputDuration)

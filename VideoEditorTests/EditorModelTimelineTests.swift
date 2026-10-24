@@ -846,6 +846,28 @@ final class EditorModelTimelineTests: XCTestCase {
         XCTAssertEqual(dropMarksItsLanding(at: -1), 0)
     }
 
+    /// The timeline runs as far as anything on it does: the movie's last
+    /// frame, or sound that goes on past it. That is what it scrolls to and
+    /// what 符合視窗 fits, so a song longer than the picture is seen to its
+    /// end — while the movie stays as long as its picture.
+    func testTheTimelineRunsToWhicheverEndsLaterPictureOrSound() throws {
+        let (model, id) = trackModel()
+        XCTAssertEqual(model.timelineContentEnd, 10.5, accuracy: 1e-9)
+        XCTAssertEqual(model.totalOutputDuration, 3, accuracy: 1e-9)
+
+        model.trimAudioClip(id, inPoint: 0, outPoint: 2, timelineStart: 0.5)
+        XCTAssertEqual(model.timelineContentEnd, 3, accuracy: 1e-9,
+                       "Sound within the picture leaves the movie's end as the end")
+
+        let alone = EditorModel()
+        XCTAssertEqual(alone.timelineContentEnd, 0, "An empty timeline has nothing to fit")
+        let music = try XCTUnwrap(model.library.first { $0.kind == .audio })
+        alone.library = [music]
+        alone.insertAudioClip(from: music, at: 0)
+        XCTAssertEqual(alone.timelineContentEnd, 10, accuracy: 1e-9,
+                       "Sound with no picture is still something to fit")
+    }
+
     /// S cuts whatever is selected under the playhead. With sound selected
     /// that is the sound: the halves stay where they were on the movie, and
     /// the fades stay with the ends they belong to.
