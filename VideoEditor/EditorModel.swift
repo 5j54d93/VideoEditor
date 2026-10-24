@@ -117,6 +117,13 @@ final class EditorModel {
     /// two kinds sit on different rows and answer to different controls, but
     /// a plain click on either clears the other, so ⌫ always has one target.
     var selectedAudioIDs: Set<AudioClip.ID> = []
+    /// The sound a drag picked up from the library carries, if it carries
+    /// sound. What a drag holds can only be read once it is let go, and the
+    /// timeline has to show before then where it will land: sound at the
+    /// moment under the pointer, everything else in the gap nearest it. Every
+    /// drag picked up in the window sets it, so one let go somewhere else is
+    /// forgotten by the next; only the caret of a drag in flight reads it.
+    @ObservationIgnored var draggedSound: LibraryAsset.ID?
     @ObservationIgnored private let audioPlayback = AudioTrackPlayback()
 
     // Editing state (of the selected item's source)
@@ -1078,12 +1085,19 @@ final class EditorModel {
 
     static let maximumAudioGain = 2.0
 
-    /// Put a stretch of a file on the track at `start`. The movie's length is
-    /// untouched: the track is heard under the picture, never appended to it,
-    /// and sound that runs past the last frame simply is not in the file.
-    /// With no picture yet there is nothing to put it under, so it starts
-    /// where the movie will, wherever it was dropped — as it does from the
-    /// library's add, under a playhead that has nowhere else to be.
+    /// Where sound put on the track at `time` starts. With no picture yet
+    /// there is nothing to put it under, so it starts where the movie will,
+    /// wherever it was dropped — as it does from the library's add, under a
+    /// playhead that has nowhere else to be. The caret of a drag of sound asks
+    /// the same, so it marks where the drop will put it.
+    func soundStart(at time: Double) -> Double {
+        items.isEmpty ? 0 : max(0, time)
+    }
+
+    /// Put a stretch of a file on the track at `start`, or where
+    /// `soundStart(at:)` moves it. The movie's length is untouched: the track
+    /// is heard under the picture, never appended to it, and sound that runs
+    /// past the last frame simply is not in the file.
     @discardableResult
     func insertAudioClip(from asset: LibraryAsset, at start: Double) -> AudioClip.ID? {
         guard asset.kind == .audio, asset.duration > AudioClip.minimumDuration else { return nil }
@@ -1093,7 +1107,7 @@ final class EditorModel {
         let clip = AudioClip(url: normalizedSourceURL(asset.url),
                              audioEndTime: asset.duration,
                              inPoint: 0, outPoint: asset.duration,
-                             timelineStart: items.isEmpty ? 0 : max(0, start))
+                             timelineStart: soundStart(at: start))
         audioClips.append(clip)
         selectAudioClip(clip.id)
         return clip.id

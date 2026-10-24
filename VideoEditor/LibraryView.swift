@@ -309,7 +309,14 @@ private struct LibraryAssetCard: View {
         .simultaneousGesture(
             TapGesture(count: 1).onEnded { selectFromPointer() }
         )
-        .draggable("library:\(asset.id.uuidString)")
+        // `onDrag` rather than `draggable`: the provider it returns is what
+        // starts the drag, so this runs as the card is picked up — which is
+        // when the timeline has to hear that sound is on its way, to mark
+        // where it will land rather than a gap between clips.
+        .onDrag {
+            model.draggedSound = asset.kind == .audio ? asset.id : nil
+            return NSItemProvider(object: "library:\(asset.id.uuidString)" as NSString)
+        }
         .contextMenu { contextItems }
         .task(id: thumbnailTaskID) { await loadThumbnail() }
         .accessibilityLabel(asset.url.lastPathComponent)

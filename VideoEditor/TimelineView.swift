@@ -63,7 +63,7 @@ struct TimelineView: View {
     @State private var magnificationContext: MagnificationContext?
     @State private var marqueeStart: CGPoint?
     @State private var marqueeRect: CGRect?
-    @State private var dropInsertionIndex: Int?
+    @State private var dropCaret: DropCaret?
     @State private var dropAutoScrollStep: CGFloat = 0
     @State private var dropAutoScrollTask: Task<Void, Never>?
 
@@ -471,12 +471,15 @@ struct TimelineView: View {
                     .allowsHitTesting(false)
             }
 
-            if let insertion = dropInsertionIndex {
+            if let caret = dropCaret {
+                let x = switch caret {
+                case .gap(let index): layout.insertionX(index, scale: scale)
+                case .moment(let time): CGFloat(time) * scale
+                }
                 Capsule()
                     .fill(Color.accentColor)
                     .frame(width: 3, height: baseTrackHeight + 12)
-                    .offset(x: layout.insertionX(insertion, scale: scale) - 1.5,
-                            y: geometry.clipRowTop - 6)
+                    .offset(x: x - 1.5, y: geometry.clipRowTop - 6)
                     .allowsHitTesting(false)
             }
 
@@ -499,15 +502,22 @@ struct TimelineView: View {
         // One drop surface for the whole timeline (clips, ruler, blank space,
         // trailing zone): route every reorder / library drop to the nearest
         // insertion gap — including index 0, so a clip can be moved to the very
-        // start — and show a caret at that gap while dragging.
+        // start — and show a caret at that gap while dragging. Sound is the
+        // exception: it starts at the moment under the pointer, and the caret
+        // goes there instead.
         .onDrop(of: [.text], delegate: TimelineInsertionDropDelegate(
             insertionIndex: { location in
                 layout.insertionIndex(at: location.x, scale: scale)
             },
             dropTime: { location in Double(location.x / scale) },
+            caret: { location in
+                model.draggedSound != nil
+                    ? .moment(model.soundStart(at: Double(location.x / scale)))
+                    : .gap(layout.insertionIndex(at: location.x, scale: scale))
+            },
             // The caret is up exactly while a drag is over the timeline.
-            isTargeted: { dropInsertionIndex != nil },
-            setIndicator: { dropInsertionIndex = $0 },
+            isTargeted: { dropCaret != nil },
+            setCaret: { dropCaret = $0 },
             autoScroll: { location in updateDropAutoScroll(pointerX: location.x) },
             stopAutoScroll: { stopDropAutoScroll() },
             perform: { payload, index, time in handleTimelineDrop(payload, at: index, time: time) }
@@ -949,7 +959,11 @@ private struct TimelineClipView: View {
     }
 
     private var selected: Bool { model.selectedIDs.contains(item.id) }
-    private var dragPayload: String {
+    /// What a drag of the clip carries, read as the drag begins: the whole
+    /// selection when the clip is part of it. Clips carry no sound, so picking
+    /// them up also forgets any the last drag from the library carried.
+    private func pickUp() -> String {
+        model.draggedSound = nil
         let draggedItems = selected
             ? model.items.filter { model.selectedIDs.contains($0.id) }
             : [item]
@@ -1118,7 +1132,7 @@ private struct TimelineClipView: View {
                 .fill(Color.black.opacity(0.001))
                 .frame(width: max(0.01, width), height: laneHeight)
                 .contentShape(Rectangle())
-                .draggable(dragPayload)
+                .draggable(pickUp())
         }
         .frame(width: width, height: laneHeight)
         .clipped()
@@ -1147,7 +1161,7 @@ private struct TimelineClipView: View {
                 .fill(Color.black.opacity(0.001))
                 .frame(width: max(0.01, width), height: TimelineLaneMetrics.audioHeight)
                 .contentShape(Rectangle())
-                .draggable(dragPayload)
+                .draggable(pickUp())
 
             if item.hasVideoPad {
                 Rectangle()
@@ -2018,19 +2032,30 @@ struct FilmstripStrip: View {
     }
 }
 
+/// Where a drop in flight would land, as the caret marks it.
+private enum DropCaret: Equatable {
+    /// The gap between clips a clip would go into.
+    case gap(Int)
+    /// The moment a piece of sound would start at.
+    case moment(Double)
+}
+
 /// Routes every timeline drop (clip reorder + library insert) to the insertion
-/// gap nearest the pointer, drawing a caret there while the drag hovers. Being
-/// the only drop surface, drops can never fall through to an append fallback —
-/// the caret position is exactly what a release does.
+/// gap nearest the pointer — sound to the moment under it — drawing a caret
+/// there while the drag hovers. Being the only drop surface, drops can never
+/// fall through to an append fallback — the caret position is exactly what a
+/// release does.
 private struct TimelineInsertionDropDelegate: DropDelegate {
     let insertionIndex: (CGPoint) -> Int
     /// The moment under the pointer, for what lands on the track rather than
     /// in the clip order.
     let dropTime: (CGPoint) -> Double
+    /// Where the caret goes for the drag in flight at a point.
+    let caret: (CGPoint) -> DropCaret
     /// Whether a drag is over the timeline: from `dropEntered` until
     /// `dropExited` or `performDrop`.
     let isTargeted: () -> Bool
-    let setIndicator: (Int?) -> Void
+    let setCaret: (DropCaret?) -> Void
     let autoScroll: (CGPoint) -> Void
     let stopAutoScroll: () -> Void
     let perform: (String, Int, Double) -> Void
@@ -2040,7 +2065,7 @@ private struct TimelineInsertionDropDelegate: DropDelegate {
     }
 
     func dropEntered(info: DropInfo) {
-        setIndicator(insertionIndex(info.location))
+        setCaret(caret(info.location))
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
@@ -2050,21 +2075,21 @@ private struct TimelineInsertionDropDelegate: DropDelegate {
         // left to stop — a drop near either edge left the timeline creeping
         // on its own the moment a zoom gave it room.
         if isTargeted() {
-            setIndicator(insertionIndex(info.location))
+            setCaret(caret(info.location))
             autoScroll(info.location)
         }
         return DropProposal(operation: .move)
     }
 
     func dropExited(info: DropInfo) {
-        setIndicator(nil)
+        setCaret(nil)
         stopAutoScroll()
     }
 
     func performDrop(info: DropInfo) -> Bool {
         let index = insertionIndex(info.location)
         let time = dropTime(info.location)
-        setIndicator(nil)
+        setCaret(nil)
         stopAutoScroll()
         guard let provider = info.itemProviders(for: [.text]).first else { return false }
         _ = provider.loadObject(ofClass: NSString.self) { object, _ in

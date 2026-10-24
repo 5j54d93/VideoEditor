@@ -821,6 +821,31 @@ final class EditorModelTimelineTests: XCTestCase {
         XCTAssertEqual(model.audioClips.last?.timelineStart ?? -1, 1.5, accuracy: 1e-9)
     }
 
+    /// A drag of sound puts its caret where the drop would start it, by asking
+    /// the question the drop asks: the start before there is any picture, the
+    /// moment under the pointer after — past the last frame included.
+    func testTheCaretMarksWhereDroppedSoundStarts() {
+        let image = LibraryAsset(url: URL(fileURLWithPath: "/fixtures/still.png"),
+                                 kind: .image, width: 640, height: 480)
+        let music = LibraryAsset(url: URL(fileURLWithPath: "/fixtures/music.m4a"),
+                                 kind: .audio, duration: 10)
+        let model = EditorModel()
+        model.library = [image, music]
+        model.imageDefaultDuration = 6
+
+        func dropMarksItsLanding(at time: Double) -> Double {
+            let marked = model.soundStart(at: time)
+            model.insertAudioClip(from: music, at: time)
+            XCTAssertEqual(model.audioClips.last?.timelineStart, marked)
+            return marked
+        }
+        XCTAssertEqual(dropMarksItsLanding(at: 4.5), 0)
+        model.insertLibraryAsset(image.id)
+        XCTAssertEqual(dropMarksItsLanding(at: 4.5), 4.5)
+        XCTAssertEqual(dropMarksItsLanding(at: 9), 9)
+        XCTAssertEqual(dropMarksItsLanding(at: -1), 0)
+    }
+
     /// S cuts whatever is selected under the playhead. With sound selected
     /// that is the sound: the halves stay where they were on the movie, and
     /// the fades stay with the ends they belong to.
