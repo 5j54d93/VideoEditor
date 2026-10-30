@@ -289,7 +289,7 @@ struct TimelineView: View {
                     // the old width.
                     let x = CGFloat(request.time) * CGFloat(model.timelinePointsPerSecond)
                     DispatchQueue.main.async {
-                        scrollPosition.scrollTo(x: max(0, x - geo.size.width / 3))
+                        scrollTimeline(to: max(0, x - geo.size.width / 3))
                     }
                 }
             }
@@ -334,15 +334,18 @@ struct TimelineView: View {
                     set: { newLevel in
                         // Zoom about the playhead: keep it at the same viewport x while
                         // the scale changes; if it's off-screen, bring it to centre.
-                        let oldScale = CGFloat(model.timelinePointsPerSecond)
-                        model.timelineZoomLevel = newLevel
-                        let newScale = CGFloat(model.timelinePointsPerSecond)
-                        guard newScale != oldScale else { return }
-                        let playheadX = CGFloat(model.timelineTime) * oldScale - scrollOffset
-                        let anchorX = (playheadX >= 0 && playheadX <= viewportWidth)
-                            ? playheadX : viewportWidth / 2
-                        scrollPosition.scrollTo(
-                            x: max(0, CGFloat(model.timelineTime) * newScale - anchorX))
+                        // The slider may hand its value over inside an animation;
+                        // the zoom still lands at once, as the anchoring assumes.
+                        withTransaction(\.animation, nil) {
+                            let oldScale = CGFloat(model.timelinePointsPerSecond)
+                            model.timelineZoomLevel = newLevel
+                            let newScale = CGFloat(model.timelinePointsPerSecond)
+                            guard newScale != oldScale else { return }
+                            let playheadX = CGFloat(model.timelineTime) * oldScale - scrollOffset
+                            let anchorX = (playheadX >= 0 && playheadX <= viewportWidth)
+                                ? playheadX : viewportWidth / 2
+                            scrollTimeline(to: max(0, CGFloat(model.timelineTime) * newScale - anchorX))
+                        }
                     }
                 ), in: 0...1)
                 .frame(width: 130)
@@ -435,7 +438,18 @@ struct TimelineView: View {
         // Scroll after the zoom change has re-laid the content: in the same
         // update the target is clamped against the old width and the viewport
         // stays where it was.
-        DispatchQueue.main.async { scrollPosition.scrollTo(x: 0) }
+        DispatchQueue.main.async { scrollTimeline(to: 0) }
+    }
+
+    /// Every move the app makes of the timeline is made at once. A scroll
+    /// asked for inside an animation is handed to AppKit to animate, and
+    /// AppKit's scroll animation has trapped on a NaN origin under a drag of
+    /// the zoom slider — the whole app went down with it. Nothing here wants
+    /// the move eased anyway: the content is laid out at its new scale at
+    /// once, and the scroll that keeps the playhead in place has to land
+    /// with it.
+    private func scrollTimeline(to x: CGFloat) {
+        withTransaction(\.animation, nil) { scrollPosition.scrollTo(x: x) }
     }
 
     private func updateViewportWidth(_ width: CGFloat, contentEnd: Double) {
@@ -689,7 +703,7 @@ struct TimelineView: View {
                     model.setTimelineScale(context.baseScale * Double(value.magnification))
                     let anchoredX = CGFloat(context.anchorTime * model.timelinePointsPerSecond)
                         - context.anchorViewportX
-                    scrollPosition.scrollTo(x: max(0, anchoredX))
+                    scrollTimeline(to: max(0, anchoredX))
                 }
                 .onEnded { _ in magnificationContext = nil }
         )
@@ -726,7 +740,7 @@ struct TimelineView: View {
         guard step != 0 else { return }
         dropAutoScrollTask = Task { @MainActor in
             while !Task.isCancelled {
-                scrollPosition.scrollTo(x: max(0, scrollOffset + step))
+                scrollTimeline(to: max(0, scrollOffset + step))
                 try? await Task.sleep(for: .milliseconds(33))
             }
         }
