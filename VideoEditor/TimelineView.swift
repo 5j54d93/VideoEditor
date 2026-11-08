@@ -74,6 +74,103 @@ enum StillLength {
     }
 }
 
+/// A zoom of the timeline, taken a step at a time. Each step sets the scale
+/// and scrolls so that one moment holds still on screen. Asked for on top of
+/// one another, those scrolls go astray: SwiftUI lands them a step behind the
+/// scale, and can put an earlier one back after the last — a fast drag of the
+/// slider to its end left the timeline tens of thousands of points short of
+/// the playhead. So while a step's scroll is on its way, the latest step asked
+/// for waits for it to land, and any in between are skipped. Kept out of the
+/// view so the pacing can be asserted without a window.
+struct TimelineZoomPacing {
+    /// What a step holds still: a moment, and how far across the viewport it
+    /// sits.
+    struct Anchor: Equatable {
+        var time: Double
+        var viewportX: CGFloat
+    }
+
+    struct Step: Equatable {
+        var scale: Double
+        /// `nil` holds the playhead, wherever it is when the step is taken.
+        var anchor: Anchor?
+    }
+
+    /// Where the last step scrolled to, until the scroll view reports being
+    /// there.
+    private(set) var landing: CGFloat?
+    /// The latest step asked for while one was landing.
+    private(set) var waiting: Step?
+    /// Numbers the scrolls, so giving up on one never lets go of a later one.
+    private var scrollCount = 0
+
+    /// The step to take now, or `nil` when it waits for the scroll on its way.
+    /// A step taken now leaves nothing waiting: it is the latest.
+    mutating func ask(_ step: Step) -> Step? {
+        guard landing == nil else {
+            waiting = step
+            return nil
+        }
+        waiting = nil
+        return step
+    }
+
+    /// The step just taken scrolls to `offset`. Returns the scroll's number,
+    /// for giving up on it.
+    mutating func scrolled(to offset: CGFloat) -> Int {
+        scrollCount &+= 1
+        landing = offset
+        return scrollCount
+    }
+
+    /// The scroll view reports being at `offset`. Returns whether that is
+    /// where the last step went, so the step waiting can go.
+    mutating func reached(_ offset: CGFloat) -> Bool {
+        // Within a point: the scroll view lands on whole pixels.
+        guard let landing, abs(offset - landing) < 1 else { return false }
+        self.landing = nil
+        return true
+    }
+
+    /// Stops waiting on scroll `number`, which never came to report: a hand
+    /// on the scroll bar, say, took the timeline somewhere else. Returns
+    /// whether it was still being waited on.
+    mutating func giveUp(on number: Int) -> Bool {
+        guard landing != nil, number == scrollCount else { return false }
+        landing = nil
+        return true
+    }
+
+    /// The step that waited, now that nothing is landing.
+    mutating func next() -> Step? {
+        guard landing == nil, let step = waiting else { return nil }
+        waiting = nil
+        return step
+    }
+
+    /// Drops the zoom: something else has set the scale.
+    mutating func cancel() {
+        landing = nil
+        waiting = nil
+    }
+
+    /// The playhead where it is on screen, or the middle of the screen when it
+    /// is off it.
+    static func playheadAnchor(time: Double, scale: CGFloat, offset: CGFloat,
+                               viewportWidth: CGFloat) -> Anchor {
+        let x = CGFloat(time) * scale - offset
+        return Anchor(time: time,
+                      viewportX: x >= 0 && x <= viewportWidth ? x : viewportWidth / 2)
+    }
+
+    /// The offset that keeps `anchor` where it sits on screen at `scale`, as
+    /// near as the ends of the content allow.
+    static func offset(holding anchor: Anchor, at scale: CGFloat,
+                       maxOffset: CGFloat) -> CGFloat {
+        min(max(0, CGFloat(anchor.time) * scale - anchor.viewportX), max(0, maxOffset))
+    }
+}
+
 struct TimelineView: View {
     let model: EditorModel
 
@@ -92,6 +189,7 @@ struct TimelineView: View {
     @State private var viewportWidth: CGFloat = 0
     @State private var pendingAutoFit = false
     @State private var magnificationContext: MagnificationContext?
+    @State private var zoomPacing = TimelineZoomPacing()
     @State private var marqueeStart: CGPoint?
     @State private var marqueeRect: CGRect?
     @State private var dropCaret: DropCaret?
@@ -100,8 +198,7 @@ struct TimelineView: View {
 
     private struct MagnificationContext {
         let baseScale: Double
-        let anchorTime: Double
-        let anchorViewportX: CGFloat
+        let anchor: TimelineZoomPacing.Anchor
     }
 
     /// One prefix-sum pass per body evaluation. Rendering and pointer geometry
@@ -251,9 +348,7 @@ struct TimelineView: View {
             GeometryReader { geo in
                 let scale = CGFloat(model.timelinePointsPerSecond)
                 let clipsWidth = CGFloat(layout.totalDuration) * scale
-                let trailingWorkspace = max(360, geo.size.width * 0.72)
-                let contentWidth = max(geo.size.width,
-                                       CGFloat(contentEnd) * scale + trailingWorkspace)
+                let contentWidth = timelineWidth(scale: scale, viewportWidth: geo.size.width)
                 let geometry = TrackGeometry(paneHeight: geo.size.height, rulerHeight: rulerHeight,
                                              clipRowHeight: baseTrackHeight,
                                              audioLanes: track.laneCount)
@@ -275,6 +370,14 @@ struct TimelineView: View {
                 .onScrollGeometryChange(for: CGFloat.self,
                                         of: { max(0, $0.contentOffset.x) }) { _, newValue in
                     scrollOffset = newValue
+                    if zoomPacing.reached(newValue) {
+                        // The next step goes on the next turn: asked for
+                        // inside the scroll view's own update, its scroll is
+                        // put back as the update finishes.
+                        DispatchQueue.main.async {
+                            if let next = zoomPacing.next() { takeZoomStep(next) }
+                        }
+                    }
                 }
                 .onAppear {
                     updateViewportWidth(geo.size.width, contentEnd: contentEnd)
@@ -284,6 +387,7 @@ struct TimelineView: View {
                 }
                 .onChange(of: model.timelineZoomRequest) { _, request in
                     guard let request else { return }
+                    zoomPacing.cancel()
                     // The scale is already applied; scroll after the content has
                     // been re-laid out at it, or the target is clamped against
                     // the old width.
@@ -329,23 +433,17 @@ struct TimelineView: View {
             HStack(spacing: 8) {
                 tailMenu
                 Image(systemName: "minus.magnifyingglass").foregroundStyle(.secondary)
+                // The knob follows the hand, even while the step it asked for
+                // waits on the one before.
+                let zoomLevel = zoomPacing.waiting.map { model.timelineZoomLevel(forScale: $0.scale) }
+                    ?? model.timelineZoomLevel
                 Slider(value: Binding(
-                    get: { model.timelineZoomLevel },
+                    get: { zoomLevel },
                     set: { newLevel in
                         // Zoom about the playhead: keep it at the same viewport x while
                         // the scale changes; if it's off-screen, bring it to centre.
-                        // The slider may hand its value over inside an animation;
-                        // the zoom still lands at once, as the anchoring assumes.
-                        withTransaction(\.animation, nil) {
-                            let oldScale = CGFloat(model.timelinePointsPerSecond)
-                            model.timelineZoomLevel = newLevel
-                            let newScale = CGFloat(model.timelinePointsPerSecond)
-                            guard newScale != oldScale else { return }
-                            let playheadX = CGFloat(model.timelineTime) * oldScale - scrollOffset
-                            let anchorX = (playheadX >= 0 && playheadX <= viewportWidth)
-                                ? playheadX : viewportWidth / 2
-                            scrollTimeline(to: max(0, CGFloat(model.timelineTime) * newScale - anchorX))
-                        }
+                        takeZoomStep(.init(scale: model.timelineScale(forZoomLevel: newLevel),
+                                           anchor: nil))
                     }
                 ), in: 0...1)
                 .frame(width: 130)
@@ -434,6 +532,7 @@ struct TimelineView: View {
         }
         pendingAutoFit = false
         guard contentEnd > 0 else { return }
+        zoomPacing.cancel()
         model.setTimelineScale(Double(max(120, measuredWidth - 24)) / contentEnd)
         // Scroll after the zoom change has re-laid the content: in the same
         // update the target is clamped against the old width and the viewport
@@ -450,6 +549,42 @@ struct TimelineView: View {
     /// with it.
     private func scrollTimeline(to x: CGFloat) {
         withTransaction(\.animation, nil) { scrollPosition.scrollTo(x: x) }
+    }
+
+    /// Takes a step of a zoom, or holds it while the step before is still
+    /// scrolling: see `TimelineZoomPacing`.
+    private func takeZoomStep(_ step: TimelineZoomPacing.Step) {
+        guard let step = zoomPacing.ask(step) else { return }
+        // The slider may hand its value over inside an animation; the zoom
+        // still lands at once, as the anchoring assumes.
+        withTransaction(\.animation, nil) {
+            let oldScale = CGFloat(model.timelinePointsPerSecond)
+            let anchor = step.anchor ?? TimelineZoomPacing.playheadAnchor(
+                time: model.timelineTime, scale: oldScale, offset: scrollOffset,
+                viewportWidth: viewportWidth)
+            model.setTimelineScale(step.scale)
+            let newScale = CGFloat(model.timelinePointsPerSecond)
+            guard newScale != oldScale else { return }
+            let target = TimelineZoomPacing.offset(
+                holding: anchor, at: newScale,
+                maxOffset: timelineWidth(scale: newScale, viewportWidth: viewportWidth) - viewportWidth)
+            // Within a point the timeline stays where it is, and no report
+            // would come to let the next step go.
+            guard abs(target - scrollOffset) >= 1 else { return }
+            let scroll = zoomPacing.scrolled(to: target)
+            scrollTimeline(to: target)
+            // A scroll that never reports holds the zoom up no longer than this.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                if zoomPacing.giveUp(on: scroll), let next = zoomPacing.next() { takeZoomStep(next) }
+            }
+        }
+    }
+
+    /// How wide the timeline is at a scale: everything on it, and room after
+    /// the end to drop onto.
+    private func timelineWidth(scale: CGFloat, viewportWidth: CGFloat) -> CGFloat {
+        let trailingWorkspace = max(360, viewportWidth * 0.72)
+        return max(viewportWidth, CGFloat(model.timelineContentEnd) * scale + trailingWorkspace)
     }
 
     private func updateViewportWidth(_ width: CGFloat, contentEnd: Double) {
@@ -695,15 +830,13 @@ struct TimelineView: View {
                         let base = model.timelinePointsPerSecond
                         magnificationContext = MagnificationContext(
                             baseScale: base,
-                            anchorTime: Double(value.startLocation.x) / base,
-                            anchorViewportX: value.startLocation.x - scrollOffset
+                            anchor: .init(time: Double(value.startLocation.x) / base,
+                                          viewportX: value.startLocation.x - scrollOffset)
                         )
                     }
                     guard let context = magnificationContext else { return }
-                    model.setTimelineScale(context.baseScale * Double(value.magnification))
-                    let anchoredX = CGFloat(context.anchorTime * model.timelinePointsPerSecond)
-                        - context.anchorViewportX
-                    scrollTimeline(to: max(0, anchoredX))
+                    takeZoomStep(.init(scale: context.baseScale * Double(value.magnification),
+                                       anchor: context.anchor))
                 }
                 .onEnded { _ in magnificationContext = nil }
         )

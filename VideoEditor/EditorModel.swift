@@ -290,16 +290,19 @@ final class EditorModel {
     // frames can become first-class cells inside the timeline itself.
     let timelineMaxPointsPerSecond: Double = 3_600
 
-    var timelineZoomLevel: Double {
-        get {
-            log(timelinePointsPerSecond / timelineMinPointsPerSecond)
-                / log(timelineMaxPointsPerSecond / timelineMinPointsPerSecond)
-        }
-        set {
-            let level = min(max(newValue, 0), 1)
-            setTimelineScale(timelineMinPointsPerSecond
-                * pow(timelineMaxPointsPerSecond / timelineMinPointsPerSecond, level))
-        }
+    var timelineZoomLevel: Double { timelineZoomLevel(forScale: timelinePointsPerSecond) }
+
+    /// Where on the zoom slider a scale sits, 0 widest and 1 closest. The
+    /// slider is logarithmic: every stretch of it zooms by the same factor.
+    func timelineZoomLevel(forScale scale: Double) -> Double {
+        let level = log(scale / timelineMinPointsPerSecond)
+            / log(timelineMaxPointsPerSecond / timelineMinPointsPerSecond)
+        return min(max(level, 0), 1)
+    }
+
+    func timelineScale(forZoomLevel level: Double) -> Double {
+        timelineMinPointsPerSecond
+            * pow(timelineMaxPointsPerSecond / timelineMinPointsPerSecond, min(max(level, 0), 1))
     }
 
     func setTimelineScale(_ value: Double) {
